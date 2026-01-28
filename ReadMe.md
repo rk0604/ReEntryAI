@@ -96,7 +96,7 @@ The codebase is modular by intent — each file corresponds to a clear physical 
 
 ---
 
-## Design Choices (What I’d Defend in an Interview)
+## Design Choices 
 
 ### Why Euler Integration?
 I intentionally start with explicit Euler:
