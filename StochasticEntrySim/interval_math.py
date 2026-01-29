@@ -125,6 +125,12 @@ class Interval:
             return Interval(-self.hi, -self.lo)
         # crosses 0
         return Interval(0.0, max(-self.lo, self.hi))
+    
+    def log(self) -> "Interval":
+        """Natural log of a positive interval"""
+        if self.lo <= 0.0:
+            raise ValueError(f"log undefined for interval containing non-positive values: {self}")
+        return Interval(math.log(self.lo), math.log(self.hi))
 
     def sqrt(self) -> "Interval":
         """sqrt([a,b]) with a >= 0 required."""

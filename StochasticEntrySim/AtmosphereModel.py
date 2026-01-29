@@ -96,10 +96,10 @@ def US_Standard_ATM(z: float) -> dict:
     # 1) geometric -> geopotential altitude
     h = geopotential_altitude(z)
 
-    # 2) find what layer we are in
+    # 2) layer
     layer_info = find_layer(h)
     if layer_info == -1:
-        # outside 0–86 km USSA76 range; you can decide how to handle this
+        # outside 0–86 km USSA76 range
         return {
             "T_K": None,
             "p_Pa": None,
@@ -238,20 +238,19 @@ width (m): 2999.9904474946816
 layers:  {0: -0.0065, 1: 0.0}
 '''
 
-def intv_temp_in_layer(layers: dict, h: Interval) -> dict:
-    """
-    Compute interval temperature for each atmospheric layer intersected by h.
-
+# Compute interval temperature for each atmospheric layer intersected by h
+"""
     Parameters:
-    layers : dict
+    layers: dict
         Keys are layer indices (from intv_find_layers)
-    h : Interval
+    h: Interval
         Geopotential altitude interval
 
     Returns:
     dict
         layer_index -> Interval temperature
-    """
+"""
+def intv_temp_in_layer(layers: dict, h: Interval) -> dict:
 
     temps = {}
 
@@ -263,10 +262,6 @@ def intv_temp_in_layer(layers: dict, h: Interval) -> dict:
         base_height = layer_params['h_b_m']
 
         if lapse_rate != 0.0:
-            # h is an Interval, base_height is scalar
-            # (h - h_b) → Interval
-            # L * (h - h_b) → Interval
-            # T_b + ... → Interval
             temp_interval = base_temp + lapse_rate * (h - base_height)
         else:
             # Isothermal layer: temperature is constant
@@ -276,5 +271,135 @@ def intv_temp_in_layer(layers: dict, h: Interval) -> dict:
 
     return temps
         
-print("\n--- Testing intv_temp_in_layer ---")
-print("interval temperature results: ", intv_temp_in_layer(intv_find_layers(h_intv), h_intv))
+print("\n---------------------- Testing intv_temp_in_layer ----------------------")
+print("interval temperature(K) results: ", intv_temp_in_layer(intv_find_layers(h_intv), h_intv))
+# interval temperature(K) results:  {0: Interval(203.78227720292418, 223.2822151116396), 1: Interval(216.65, 216.65)}
+
+# interval math variant of the pressure computation helper
+"""
+    Parameters:
+    layers: dict
+        Keys are layer indices (from intv_find_layers)
+    h: Interval
+        Geopotential altitude interval
+
+    Returns:
+    dict
+        layer_index -> Interval pressure
+"""
+def intv_pressure_in_layer(layers: dict, h: Interval, temperatures: dict) -> dict:
+    pressure = {}
+
+    for k in layers.keys():
+        layer_params = get_layer_params(k)
+
+        lapse_rate    = layer_params['L_K_per_m']
+        base_temp     = layer_params['T_b_K']
+        base_height   = layer_params['h_b_m']
+        base_pressure = layer_params['p_b_Pa']
+
+        T = temperatures[k]  # Interval
+
+        if lapse_rate != 0.0:
+            # p = p_b * (T / T_b)^(-g0 / (L R))
+            exponent = (-constants.g_0) / (lapse_rate * constants.R_AIR_DRY)
+            temp_ratio = T / base_temp            # Interval (positive)
+            factor = (temp_ratio.log() * exponent).exp()
+            pressure[k] = base_pressure * factor
+
+        else:
+            # p = p_b * exp( -g0 (h - h_b) / (R T_b) )
+            exponent = (
+                -constants.g_0 * (h - base_height)
+            ) / (constants.R_AIR_DRY * base_temp)
+            pressure[k] = base_pressure * exponent.exp()
+
+    return pressure
+
+print("\n---------------------- Testing intv_pressure_in_layer ----------------------")
+temperature_computations = intv_temp_in_layer(intv_find_layers(h_intv), h_intv)
+pressure_computations = intv_pressure_in_layer(intv_find_layers(h_intv), h_intv, temperature_computations)
+print("interval pressure results(Pascals): ", pressure_computations)
+# interval pressure results(Pascals):  {0: Interval(16404.31960584069, 26518.687101234515), 1: Interval(16563.498028596357, 26582.821861831824)}
+
+"""
+    Parameters:
+    pressures: dict
+    temperatures: dict
+        Keys are layer indices (from intv_find_layers)
+
+    Returns:
+    dict
+        layer_index -> layer density
+"""
+# interval version compute air density from pressure and temperature (ideal gas law)
+def intv_density_from_pressure(pressures: dict, temperatures:dict) -> dict:
+    # density = pressure / (R * T)
+    densities = {}
+    for k in pressures.keys():
+        density_intv = pressures[k] / (constants.R_AIR_DRY * temperatures[k])
+        densities[k] = density_intv
+    return densities
+print("\n---------------------- Testing intv_density_from_pressure ----------------------")
+density_computations = intv_density_from_pressure(pressure_computations, temperature_computations)
+print("density copmutations", density_computations)
+# density copmutations {0: Interval(0.25594225971588885, 0.453339454740784), 1: Interval(0.2663368610060334, 0.42744505533429455)}
+
+"""
+    Parameters:
+    h: Interval geometric altitude
+
+    Returns:
+    Dict{
+        "T_K": T,
+        "p_Pa": p,
+        "rho_kgm3": rho,
+        "geopotential_alt_m": h,
+        "layer_index": layer_index
+        }
+"""
+# use for altitude <= 86km
+def intv_US_Standard_ATM(z: Interval) -> float:
+    # 1) Interval(geometric -> geopotential altitude)
+    h = intv_geopotential_altitude(z)
+
+    # 2) layer
+    layer_info = intv_find_layers(h) # {0: -0.0065, 1: 0.0}
+    if -1 in layer_info.values():
+        # outside 0–86 km USSA76 range
+        return {
+            "T_K": None,
+            "p_Pa": None,
+            "rho_kgm3": None,
+            "geopotential_alt_m": h,
+            "layer_index": -1
+        }
+    
+    atmosphere_info = {}
+
+    # 3) Compute temperature at various h
+    temperatures = intv_temp_in_layer(layer_info, h)
+
+    # 4) compute pressure at various h
+    pressures = intv_pressure_in_layer(layer_info, h, temperatures)
+
+    # 5) compute density at various h
+    densities = intv_density_from_pressure(pressures, temperatures)
+
+    for k in layer_info.keys():
+        atmosphere_info[k] = {
+            "T_K": temperatures[k],
+            "p_Pa": pressures[k],
+            "rho_kgm3": densities[k],
+        }
+
+    #6) return all
+    return atmosphere_info
+    
+print("-------------------- intv_US_Standard_ATM testing --------------------")
+atmosphere_info = intv_US_Standard_ATM(z_intv)
+for k in atmosphere_info.keys():
+    print(f"{k}: {atmosphere_info[k]} \n")
+
+# 0: {'T_K': Interval(203.78227720292418, 223.2822151116396), 'p_Pa': Interval(16404.31960584069, 26518.687101234515), 'rho_kgm3': Interval(0.25594225971588885, 0.453339454740784)} 
+# 1: {'T_K': Interval(216.65, 216.65), 'p_Pa': Interval(16563.498028596357, 26582.821861831824), 'rho_kgm3': Interval(0.2663368610060334, 0.42744505533429455)} 
