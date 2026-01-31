@@ -1,4 +1,6 @@
 
+from interval_math import Interval, promote, box_add, box_scalar_mul, scalar_times_interval
+
 RADIUS_EARTH = 6378100  # meters
 MU = 3.986e14           # 3.986*10^14 m^3/s^2
 SEA_LEVEL_DENSITY = 1.225  # (kg/m^3)
@@ -33,9 +35,18 @@ def altitude(r: float) -> float:
     """Convert radial distance from Earth center to altitude above surface."""
     return r - RADIUS_EARTH
 
+# interval version of the radial distance conversion to geometric altitude
+def intv_geometric_altitude(r) -> Interval:
+    r_iv = promote(r)
+    return r_iv - RADIUS_EARTH
+
 def gravity(r: float) -> float:
     """Compute gravity magnitude at radius r."""
     return MU / (r * r)
+
+def intv_gravity(r:float) -> Interval:
+    r_iv = promote(r)
+    return (MU / (r_iv * r_iv))
 
 # table for base values for the 1976 us std. atmosphere model
 base_layers = {
