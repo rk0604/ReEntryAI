@@ -203,34 +203,96 @@ def intv_temp_in_layer(layers: dict, h: Interval) -> dict:
 
 
 def intv_pressure_in_layer(layers: dict, h: Interval, temperatures: dict) -> dict:
+    """
+    Interval pressure computation for each atmospheric layer.
+
+    IMPORTANT MODELING NOTE:
+    Interval arithmetic can cause temperature or pressure intervals
+    to include non-physical values (such as <= 0) due to overestimation.
+    Since pressure and temperature are strictly positive in reality,
+    Enforce this known physical invariant via conservative clamping.
+
+    This prevents undefined operations (such as log of non-positive values)
+    while preserving a valid outer enclosure.
+    """
+
     pressure = {}
+
+    # Small positive lower bound to enforce physical domain
+    # This does NOT assert pressure is this small, only that it is positive
+    EPS = 1e-9
+
     for k in layers.keys():
         layer_params = get_layer_params(k)
-        lapse_rate = layer_params['L_K_per_m']
-        base_temp = layer_params['T_b_K']
-        base_height = layer_params['h_b_m']
-        base_pressure = layer_params['p_b_Pa']
+
+        lapse_rate = layer_params["L_K_per_m"]
+        base_temp = layer_params["T_b_K"]
+        base_height = layer_params["h_b_m"]
+        base_pressure = layer_params["p_b_Pa"]
+
         T = temperatures[k]
 
+        # -------------------------------
+        # Enforce temperature positivity
+        # -------------------------------
+        # Temperature must be strictly positive.
+        # If interval overestimation causes T.lo <= 0,
+        # we clamp it to a small positive value.
+        T_safe = Interval(
+            max(T.lo, EPS),
+            max(T.hi, EPS)
+        )
+
         if lapse_rate != 0.0:
+            # Pressure law with lapse rate
             exponent = (-constants.g_0) / (lapse_rate * constants.R_AIR_DRY)
-            temp_ratio = T / base_temp
-            factor = (temp_ratio.log() * exponent).exp()
+
+            # temp_ratio must be positive for log
+            temp_ratio = T_safe / base_temp
+
+            # Enforce positivity before log
+            temp_ratio_safe = Interval(
+                max(temp_ratio.lo, EPS),
+                max(temp_ratio.hi, EPS)
+            )
+
+            factor = (temp_ratio_safe.log() * exponent).exp()
             pressure[k] = base_pressure * factor
+
         else:
+            # Isothermal layer case
             exponent = (
                 -constants.g_0 * (h - base_height)
             ) / (constants.R_AIR_DRY * base_temp)
+
             pressure[k] = base_pressure * exponent.exp()
 
     return pressure
 
 
 def intv_density_from_pressure(pressures: dict, temperatures: dict) -> dict:
+    """
+    Interval density computation using ideal gas law.
+
+    Density must be strictly positive.
+    Enforce positivity of temperature to avoid division by zero
+    or negative values due to interval overestimation.
+    """
+
     densities = {}
+    EPS = 1e-9
+
     for k in pressures.keys():
-        density_intv = pressures[k] / (constants.R_AIR_DRY * temperatures[k])
-        densities[k] = density_intv
+        T = temperatures[k]
+
+        # Enforce temperature positivity
+        T_safe = Interval(
+            max(T.lo, EPS),
+            max(T.hi, EPS)
+        )
+
+        densities[k] = pressures[k] / (constants.R_AIR_DRY * T_safe)
+
     return densities
 
 

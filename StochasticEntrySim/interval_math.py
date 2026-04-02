@@ -334,7 +334,7 @@ def box_split(box: Box, idx: Optional[int] = None) -> Tuple[Box, Box]:
 
 
 # ---------------------------
-# Convenience: "safe" helpers used a lot in dynamics
+# Convenience: helpers used commonly in dynamics
 # ---------------------------
 def dynamic_pressure(rho: MaybeInterval, V: MaybeInterval) -> Interval:
     """
@@ -357,9 +357,26 @@ def clamp_interval(iv: Interval, lo: float, hi: float) -> Interval:
         raise ValueError(f"clamp_interval empty intersection: {iv} ∩ [{lo},{hi}]")
     return Interval(new_lo, new_hi)
 
+# ---------------------------
+# interval euler time step for the ODEs
+# ---------------------------
+# def interval_euler_step(X, dt, f):
+#     """
+#     X : list[Interval]  (state box)
+#     dt: float
+#     f : function(t, X) -> list[Interval] (derivatives)
+#     """
+#     Xdot = f(X)
+#     return box_add(X, box_scalar_mul(dt, Xdot))
+
+def interval_euler_step(X, dt, f, t=None):
+    Xdot = f(t, X) if t is not None else f(X)
+    return box_add(X, box_scalar_mul(dt, Xdot))
+
+
 
 # ---------------------------
-# Small self-test (optional)
+# Small self-test
 # ---------------------------
 if __name__ == "__main__":
     # Quick sanity checks
