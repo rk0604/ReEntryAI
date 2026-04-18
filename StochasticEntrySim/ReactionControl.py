@@ -1,7 +1,7 @@
 """
 ReactionControl.py
 
-Milestone-1 physical RCS model for the entry capsule.
+Milestone-1 physical RCS model for the entry capsule
 
 What this file does
 -------------------
@@ -24,7 +24,7 @@ This file is intentionally scoped to the first useful step:
 
 Important design choice
 -----------------------
-This module works in the BODY frame only.
+This module works in the BODY frame only
 
 That is deliberate:
 - thrusters are fixed in body coordinates
@@ -34,7 +34,7 @@ That is deliberate:
 
 Numerical behavior
 ------------------
-Your physics loop runs at dt = 0.25 s.
+The physics loop runs at dt = 0.25 s.
 To stay compatible with that fixed-step loop, minimum pulse width is modeled
 as one full simulation step.
 
@@ -56,9 +56,7 @@ import numpy as np
 import constants
 
 
-# ------------------------------------------------------------------------------
-# Small math helpers
-# ------------------------------------------------------------------------------
+# Small math helpers ------------------------------------------------------------------
 
 def clamp(value: float, lower: float, upper: float) -> float:
     """
@@ -81,10 +79,7 @@ def normalize(vec: np.ndarray, eps: float = 1.0e-12) -> np.ndarray:
         raise ValueError("Cannot normalize near-zero vector")
     return arr / n
 
-
-# ------------------------------------------------------------------------------
-# Core thruster and wrench data models
-# ------------------------------------------------------------------------------
+# Core thruster and wrench data models ------------------------------------------------------------------
 
 @dataclass
 class RCSThruster:
@@ -182,19 +177,16 @@ class RollChannelStepResult:
     wrench: RCSWrench
 
 
-# ------------------------------------------------------------------------------
-# Duty accumulation for fixed-step minimum pulse logic
-# ------------------------------------------------------------------------------
-
+# Duty accumulation for fixed-step minimum pulse logic ------------------------------------------------------------------
 class PulseAccumulator:
     """
     Convert a fractional duty request into whole-step ON/OFF firing.
 
     Why this exists
     ---------------
-    Your integrator uses a fixed step of dt = 0.25 s.
+    The integrator uses a fixed step of dt = 0.25 s.
     If minimum pulse width is also 0.25 s, then inside one step the jet cannot
-    fire for "half a step" physically in this simple model.
+    fire for "half a step" physically in this simple model
 
     So we accumulate requested duty across steps:
     - if requested duty is large enough, fire this step
@@ -209,7 +201,7 @@ class PulseAccumulator:
 
     def step(self, duty_request: float) -> bool:
         """
-        Return True if the channel should fire for this entire simulation step.
+        Return True if the channel should fire for this entire simulation step
         """
         duty_request = clamp(float(duty_request), 0.0, 1.0)
         self._accum += duty_request
@@ -224,10 +216,7 @@ class PulseAccumulator:
     def residual(self) -> float:
         return self._accum
 
-
-# ------------------------------------------------------------------------------
-# Physical RCS system
-# ------------------------------------------------------------------------------
+# Physical RCS system ------------------------------------------------------------------
 
 class CapsuleRCSSystem:
     """
@@ -236,10 +225,10 @@ class CapsuleRCSSystem:
     Layout assumptions
     ------------------
     - Thrusters are fixed in body coordinates.
-    - Body-frame force and torque are computed exactly from the thruster layout.
-    - The roll allocator uses symmetric tangential jets.
+    - Body-frame force and torque are computed exactly from the thruster layout
+    - The roll allocator uses symmetric tangential jets
     - Axial jets are stored now for future pitch/yaw control, even though
-      milestone 1 does not allocate them yet.
+      milestone 1 does not allocate them yet
 
     Main API
     --------
@@ -274,13 +263,11 @@ class CapsuleRCSSystem:
         if missing:
             raise ValueError(f"Unknown thruster names in layout: {missing}")
 
-        # Separate accumulators for positive-roll and negative-roll channels.
+        # Separate accumulators for positive-roll and negative-roll channels
         self._roll_pos_pwm = PulseAccumulator()
         self._roll_neg_pwm = PulseAccumulator()
 
-    # ------------------------------------------------------------------
     # Lifecycle
-    # ------------------------------------------------------------------
 
     def reset(self) -> None:
         """
@@ -289,9 +276,7 @@ class CapsuleRCSSystem:
         self._roll_pos_pwm.reset()
         self._roll_neg_pwm.reset()
 
-    # ------------------------------------------------------------------
     # Basic access helpers
-    # ------------------------------------------------------------------
 
     def get_thruster(self, name: str) -> RCSThruster:
         return self.thrusters[name]
@@ -299,9 +284,7 @@ class CapsuleRCSSystem:
     def names(self) -> List[str]:
         return list(self.thrusters.keys())
 
-    # ------------------------------------------------------------------
-    # Wrench evaluation
-    # ------------------------------------------------------------------
+    # Wrench evaluation ------------------------------------------------------------------
 
     def body_wrench(self, fire_cmd: ThrusterFireCommand) -> RCSWrench:
         """
@@ -317,9 +300,7 @@ class CapsuleRCSSystem:
 
         return RCSWrench(force_b_N=force_b, torque_b_Nm=torque_b)
 
-    # ------------------------------------------------------------------
-    # Roll-channel capability
-    # ------------------------------------------------------------------
+    # Roll-channel capability ------------------------------------------------------------------
 
     def roll_torque_capacity_Nm(self, positive: bool = True) -> float:
         """
@@ -335,9 +316,7 @@ class CapsuleRCSSystem:
 
         return abs(float(tau_z))
 
-    # ------------------------------------------------------------------
-    # Roll allocator
-    # ------------------------------------------------------------------
+    # Roll allocator ------------------------------------------------------------------
 
     def allocate_roll_step(
         self,
@@ -440,10 +419,7 @@ class CapsuleRCSSystem:
         )
 
 
-# ------------------------------------------------------------------------------
 # Orion-inspired milestone-1 12-thruster layout
-# ------------------------------------------------------------------------------
-
 def build_orion_cm_rcs_12(
     ring_radius_m: float = constants.CAPSULE_RCS_RING_RADIUS_M,
     ring_z_m: float = constants.CAPSULE_RCS_RING_Z_M,
@@ -546,9 +522,7 @@ def build_orion_cm_rcs_12(
     )
 
 
-# ------------------------------------------------------------------------------
-# Optional compatibility helpers
-# ------------------------------------------------------------------------------
+# compatibility helpers
 
 @dataclass
 class LegacyPulseResult:
@@ -556,9 +530,7 @@ class LegacyPulseResult:
     Small compatibility packet for older logs or notebooks that still expect
     something pulse-like from an RCS object.
 
-    This is not used by the new milestone-1 control stack directly.
-    It is provided only to make migration less painful if you still have
-    analysis code that wants "pulse" style outputs.
+    This is not used by the new milestone-1 control stack directly
     """
     fired: bool
     active_names: List[str]
@@ -618,8 +590,6 @@ class LegacyPulseAdapter:
 #
 # F_rcs_b = roll_step.wrench.force_b_N
 # tau_rcs_b = roll_step.wrench.torque_b_Nm
-#
-# # Then pass tau_rcs_b into your attitude integrator in math_3d.py.
 #
 # Important:
 # - control.py owns sigma_cmd and sigma_target

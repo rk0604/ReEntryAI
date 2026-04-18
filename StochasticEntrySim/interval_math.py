@@ -35,7 +35,7 @@ Box = List["Interval"]  # vector of intervals
 class Interval:
     """
     Closed interval [lo, hi].
-    Invariant: lo <= hi, unless you construct via empty interval intentionally (not recommended).
+    Invariant: lo <= hi
     """
     lo: float
     hi: float
@@ -44,9 +44,7 @@ class Interval:
         if self.lo > self.hi:
             raise ValueError(f"Invalid Interval: lo ({self.lo}) > hi ({self.hi})")
 
-    # ---------------------------
-    # Basic properties
-    # ---------------------------
+    # Basic properties ---------------------------
     def width(self) -> float:
         return self.hi - self.lo
 
@@ -59,16 +57,12 @@ class Interval:
     def is_punctual(self) -> bool:
         return self.lo == self.hi
 
-    # ---------------------------
-    # Set hull / union wrapper
-    # ---------------------------
+    # Set hull / union wrapper ---------------------------
     def hull(self, other: "Interval") -> "Interval":
         """Smallest interval containing self and other."""
         return Interval(min(self.lo, other.lo), max(self.hi, other.hi))
 
-    # ---------------------------
-    # Arithmetic operators
-    # ---------------------------
+    # Arithmetic operators ---------------------------
     def __neg__(self) -> "Interval":
         return Interval(-self.hi, -self.lo)
 
@@ -114,9 +108,7 @@ class Interval:
         o = promote(other)
         return o * self.reciprocal()
 
-    # ---------------------------
-    # Useful extras
-    # ---------------------------
+    # Useful extras ---------------------------
     def abs(self) -> "Interval":
         """Interval absolute value enclosure."""
         if self.lo >= 0:
@@ -177,19 +169,14 @@ def promote(x: MaybeInterval) -> Interval:
     return Interval(float(x), float(x))
 
 
-# ---------------------------
-# Scalar helpers (explicit)
-# ---------------------------
+# Scalar helpers (explicit) ------------------------------------------------------
 def scalar_times_interval(alpha: float, iv: Interval) -> Interval:
     """alpha * [lo,hi] with bound flip when alpha < 0."""
     if alpha >= 0:
         return Interval(alpha * iv.lo, alpha * iv.hi)
     return Interval(alpha * iv.hi, alpha * iv.lo)
 
-
-# ---------------------------
-# Trig inclusion functions
-# ---------------------------
+# Trig inclusion functions ------------------------------------------------------
 _TWO_PI = 2.0 * math.pi
 _HALF_PI = 0.5 * math.pi
 
@@ -259,9 +246,7 @@ def interval_cos(x: Interval) -> Interval:
     return Interval(lo, hi)
 
 
-# ---------------------------
 # Box (vector of intervals) helpers
-# ---------------------------
 def box_from_numbers(vals: Sequence[Number]) -> Box:
     return [Interval(float(v), float(v)) for v in vals]
 
@@ -311,7 +296,7 @@ def box_contains(box: Box, point: Sequence[float]) -> bool:
 def box_split(box: Box, idx: Optional[int] = None) -> Tuple[Box, Box]:
     """
     Split a box into two boxes by bisecting one interval (default: widest dimension).
-    This is your main tool later to reduce overestimation.
+    This is the main tool later to reduce overestimation
     """
     if not box:
         raise ValueError("box_split: empty box")
@@ -332,10 +317,7 @@ def box_split(box: Box, idx: Optional[int] = None) -> Tuple[Box, Box]:
     right[idx] = right_iv
     return left, right
 
-
-# ---------------------------
-# Convenience: helpers used commonly in dynamics
-# ---------------------------
+# Convenience: helpers used commonly in dynamics ---------------------------
 def dynamic_pressure(rho: MaybeInterval, V: MaybeInterval) -> Interval:
     """
     q = 0.5 * rho * V^2
@@ -357,9 +339,7 @@ def clamp_interval(iv: Interval, lo: float, hi: float) -> Interval:
         raise ValueError(f"clamp_interval empty intersection: {iv} ∩ [{lo},{hi}]")
     return Interval(new_lo, new_hi)
 
-# ---------------------------
-# interval euler time step for the ODEs
-# ---------------------------
+# interval euler time step for the ODEs ---------------------------
 # def interval_euler_step(X, dt, f):
 #     """
 #     X : list[Interval]  (state box)
@@ -375,9 +355,7 @@ def interval_euler_step(X, dt, f, t=None):
 
 
 
-# ---------------------------
-# Small self-test
-# ---------------------------
+# self-test
 if __name__ == "__main__":
     # Quick sanity checks
     x = Interval(0.9, 1.1)

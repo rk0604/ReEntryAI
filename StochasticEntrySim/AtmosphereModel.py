@@ -19,7 +19,7 @@ def geopotential_altitude(z) -> float:
     return geo_alt
 
 # determine which atmospheric layer (0-86km) contains the current geopotential_alt
-# It returns an integer layer index (0 to 6) that tells you which set of base values and lapse rate to use.
+# It returns an integer layer index (0 to 6) that is used to get a set of base values and lapse rate to use.
 # The rate at which temperature changes with altitude inside an atmospheric layer.
 def find_layer(h: float):
     key = ""
