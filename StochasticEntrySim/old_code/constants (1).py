@@ -322,12 +322,8 @@ HEAT_LOAD_LIMIT_DEFAULT = 2.5e9
 # Enable interval box recentering around the current nominal state.
 INTERVAL_RECENTER_ENABLED = True
 
-# Enable fixed time cadence recentering.
-# Turn this off for RL dataset generation so recenter only happens for interval health reasons.
-INTERVAL_RECENTER_USE_CADENCE = False
-
 # Rebuild the live interval box every fixed number of seconds when active.
-INTERVAL_RECENTER_CADENCE_S = 5.0 # so 20 euler steps
+INTERVAL_RECENTER_CADENCE_S = 5.0
 
 # Per state width thresholds that can also trigger a recenter.
 INTERVAL_RECENTER_WIDTH_THRESHOLDS = {

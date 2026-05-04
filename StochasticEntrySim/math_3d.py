@@ -1,38 +1,14 @@
 """
-math_3d.py
+interval and nominal translational reentry dynamics for milestone one
 
-Interval and nominal translational reentry dynamics for milestone 1.
+state order
 
-This file keeps the existing interval supervisor architecture while using a
-corrected spherical Earth point mass entry model with bank modulated lift.
-
-State convention kept intact
-
-X = [r, phi, lam, V, gamma, chi]
-
-r      radial distance from Earth center in meters
-phi    geocentric latitude in radians
-lam    longitude in radians
-V      speed magnitude in m per s
-gamma  flight path angle in radians
-chi    heading angle in radians measured from east toward north
-
-Modeling scope
-
-spherical Earth
-non rotating Earth for milestone 1
-point mass 3DOF translational dynamics
-bank angle modulates lift between vertical plane and lateral components
-drag acts only opposite the velocity vector and therefore only enters V_dot
-
-The interval supervisor remains an annotation layer around the nominal path.
-
-Important milestone 1 approximation note
-
-The predictor corrector support added here uses the current corrected 3DOF
-translational model plus the current interval heat shield model. That is the
-closest clean milestone 1 fit to the current codebase. It is not a literal
-line by line reproduction of every equation in Lu.
+r
+phi
+lam
+v
+gamma
+chi
 """
 
 from __future__ import annotations
@@ -40,266 +16,235 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import AtmosphereModel
 import constants
-from interval_math import Interval, box_add, box_scalar_mul, promote
+from interval_math import Interval, box_add, box_scalar_mul, box_split, promote
 
 
-# Keep one canonical ordering for state names.
-# This is used by interval width dictionaries and debug output.
 STATE_NAMES = ("r", "phi", "lam", "V", "gamma", "chi")
 
-# Configuration and result models ---------------------------------
 
 @dataclass
 class IntervalSupervisorConfig:
     """
-    Half widths used to inflate a nominal translational state into an interval box.
+    store the live interval supervisor settings
+
+    this includes the initial half widths heat limits recenter logic
+    split logic and denominator safety thresholds
+
+    input
+    scalar configuration values
+
+    output
+    one config object used by interval propagation
     """
 
-    # Half width for radius in meters.
     r_half_width_m: float = 0.0
-
-    # Half width for latitude in radians.
     phi_half_width_rad: float = 0.0
-
-    # Half width for longitude in radians.
     lam_half_width_rad: float = 0.0
-
-    # Half width for speed in meters per second.
     V_half_width_mps: float = 0.0
-
-    # Half width for flight path angle in radians.
     gamma_half_width_rad: float = 0.0
-
-    # Half width for heading angle in radians.
     chi_half_width_rad: float = 0.0
 
-    # Optional lower altitude constraint for interval summary checks.
     min_altitude_m: Optional[float] = None
-
-    # Optional upper altitude constraint for interval summary checks.
     max_altitude_m: Optional[float] = None
-
-    # Optional upper speed constraint for interval summary checks.
     max_speed_mps: Optional[float] = None
-
-    # Optional upper dynamic pressure constraint for interval summary checks.
     max_dynamic_pressure_pa: Optional[float] = None
 
-    # When True, interval heating is propagated during annotation.
     include_heating: bool = False
+    heat_rate_limit: Optional[float] = constants.HEAT_RATE_LIMIT_DEFAULT
+    heat_load_limit: Optional[float] = constants.HEAT_LOAD_LIMIT_DEFAULT
+
+    interval_recenter_enabled: bool = constants.INTERVAL_RECENTER_ENABLED
+    interval_recenter_use_cadence: bool = getattr(constants, "INTERVAL_RECENTER_USE_CADENCE", True)
+    interval_recenter_cadence_s: float = constants.INTERVAL_RECENTER_CADENCE_S
+    interval_recenter_width_thresholds: Dict[str, float] = field(
+        default_factory=lambda: dict(constants.INTERVAL_RECENTER_WIDTH_THRESHOLDS)
+    )
+
+    interval_box_split_enabled: bool = constants.INTERVAL_BOX_SPLIT_ENABLED
+    interval_box_split_max_depth: int = constants.INTERVAL_BOX_SPLIT_MAX_DEPTH
+    interval_box_split_width_thresholds: Dict[str, float] = field(
+        default_factory=lambda: dict(constants.INTERVAL_BOX_SPLIT_WIDTH_THRESHOLDS)
+    )
+
+    interval_denominator_safety_V_mps: float = constants.INTERVAL_DENOMINATOR_SAFETY_V_MPS
+    interval_denominator_safety_cos_gamma: float = constants.INTERVAL_DENOMINATOR_SAFETY_COS_GAMMA
+    interval_denominator_safety_cos_phi: float = constants.INTERVAL_DENOMINATOR_SAFETY_COS_PHI
 
 
 @dataclass
 class IntervalAnnotationResult:
     """
-    Interval supervisor output for one annotated translational step
+    store the result of one interval annotation step
+
+    this tracks the new interval box derivative widths heat summary
+    safety flags and whether recenter or splitting was used
+
+    input
+    values created by one interval propagation step
+
+    output
+    one structured result object
     """
 
-    # Interval state before the propagated step
     x_interval_old: List[Interval]
-
-    # Interval state after the propagated step
     x_interval_new: List[Interval]
-
-    # Interval derivative used during propagation
     dx_interval: List[Interval]
 
-    # Bank interval used for this step
     sigma_interval_used: Interval
-
-    # Interval density hull used for this step
     rho_interval: Interval
-
-    # Interval dynamic pressure for this step
     q_interval: Interval
-
-    # Interval geometric altitude for this step
     altitude_interval: Interval
-
-    # Interval temperature hull if available
     temperature_interval: Optional[Interval]
-
-    # Interval pressure hull if available
     pressure_interval: Optional[Interval]
 
-    # Widths of the interval state before stepping
     state_widths_old: Dict[str, float] = field(default_factory=dict)
-
-    # Widths of the interval state after stepping.
     state_widths_new: Dict[str, float] = field(default_factory=dict)
-
-    # Widths of the interval derivative.
     dx_widths: Dict[str, float] = field(default_factory=dict)
 
-    # Maximum cell heating rate interval if heating is enabled
     heating_qdot_max_interval: Optional[Interval] = None
-
-    # Mean heating rate interval if heating is enabled.
     heating_qdot_mean_interval: Optional[Interval] = None
-
-    # Maximum accumulated heat interval if heating is enabled
     heating_Q_max_interval: Optional[Interval] = None
-
-    # Heat shield object after the propagated step
     heat_shield: Optional[Any] = None
 
-    # Summary status from simple bound checks
     safety_status: str = "not_evaluated"
-
-    # Per limit check status values.
     safety_checks: Dict[str, str] = field(default_factory=dict)
-
-    # Atmospheric layer indices intersected by the altitude interval
     layer_indices: List[int] = field(default_factory=list)
+
+    interval_valid: bool = True
+    interval_active: bool = True
+    interval_failed: bool = False
+    interval_failure_kind: str = "none"
+    interval_failure_reason: str = ""
+    interval_numerical_failure: bool = False
+    interval_heat_violation: bool = False
+
+    recentered_this_step: bool = False
+    recenter_reason: str = ""
+    split_this_step: bool = False
+    split_reason: str = ""
+    split_depth_used: int = 0
+    split_child_count: int = 0
+
+    last_valid_interval_state: Optional[List[Interval]] = None
 
 
 @dataclass
 class RolloutStepSummary:
     """
-    One step summary for a predictor corrector candidate rollout.
+    store one predictor rollout step summary
+
+    input
+    nominal interval and heat data for one rollout step
+
+    output
+    one step packet used by guidance logs
     """
 
-    # Step index inside the candidate rollout.
     step_index: int
-
-    # Physical time associated with this step.
     time_s: float
-
-    # Nominal state before the step.
     x_nominal_before: List[float]
-
-    # Nominal state after the step.
     x_nominal_after: List[float]
-
-    # Interval state after the step if propagation was valid.
     x_interval_after: Optional[List[Interval]]
-
-    # Maximum heating rate interval seen at this step.
     max_heating_rate_interval: Interval
-
-    # Maximum accumulated heat interval seen at this step.
     max_heat_load_interval: Interval
-
-    # Whether the candidate is still heat feasible after this step.
     heat_feasible_after_step: bool
-
-    # Whether interval propagation remained valid after this step.
     interval_valid_after_step: bool
-
-    # Failure reason string if the candidate has failed.
     failure_reason: str = ""
 
 
 @dataclass
 class PredictorCorrectorRolloutResult:
     """
-    Summary returned to guidance for one candidate rollout.
+    store one predictor corrector candidate rollout
 
-    Guidance uses this object to combine geometry prediction and heat
-    feasibility inside one coherent candidate evaluation.
+    input
+    all states and heat results from a short horizon candidate simulation
+
+    output
+    one object used by guidance scoring
     """
 
-    # Candidate bank command being evaluated.
     sigma_cmd_rad: float
-
-    # Number of short horizon steps requested.
     horizon_steps: int
-
-    # Sequence of nominal states including the initial state.
     nominal_states: List[List[float]] = field(default_factory=list)
-
-    # Sequence of interval states including the initial state when available.
     interval_states: List[List[Interval]] = field(default_factory=list)
-
-    # Step by step summary packets.
     step_summaries: List[RolloutStepSummary] = field(default_factory=list)
 
-    # Final nominal state.
     final_nominal_state: List[float] = field(default_factory=list)
-
-    # Final interval state if propagation remained valid.
     final_interval_state: Optional[List[Interval]] = None
-
-    # Final heat shield state after the rollout.
     final_heat_shield: Optional[Any] = None
 
-    # Hull of maximum heating rate across the rollout horizon.
     max_heating_rate_interval: Interval = field(default_factory=lambda: Interval(0.0, 0.0))
-
-    # Hull of maximum accumulated heat across the rollout horizon.
     max_heat_load_interval: Interval = field(default_factory=lambda: Interval(0.0, 0.0))
 
-    # Index of the first violating step.
     first_violation_step: int = -1
-
-    # Physical time of the first violating step.
     first_violation_time_s: float = math.nan
 
-    # True only if heat rate and heat load limits stayed satisfied.
     heat_feasible: bool = True
-
-    # True only if interval propagation stayed valid.
     interval_valid: bool = True
-
-    # Scalar violation magnitude used for optimization penalties.
+    interval_screen_used: bool = True
+    interval_failure_kind: str = "none"
     violation_amount: float = 0.0
-
-    # Scalar heat penalty accumulated during rollout.
     heat_penalty: float = 0.0
-
-    # Human readable reason for failure.
     failure_reason: str = ""
 
-# Small helpers used by both nominal and interval paths
 
 def _get_param(params: Dict[str, Any], *keys: str, default: Optional[float] = None) -> float:
     """
-    Fetch the first matching numeric parameter from a dictionary.
+    fetch the first matching numeric parameter
+
+    input
+    parameter dictionary and possible key names
+
+    output
+    one float value
     """
-    # Try each alias in order so older notebook parameter names keep working.
     for key in keys:
         if key in params:
             return float(params[key])
 
-    # If nothing matched and no default exists, fail loudly.
     if default is None:
         raise KeyError(f"Missing required parameter. Tried keys={keys}")
 
-    # Otherwise return the caller provided default.
     return float(default)
 
 
 def hull_intervals(intervals: List[Interval]) -> Interval:
     """
-    Return the smallest interval containing all input intervals.
+    build the smallest interval that contains all input intervals
+
+    input
+    a nonempty list of intervals
+
+    output
+    one hull interval
     """
-    # Empty input is a real usage error because there is no hull to build.
     if not intervals:
         raise ValueError("interval list cannot be empty")
 
-    # Start from the first interval.
     out = intervals[0]
-
-    # Expand the hull one interval at a time.
     for iv in intervals[1:]:
         out = out.hull(iv)
-
     return out
 
 
 def nominal_state_to_interval_box(x_nominal: List[float]) -> List[Interval]:
     """
-    Convert a nominal float state into a punctual interval box.
+    convert a nominal state into a zero width interval box
+
+    input
+    six component nominal state
+
+    output
+    six component interval box
     """
-    # The translational state must always have six components.
     if len(x_nominal) != 6:
         raise ValueError("x_nominal must have 6 components")
 
-    # Promote every scalar state into a zero width interval.
     return [promote(float(v)) for v in x_nominal]
 
 
@@ -308,13 +253,17 @@ def inflate_nominal_state_to_interval_box(
     cfg: IntervalSupervisorConfig,
 ) -> List[Interval]:
     """
-    Inflate a nominal float state into an interval box using configured half widths.
+    inflate a nominal state into an interval box using configured half widths
+
+    input
+    six component nominal state and supervisor config
+
+    output
+    six component interval box
     """
-    # The translational state must always have six components.
     if len(x_nominal) != 6:
         raise ValueError("x_nominal must have 6 components")
 
-    # Collect half widths in the same order as the state vector.
     half_widths = [
         float(cfg.r_half_width_m),
         float(cfg.phi_half_width_rad),
@@ -324,7 +273,6 @@ def inflate_nominal_state_to_interval_box(
         float(cfg.chi_half_width_rad),
     ]
 
-    # Build one interval per state component.
     return [
         Interval(float(x_nominal[i]) - half_widths[i], float(x_nominal[i]) + half_widths[i])
         for i in range(6)
@@ -333,39 +281,426 @@ def inflate_nominal_state_to_interval_box(
 
 def interval_component_widths(box: List[Interval]) -> Dict[str, float]:
     """
-    Compute per component interval widths for a translational box.
+    compute one width value for each state component
+
+    input
+    six component interval box
+
+    output
+    mapping from state name to width
     """
-    # The interval state box must match the six state convention.
     if len(box) != 6:
         raise ValueError("box must have 6 components")
 
-    # Return a small name to width dictionary for logging and diagnostics.
     return {STATE_NAMES[i]: float(box[i].width()) for i in range(6)}
+
+
+def copy_interval(iv: Interval) -> Interval:
+    """
+    make a shallow copy of one interval
+
+    input
+    one interval
+
+    output
+    copied interval
+    """
+    return Interval(float(iv.lo), float(iv.hi))
+
+
+def copy_interval_box(box: List[Interval]) -> List[Interval]:
+    """
+    make a shallow copy of one interval box
+
+    input
+    one interval box
+
+    output
+    copied interval box
+    """
+    return [copy_interval(iv) for iv in box]
+
+
+def hull_interval_boxes(boxes: List[List[Interval]]) -> List[Interval]:
+    """
+    build the componentwise hull across many interval boxes
+
+    input
+    nonempty list of interval boxes
+
+    output
+    one hull box
+    """
+    if not boxes:
+        raise ValueError("boxes cannot be empty")
+
+    return [
+        hull_intervals([box[i] for box in boxes])
+        for i in range(len(boxes[0]))
+    ]
+
+
+def _interval_abs_min(iv: Interval) -> float:
+    """
+    return the smallest absolute value that may appear in an interval
+
+    input
+    one interval
+
+    output
+    scalar absolute minimum
+    """
+    if iv.lo <= 0.0 <= iv.hi:
+        return 0.0
+    return min(abs(float(iv.lo)), abs(float(iv.hi)))
+
+
+def _crosses_cadence_boundary(t_s: float, dt_s: float, cadence_s: float) -> bool:
+    """
+    detect whether a step crosses a cadence bucket boundary
+
+    input
+    current time step size and cadence size
+
+    output
+    true when a new cadence bucket is entered
+    """
+    if cadence_s <= 0.0:
+        return False
+
+    prev_bin = int(max(float(t_s), 0.0) / float(cadence_s))
+    next_bin = int(max(float(t_s) + float(dt_s), 0.0) / float(cadence_s))
+    return next_bin > prev_bin
+
+
+def interval_width_exceeds_thresholds(
+    box: List[Interval],
+    thresholds: Optional[Dict[str, float]],
+) -> bool:
+    """
+    check whether any state width exceeds its configured threshold
+
+    input
+    interval box and optional width limits
+
+    output
+    true when any width is too large
+    """
+    if not thresholds:
+        return False
+
+    widths = interval_component_widths(box)
+    for name, width in widths.items():
+        limit = thresholds.get(name)
+        if limit is not None and float(width) > float(limit):
+            return True
+
+    return False
+
+
+def dangerous_interval_denominator_flags(
+    box: List[Interval],
+    cfg: Optional[IntervalSupervisorConfig],
+) -> Dict[str, bool]:
+    """
+    flag denominator regions that are getting close to singular behavior
+
+    the sensitive terms are v cos gamma and cos phi
+
+    input
+    interval box and supervisor config
+
+    output
+    dictionary of boolean danger flags
+    """
+    if cfg is None:
+        return {
+            "V": False,
+            "cos_gamma": False,
+            "cos_phi": False,
+        }
+
+    V_iv = box[3]
+    gamma_iv = box[4]
+    phi_iv = box[1]
+
+    cos_gamma_iv = gamma_iv.cos()
+    cos_phi_iv = phi_iv.cos()
+
+    return {
+        "V": float(V_iv.lo) <= float(cfg.interval_denominator_safety_V_mps),
+        "cos_gamma": _interval_abs_min(cos_gamma_iv) <= float(cfg.interval_denominator_safety_cos_gamma),
+        "cos_phi": _interval_abs_min(cos_phi_iv) <= float(cfg.interval_denominator_safety_cos_phi),
+    }
+
+
+def should_recenter_interval_box(
+    x_interval_old: List[Interval],
+    x_nominal_center: Optional[List[float]],
+    cfg: Optional[IntervalSupervisorConfig],
+    t_s: float,
+    dt_s: float,
+) -> Tuple[bool, str]:
+    """
+    decide whether the live interval box should be rebuilt around nominal
+
+    this now separates width based health recenter from fixed cadence recenter
+    so rl data can ignore maintenance resets when cadence is disabled
+
+    input
+    current interval box nominal center config current time and step size
+
+    output
+    recenter flag and short reason string
+    """
+    if cfg is None or not bool(cfg.interval_recenter_enabled):
+        return False, ""
+
+    if x_nominal_center is None:
+        return False, ""
+
+    if interval_width_exceeds_thresholds(x_interval_old, cfg.interval_recenter_width_thresholds):
+        return True, "width_threshold"
+
+    # this block is the main fix
+    # cadence recenter only runs when the new config flag allows it
+    if bool(cfg.interval_recenter_use_cadence) and _crosses_cadence_boundary(
+        t_s=float(t_s),
+        dt_s=float(dt_s),
+        cadence_s=float(cfg.interval_recenter_cadence_s),
+    ):
+        return True, "cadence"
+
+    return False, ""
+
+
+def recenter_interval_box_around_nominal(
+    x_nominal_center: List[float],
+    cfg: Optional[IntervalSupervisorConfig],
+) -> List[Interval]:
+    """
+    rebuild the live interval box around the current nominal center
+
+    input
+    nominal center and optional config
+
+    output
+    new interval box centered on nominal
+    """
+    if cfg is None:
+        return nominal_state_to_interval_box(x_nominal_center)
+
+    return inflate_nominal_state_to_interval_box(x_nominal_center, cfg)
+
+
+def choose_split_dimension(
+    box: List[Interval],
+    cfg: Optional[IntervalSupervisorConfig],
+) -> int:
+    """
+    choose the dimension used for adaptive splitting
+
+    denominator danger takes priority
+    otherwise the widest dimension is split
+
+    input
+    interval box and config
+
+    output
+    split index
+    """
+    flags = dangerous_interval_denominator_flags(box, cfg)
+
+    if flags.get("cos_gamma", False):
+        return 4
+    if flags.get("cos_phi", False):
+        return 1
+    if flags.get("V", False):
+        return 3
+
+    widths = [iv.width() for iv in box]
+    return int(max(range(len(widths)), key=lambda i: widths[i]))
+
+
+def interval_box_needs_split(
+    box: List[Interval],
+    cfg: Optional[IntervalSupervisorConfig],
+) -> bool:
+    """
+    decide whether adaptive splitting should be attempted
+
+    input
+    interval box and config
+
+    output
+    true when the box is too wide or near a dangerous denominator
+    """
+    if cfg is None or not bool(cfg.interval_box_split_enabled):
+        return False
+
+    if interval_width_exceeds_thresholds(box, cfg.interval_box_split_width_thresholds):
+        return True
+
+    flags = dangerous_interval_denominator_flags(box, cfg)
+    return any(bool(v) for v in flags.values())
+
+
+def split_reason_from_box(
+    box: List[Interval],
+    cfg: Optional[IntervalSupervisorConfig],
+) -> str:
+    """
+    describe why adaptive splitting is needed
+
+    input
+    interval box and config
+
+    output
+    short split reason string
+    """
+    if cfg is None:
+        return ""
+
+    if interval_width_exceeds_thresholds(box, cfg.interval_box_split_width_thresholds):
+        return "width_threshold"
+
+    flags = dangerous_interval_denominator_flags(box, cfg)
+    if bool(flags.get("cos_gamma", False)):
+        return "denominator_cos_gamma"
+    if bool(flags.get("cos_phi", False)):
+        return "denominator_cos_phi"
+    if bool(flags.get("V", False)):
+        return "denominator_V"
+
+    return ""
+
+
+def hull_heat_shields(heat_shields: List[Any]) -> Optional[Any]:
+    """
+    hull many heat shield states cell by cell
+
+    input
+    list of heat shield objects
+
+    output
+    one hull heat shield
+    """
+    if not heat_shields:
+        return None
+
+    out = clone_interval_heat_shield(heat_shields[0])
+
+    for shield in heat_shields[1:]:
+        for i in range(len(out.qdot)):
+            out.qdot[i] = out.qdot[i].hull(shield.qdot[i])
+            out.Q[i] = out.Q[i].hull(shield.Q[i])
+
+    return out
+
+
+def classify_heat_violation(
+    heating_qdot_max_interval: Optional[Interval],
+    heating_Q_max_interval: Optional[Interval],
+    cfg: Optional[IntervalSupervisorConfig],
+) -> Dict[str, Any]:
+    """
+    classify interval heating against the configured hard limits
+
+    input
+    heat rate interval heat load interval and config
+
+    output
+    dictionary with violation flags and a short reason
+    """
+    rate_violation = False
+    load_violation = False
+    reason_parts: List[str] = []
+
+    if cfg is not None and heating_qdot_max_interval is not None and cfg.heat_rate_limit is not None:
+        if float(heating_qdot_max_interval.hi) > float(cfg.heat_rate_limit):
+            rate_violation = True
+            reason_parts.append("interval_heat_rate_limit")
+
+    if cfg is not None and heating_Q_max_interval is not None and cfg.heat_load_limit is not None:
+        if float(heating_Q_max_interval.hi) > float(cfg.heat_load_limit):
+            load_violation = True
+            reason_parts.append("interval_heat_load_limit")
+
+    return {
+        "heat_violation": bool(rate_violation or load_violation),
+        "rate_violation": bool(rate_violation),
+        "load_violation": bool(load_violation),
+        "reason": ",".join(reason_parts),
+    }
+
+
+def nominal_heating_envelope_from_state(
+    x_nominal: List[float],
+    dt_s: float,
+    heat_shield: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    advance the heat shield using only the nominal state
+
+    input
+    nominal state step size and optional shield
+
+    output
+    updated heat shield and nominal heat summaries
+    """
+    if len(x_nominal) != 6:
+        raise ValueError("x_nominal must have 6 components")
+
+    altitude_m = max(0.0, constants.altitude(float(x_nominal[0])))
+    atm = AtmosphereModel.US_Standard_ATM(altitude_m)
+    rho = atm["rho_kgm3"] if atm["rho_kgm3"] is not None else 0.0
+
+    if heat_shield is None:
+        heat_shield = make_interval_heat_shield()
+
+    heat_shield.update(rho=float(rho), V=float(x_nominal[3]), dt=float(dt_s))
+
+    return {
+        "heat_shield": heat_shield,
+        "qdot_max": heat_shield.qdot_max(),
+        "qdot_mean": heat_shield.qdot_mean(),
+        "Q_max": heat_shield.Q_max(),
+        "rho_kgm3": float(rho),
+    }
 
 
 def interval_dynamic_pressure_bounds(rho_interval: Interval, V_interval: Interval) -> Interval:
     """
-    Compute interval dynamic pressure bounds q = 0.5 rho V squared.
+    compute interval dynamic pressure
+
+    equation
+    q equals one half rho v squared
+
+    input
+    density interval and speed interval
+
+    output
+    dynamic pressure interval
     """
-    # Dynamic pressure is computed directly in interval form.
     return promote(0.5) * rho_interval * V_interval.pow_int(2)
 
 
 def atmosphere_interval_hull_from_state_box(x_box: List[Interval]) -> Dict[str, Any]:
     """
-    Collect hulls across all atmospheric layers intersected by the altitude box.
+    collect atmosphere hulls across all layers touched by the altitude interval
+
+    input
+    interval state box
+
+    output
+    density pressure temperature and layer indices
     """
-    # The translational interval state must have six components.
     if len(x_box) != 6:
         raise ValueError("x_box must have 6 components")
 
-    # Convert radial distance interval into geometric altitude interval.
     z_geometric_altitude = constants.intv_geometric_altitude(x_box[0])
-
-    # Query the interval atmosphere model across all intersected layers.
     atm_by_layer = AtmosphereModel.intv_US_Standard_ATM(z_geometric_altitude)
 
-    # Above the supported atmosphere range, return zero density and no layers.
     if not atm_by_layer:
         return {
             "altitude_m": z_geometric_altitude,
@@ -375,16 +710,11 @@ def atmosphere_interval_hull_from_state_box(x_box: List[Interval]) -> Dict[str, 
             "layer_indices": [],
         }
 
-    # Preserve the specific layers touched for logging.
     layer_indices = list(atm_by_layer.keys())
-
-    # Gather interval values from every touched layer.
     temperature_intervals = [atm_by_layer[k]["T_K"] for k in layer_indices]
     pressure_intervals = [atm_by_layer[k]["p_Pa"] for k in layer_indices]
     density_intervals = [atm_by_layer[k]["rho_kgm3"] for k in layer_indices]
 
-    # Return layerwise hulls so the rest of the code can work with one density,
-    # temperature, and pressure enclosure.
     return {
         "altitude_m": z_geometric_altitude,
         "T_K": hull_intervals(temperature_intervals),
@@ -396,10 +726,14 @@ def atmosphere_interval_hull_from_state_box(x_box: List[Interval]) -> Dict[str, 
 
 def make_interval_heat_shield() -> Any:
     """
-    Build a fresh interval compatible heat shield model.
+    build a fresh interval compatible heat shield
+
+    input
+    none
+
+    output
+    heat shield object
     """
-    # This uses the currently defined heat shield geometry and discretization
-    # from constants.py, including the updated ring and sector layout.
     return constants.HeatShield(
         radius_m=float(constants.HEAT_SHIELD_RADIUS_M),
         nose_radius_m=float(constants.HEAT_SHIELD_NOSE_RADIUS_M),
@@ -412,19 +746,20 @@ def make_interval_heat_shield() -> Any:
 
 def clone_interval_heat_shield(heat_shield: Optional[Any]) -> Any:
     """
-    Return an independent heat shield object for candidate rollouts.
+    return an independent heat shield for candidate rollouts
 
-    Candidate evaluations must not contaminate each other.
+    input
+    optional source heat shield
+
+    output
+    copied heat shield
     """
-    # If no shield exists yet, start from a fresh one.
     if heat_shield is None:
         return make_interval_heat_shield()
 
-    # Prefer an explicit clone method if the class provides one.
     if hasattr(heat_shield, "clone") and callable(getattr(heat_shield, "clone")):
         return heat_shield.clone()
 
-    # Deep copy is a safe fallback for the current heat shield structure.
     return copy.deepcopy(heat_shield)
 
 
@@ -435,16 +770,19 @@ def interval_heating_envelope(
     heat_shield: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
-    Compute a simple interval heating envelope using the existing heat shield model.
+    propagate the interval heat shield state for one step
+
+    input
+    density interval speed interval step size and optional shield
+
+    output
+    updated shield and heat summaries
     """
-    # Build a shield if the caller did not provide one.
     if heat_shield is None:
         heat_shield = make_interval_heat_shield()
 
-    # Advance the shield thermal state using interval density and speed.
     heat_shield.update(rho=rho_interval, V=V_interval, dt=float(dt_s))
 
-    # Return both the updated shield object and useful summary intervals.
     return {
         "heat_shield": heat_shield,
         "qdot_max": heat_shield.qdot_max(),
@@ -459,92 +797,62 @@ def classify_interval_against_limits(
     cfg: Optional[IntervalSupervisorConfig],
 ) -> Dict[str, Any]:
     """
-    Return a simple safety style summary for interval outputs.
+    classify the propagated interval against optional simple bounds
+
+    input
+    new interval box dynamic pressure interval and config
+
+    output
+    summary status and per limit checks
     """
-    # Without a config there are no limits to check.
     if cfg is None:
         return {"status": "not_evaluated", "checks": {}}
 
-    # Store individual check results here.
     checks: Dict[str, str] = {}
-
-    # Convert radius into altitude because limits are more intuitive in altitude.
     altitude_interval = constants.intv_geometric_altitude(x_interval_new[0])
-
-    # Speed is already one of the native state components.
     speed_interval = x_interval_new[3]
 
     def classify_upper(iv: Interval, upper: Optional[float]) -> Optional[str]:
-        """
-        Classify an interval against an upper bound.
-        """
-        # No bound means no check.
         if upper is None:
             return None
-
-        # Entire interval lies below or on the limit.
         if iv.hi <= upper:
             return "inside"
-
-        # Entire interval lies above the limit.
         if iv.lo > upper:
             return "outside"
-
-        # Otherwise the interval straddles the limit.
         return "mixed"
 
     def classify_lower(iv: Interval, lower: Optional[float]) -> Optional[str]:
-        """
-        Classify an interval against a lower bound.
-        """
-        # No bound means no check.
         if lower is None:
             return None
-
-        # Entire interval lies above or on the limit.
         if iv.lo >= lower:
             return "inside"
-
-        # Entire interval lies below the limit.
         if iv.hi < lower:
             return "outside"
-
-        # Otherwise the interval straddles the limit.
         return "mixed"
 
-    # Check lower altitude bound if requested.
     altitude_min_status = classify_lower(altitude_interval, cfg.min_altitude_m)
     if altitude_min_status is not None:
         checks["min_altitude_m"] = altitude_min_status
 
-    # Check upper altitude bound if requested.
     altitude_max_status = classify_upper(altitude_interval, cfg.max_altitude_m)
     if altitude_max_status is not None:
         checks["max_altitude_m"] = altitude_max_status
 
-    # Check speed upper bound if requested.
     speed_status = classify_upper(speed_interval, cfg.max_speed_mps)
     if speed_status is not None:
         checks["max_speed_mps"] = speed_status
 
-    # Check dynamic pressure upper bound if requested.
     q_status = classify_upper(q_interval, cfg.max_dynamic_pressure_pa)
     if q_status is not None:
         checks["max_dynamic_pressure_pa"] = q_status
 
-    # If no active checks existed, return a neutral status.
     if not checks:
         return {"status": "not_evaluated", "checks": checks}
 
-    # If any check is fully outside, the overall status is outside.
     if any(v == "outside" for v in checks.values()):
         status = "outside"
-
-    # If nothing is outside but at least one check is mixed, mark mixed.
     elif any(v == "mixed" for v in checks.values()):
         status = "mixed"
-
-    # Otherwise all checks were fully inside.
     else:
         status = "inside"
 
@@ -553,7 +861,13 @@ def classify_interval_against_limits(
 
 def _zero_dx_box() -> List[Interval]:
     """
-    Build a six component zero derivative box.
+    build a zero derivative box
+
+    input
+    none
+
+    output
+    six zero intervals
     """
     return [Interval(0.0, 0.0) for _ in range(6)]
 
@@ -565,32 +879,26 @@ def make_invalid_interval_annotation(
     failure_reason: str,
 ) -> IntervalAnnotationResult:
     """
-    Build a safe fallback annotation when live interval logging fails.
+    build a safe fallback annotation when interval propagation becomes invalid
 
-    This is only used by the nominal path logging wrapper. The predictor
-    corrector candidate rollout still handles interval invalidity explicitly
-    so guidance can reject or penalize those candidates.
+    input
+    old interval box sigma interval heat shield and reason string
+
+    output
+    invalid annotation result that preserves the last valid box
     """
-    # Keep the old interval state so the nominal simulator can continue.
-    x_interval_new = [Interval(iv.lo, iv.hi) for iv in x_interval_old]
-
-    # Use zero derivatives because a valid propagated derivative is unavailable.
+    x_interval_new = copy_interval_box(x_interval_old)
     dx_interval = _zero_dx_box()
-
-    # Build width summaries from the unchanged box.
     widths_old = interval_component_widths(x_interval_old)
     widths_new = interval_component_widths(x_interval_new)
     dx_widths = interval_component_widths(dx_interval)
-
-    # Altitude can still be computed from the old box.
     altitude_interval = constants.intv_geometric_altitude(x_interval_old[0])
 
-    # Return a conservative placeholder annotation.
     return IntervalAnnotationResult(
-        x_interval_old=[Interval(iv.lo, iv.hi) for iv in x_interval_old],
+        x_interval_old=copy_interval_box(x_interval_old),
         x_interval_new=x_interval_new,
         dx_interval=dx_interval,
-        sigma_interval_used=sigma_interval_used,
+        sigma_interval_used=copy_interval(sigma_interval_used),
         rho_interval=Interval(0.0, 0.0),
         q_interval=Interval(0.0, 0.0),
         altitude_interval=altitude_interval,
@@ -603,12 +911,513 @@ def make_invalid_interval_annotation(
         heating_qdot_mean_interval=None,
         heating_Q_max_interval=None,
         heat_shield=heat_shield,
-        safety_status="invalid_interval",
-        safety_checks={"interval_valid": str(failure_reason)},
+        safety_status="interval_numerical_failure",
+        safety_checks={"interval_failure": str(failure_reason)},
         layer_indices=[],
+        interval_valid=False,
+        interval_active=False,
+        interval_failed=True,
+        interval_failure_kind="numerical",
+        interval_failure_reason=str(failure_reason),
+        interval_numerical_failure=True,
+        interval_heat_violation=False,
+        last_valid_interval_state=copy_interval_box(x_interval_old),
     )
 
-# Nominal helper functions for mirrored notebook logic
+
+def _propagate_interval_annotation_core(
+    x_interval_old: List[Interval],
+    params: Dict[str, Any],
+    sigma_interval_used: Interval,
+    dt_s: float,
+    supervisor_cfg: Optional[IntervalSupervisorConfig],
+    heat_shield: Optional[Any],
+    t_s: float,
+) -> IntervalAnnotationResult:
+    """
+    propagate one interval step without recovery logic
+
+    input
+    old box parameters sigma step size config heat shield and time
+
+    output
+    one annotation result
+    """
+    atmospheric_hull = atmosphere_interval_hull_from_state_box(x_interval_old)
+    rho_interval = atmospheric_hull["rho_kgm3"]
+    altitude_interval = atmospheric_hull["altitude_m"]
+    temperature_interval = atmospheric_hull["T_K"]
+    pressure_interval = atmospheric_hull["p_Pa"]
+
+    q_interval = interval_dynamic_pressure_bounds(rho_interval, x_interval_old[3])
+
+    dx_interval = f_interval(
+        t=float(t_s),
+        X=x_interval_old,
+        params=params,
+        sigma_iv=sigma_interval_used,
+    )
+
+    x_interval_new = box_add(x_interval_old, box_scalar_mul(float(dt_s), dx_interval))
+
+    heating_qdot_max_interval = None
+    heating_qdot_mean_interval = None
+    heating_Q_max_interval = None
+
+    if (supervisor_cfg is not None and supervisor_cfg.include_heating) or (heat_shield is not None):
+        heating_info = interval_heating_envelope(
+            rho_interval=rho_interval,
+            V_interval=x_interval_old[3],
+            dt_s=float(dt_s),
+            heat_shield=heat_shield,
+        )
+        heat_shield = heating_info["heat_shield"]
+        heating_qdot_max_interval = heating_info["qdot_max"]
+        heating_qdot_mean_interval = heating_info["qdot_mean"]
+        heating_Q_max_interval = heating_info["Q_max"]
+
+    safety_info = classify_interval_against_limits(
+        x_interval_new=x_interval_new,
+        q_interval=q_interval,
+        cfg=supervisor_cfg,
+    )
+
+    heat_info = classify_heat_violation(
+        heating_qdot_max_interval=heating_qdot_max_interval,
+        heating_Q_max_interval=heating_Q_max_interval,
+        cfg=supervisor_cfg,
+    )
+
+    safety_status = safety_info["status"]
+    safety_checks = dict(safety_info["checks"])
+
+    if bool(heat_info["rate_violation"]):
+        safety_checks["heat_rate_limit"] = "outside"
+    if bool(heat_info["load_violation"]):
+        safety_checks["heat_load_limit"] = "outside"
+    if bool(heat_info["heat_violation"]):
+        safety_status = "heat_violation"
+
+    last_valid_interval_state = copy_interval_box(x_interval_new)
+    if bool(heat_info["heat_violation"]):
+        last_valid_interval_state = copy_interval_box(x_interval_old)
+
+    return IntervalAnnotationResult(
+        x_interval_old=copy_interval_box(x_interval_old),
+        x_interval_new=copy_interval_box(x_interval_new),
+        dx_interval=copy_interval_box(dx_interval),
+        sigma_interval_used=copy_interval(sigma_interval_used),
+        rho_interval=copy_interval(rho_interval),
+        q_interval=copy_interval(q_interval),
+        altitude_interval=copy_interval(altitude_interval),
+        temperature_interval=copy_interval(temperature_interval) if temperature_interval is not None else None,
+        pressure_interval=copy_interval(pressure_interval) if pressure_interval is not None else None,
+        state_widths_old=interval_component_widths(x_interval_old),
+        state_widths_new=interval_component_widths(x_interval_new),
+        dx_widths=interval_component_widths(dx_interval),
+        heating_qdot_max_interval=copy_interval(heating_qdot_max_interval) if heating_qdot_max_interval is not None else None,
+        heating_qdot_mean_interval=copy_interval(heating_qdot_mean_interval) if heating_qdot_mean_interval is not None else None,
+        heating_Q_max_interval=copy_interval(heating_Q_max_interval) if heating_Q_max_interval is not None else None,
+        heat_shield=heat_shield,
+        safety_status=safety_status,
+        safety_checks=safety_checks,
+        layer_indices=list(atmospheric_hull["layer_indices"]),
+        interval_valid=True,
+        interval_active=not bool(heat_info["heat_violation"]),
+        interval_failed=bool(heat_info["heat_violation"]),
+        interval_failure_kind="heat" if bool(heat_info["heat_violation"]) else "none",
+        interval_failure_reason=str(heat_info["reason"]),
+        interval_numerical_failure=False,
+        interval_heat_violation=bool(heat_info["heat_violation"]),
+        last_valid_interval_state=last_valid_interval_state,
+    )
+
+
+def merge_child_interval_annotations(
+    child_results: List[IntervalAnnotationResult],
+    x_interval_old: List[Interval],
+    sigma_interval_used: Interval,
+    supervisor_cfg: Optional[IntervalSupervisorConfig],
+    recentered_this_step: bool,
+    recenter_reason: str,
+    split_depth_used: int,
+    split_reason: str,
+) -> IntervalAnnotationResult:
+    """
+    hull child annotations back into one parent result
+
+    input
+    child results old box sigma config recenter info split depth and split reason
+
+    output
+    one merged annotation result
+    """
+    x_interval_new = hull_interval_boxes([child.x_interval_new for child in child_results])
+    dx_interval = hull_interval_boxes([child.dx_interval for child in child_results])
+    rho_interval = hull_intervals([child.rho_interval for child in child_results])
+    q_interval = hull_intervals([child.q_interval for child in child_results])
+    altitude_interval = hull_intervals([child.altitude_interval for child in child_results])
+
+    temperature_candidates = [child.temperature_interval for child in child_results if child.temperature_interval is not None]
+    pressure_candidates = [child.pressure_interval for child in child_results if child.pressure_interval is not None]
+    qdot_candidates = [child.heating_qdot_max_interval for child in child_results if child.heating_qdot_max_interval is not None]
+    qmean_candidates = [child.heating_qdot_mean_interval for child in child_results if child.heating_qdot_mean_interval is not None]
+    Q_candidates = [child.heating_Q_max_interval for child in child_results if child.heating_Q_max_interval is not None]
+
+    temperature_interval = hull_intervals(temperature_candidates) if temperature_candidates else None
+    pressure_interval = hull_intervals(pressure_candidates) if pressure_candidates else None
+    heating_qdot_max_interval = hull_intervals(qdot_candidates) if qdot_candidates else None
+    heating_qdot_mean_interval = hull_intervals(qmean_candidates) if qmean_candidates else None
+    heating_Q_max_interval = hull_intervals(Q_candidates) if Q_candidates else None
+    heat_shield = hull_heat_shields([child.heat_shield for child in child_results if child.heat_shield is not None])
+
+    safety_info = classify_interval_against_limits(
+        x_interval_new=x_interval_new,
+        q_interval=q_interval,
+        cfg=supervisor_cfg,
+    )
+
+    heat_info = classify_heat_violation(
+        heating_qdot_max_interval=heating_qdot_max_interval,
+        heating_Q_max_interval=heating_Q_max_interval,
+        cfg=supervisor_cfg,
+    )
+
+    safety_status = safety_info["status"]
+    safety_checks = dict(safety_info["checks"])
+    if bool(heat_info["rate_violation"]):
+        safety_checks["heat_rate_limit"] = "outside"
+    if bool(heat_info["load_violation"]):
+        safety_checks["heat_load_limit"] = "outside"
+    if bool(heat_info["heat_violation"]):
+        safety_status = "heat_violation"
+
+    failure_reason_parts = []
+    for child in child_results:
+        if child.interval_failure_reason and child.interval_failure_reason not in failure_reason_parts:
+            failure_reason_parts.append(child.interval_failure_reason)
+
+    last_valid_interval_state = copy_interval_box(x_interval_new)
+    if bool(heat_info["heat_violation"]):
+        last_valid_interval_state = copy_interval_box(x_interval_old)
+
+    layer_indices: List[int] = []
+    for child in child_results:
+        for layer_index in child.layer_indices:
+            if layer_index not in layer_indices:
+                layer_indices.append(layer_index)
+
+    return IntervalAnnotationResult(
+        x_interval_old=copy_interval_box(x_interval_old),
+        x_interval_new=copy_interval_box(x_interval_new),
+        dx_interval=copy_interval_box(dx_interval),
+        sigma_interval_used=copy_interval(sigma_interval_used),
+        rho_interval=copy_interval(rho_interval),
+        q_interval=copy_interval(q_interval),
+        altitude_interval=copy_interval(altitude_interval),
+        temperature_interval=copy_interval(temperature_interval) if temperature_interval is not None else None,
+        pressure_interval=copy_interval(pressure_interval) if pressure_interval is not None else None,
+        state_widths_old=interval_component_widths(x_interval_old),
+        state_widths_new=interval_component_widths(x_interval_new),
+        dx_widths=interval_component_widths(dx_interval),
+        heating_qdot_max_interval=copy_interval(heating_qdot_max_interval) if heating_qdot_max_interval is not None else None,
+        heating_qdot_mean_interval=copy_interval(heating_qdot_mean_interval) if heating_qdot_mean_interval is not None else None,
+        heating_Q_max_interval=copy_interval(heating_Q_max_interval) if heating_Q_max_interval is not None else None,
+        heat_shield=heat_shield,
+        safety_status=safety_status,
+        safety_checks=safety_checks,
+        layer_indices=layer_indices,
+        interval_valid=True,
+        interval_active=not bool(heat_info["heat_violation"]),
+        interval_failed=bool(heat_info["heat_violation"]),
+        interval_failure_kind="heat" if bool(heat_info["heat_violation"]) else "none",
+        interval_failure_reason=",".join(failure_reason_parts),
+        interval_numerical_failure=False,
+        interval_heat_violation=bool(heat_info["heat_violation"]),
+        recentered_this_step=bool(recentered_this_step),
+        recenter_reason=str(recenter_reason),
+        split_this_step=True,
+        split_reason=str(split_reason),
+        split_depth_used=int(split_depth_used),
+        split_child_count=len(child_results),
+        last_valid_interval_state=last_valid_interval_state,
+    )
+
+
+def split_and_propagate_interval_annotation(
+    x_interval_old: List[Interval],
+    params: Dict[str, Any],
+    sigma_interval_used: Interval,
+    dt_s: float,
+    supervisor_cfg: Optional[IntervalSupervisorConfig],
+    heat_shield: Optional[Any],
+    t_s: float,
+    split_depth: int,
+    recentered_this_step: bool,
+    recenter_reason: str,
+    split_reason: str,
+) -> IntervalAnnotationResult:
+    """
+    recursively split and propagate an unhealthy interval box
+
+    input
+    old box parameters sigma step size config heat shield time and split state
+
+    output
+    one annotation result after recursive splitting
+    """
+    if supervisor_cfg is None or not bool(supervisor_cfg.interval_box_split_enabled):
+        return make_invalid_interval_annotation(
+            x_interval_old=x_interval_old,
+            sigma_interval_used=sigma_interval_used,
+            heat_shield=heat_shield,
+            failure_reason="adaptive_box_split_disabled",
+        )
+
+    if int(split_depth) >= int(supervisor_cfg.interval_box_split_max_depth):
+        return make_invalid_interval_annotation(
+            x_interval_old=x_interval_old,
+            sigma_interval_used=sigma_interval_used,
+            heat_shield=heat_shield,
+            failure_reason="adaptive_box_split_depth_exhausted",
+        )
+
+    split_index = choose_split_dimension(x_interval_old, supervisor_cfg)
+    if float(x_interval_old[split_index].width()) <= 1.0e-12:
+        return make_invalid_interval_annotation(
+            x_interval_old=x_interval_old,
+            sigma_interval_used=sigma_interval_used,
+            heat_shield=heat_shield,
+            failure_reason="adaptive_box_split_zero_width_dimension",
+        )
+
+    left_box, right_box = box_split(copy_interval_box(x_interval_old), idx=int(split_index))
+    child_results: List[IntervalAnnotationResult] = []
+
+    for child_box in [left_box, right_box]:
+        child_heat_shield = clone_interval_heat_shield(heat_shield)
+
+        try:
+            child_result = _propagate_interval_annotation_core(
+                x_interval_old=child_box,
+                params=params,
+                sigma_interval_used=sigma_interval_used,
+                dt_s=float(dt_s),
+                supervisor_cfg=supervisor_cfg,
+                heat_shield=child_heat_shield,
+                t_s=float(t_s),
+            )
+
+            if (
+                child_result.interval_valid
+                and not child_result.interval_heat_violation
+                and interval_box_needs_split(child_result.x_interval_new, supervisor_cfg)
+            ):
+                child_result = split_and_propagate_interval_annotation(
+                    x_interval_old=child_box,
+                    params=params,
+                    sigma_interval_used=sigma_interval_used,
+                    dt_s=float(dt_s),
+                    supervisor_cfg=supervisor_cfg,
+                    heat_shield=child_heat_shield,
+                    t_s=float(t_s),
+                    split_depth=int(split_depth) + 1,
+                    recentered_this_step=bool(recentered_this_step),
+                    recenter_reason=str(recenter_reason),
+                    split_reason=split_reason_from_box(child_result.x_interval_new, supervisor_cfg),
+                )
+
+        except Exception as exc:
+            if int(split_depth) + 1 < int(supervisor_cfg.interval_box_split_max_depth):
+                child_result = split_and_propagate_interval_annotation(
+                    x_interval_old=child_box,
+                    params=params,
+                    sigma_interval_used=sigma_interval_used,
+                    dt_s=float(dt_s),
+                    supervisor_cfg=supervisor_cfg,
+                    heat_shield=child_heat_shield,
+                    t_s=float(t_s),
+                    split_depth=int(split_depth) + 1,
+                    recentered_this_step=bool(recentered_this_step),
+                    recenter_reason=str(recenter_reason),
+                    split_reason=str(split_reason),
+                )
+            else:
+                child_result = make_invalid_interval_annotation(
+                    x_interval_old=child_box,
+                    sigma_interval_used=sigma_interval_used,
+                    heat_shield=child_heat_shield,
+                    failure_reason=f"adaptive_box_split_child_invalid: {exc}",
+                )
+
+        if not child_result.interval_valid:
+            return child_result
+
+        child_results.append(child_result)
+
+    return merge_child_interval_annotations(
+        child_results=child_results,
+        x_interval_old=x_interval_old,
+        sigma_interval_used=sigma_interval_used,
+        supervisor_cfg=supervisor_cfg,
+        recentered_this_step=bool(recentered_this_step),
+        recenter_reason=str(recenter_reason),
+        split_depth_used=int(split_depth) + 1,
+        split_reason=str(split_reason),
+    )
+
+
+def build_interval_annotation(
+    x_interval_old: List[Interval],
+    params: Dict[str, Any],
+    sigma_interval_used: Interval,
+    dt_s: Optional[float] = None,
+    supervisor_cfg: Optional[IntervalSupervisorConfig] = None,
+    heat_shield: Optional[Any] = None,
+    t_s: float = 0.0,
+    x_nominal_center: Optional[List[float]] = None,
+) -> IntervalAnnotationResult:
+    """
+    propagate one interval step with recenter and split recovery logic
+
+    input
+    old box parameters sigma optional step size config heat shield time and nominal center
+
+    output
+    one annotation result
+    """
+    if dt_s is None:
+        dt_s = float(getattr(constants, "ENTRY_DT_S", 0.25))
+
+    if len(x_interval_old) != 6:
+        raise ValueError("x_interval_old must have 6 interval components")
+
+    working_box = copy_interval_box(x_interval_old)
+    recentered_this_step = False
+    recenter_reason = ""
+
+    # recenter now carries an explicit reason
+    # this keeps width based health events separate from fixed cadence maintenance
+    recenter_needed, recenter_reason = should_recenter_interval_box(
+        x_interval_old=working_box,
+        x_nominal_center=x_nominal_center,
+        cfg=supervisor_cfg,
+        t_s=float(t_s),
+        dt_s=float(dt_s),
+    )
+
+    if recenter_needed:
+        working_box = recenter_interval_box_around_nominal(
+            x_nominal_center=list(x_nominal_center),
+            cfg=supervisor_cfg,
+        )
+        recentered_this_step = True
+
+    try:
+        if interval_box_needs_split(working_box, supervisor_cfg):
+            result = split_and_propagate_interval_annotation(
+                x_interval_old=working_box,
+                params=params,
+                sigma_interval_used=sigma_interval_used,
+                dt_s=float(dt_s),
+                supervisor_cfg=supervisor_cfg,
+                heat_shield=heat_shield,
+                t_s=float(t_s),
+                split_depth=0,
+                recentered_this_step=bool(recentered_this_step),
+                recenter_reason=str(recenter_reason),
+                split_reason=split_reason_from_box(working_box, supervisor_cfg),
+            )
+        else:
+            result = _propagate_interval_annotation_core(
+                x_interval_old=working_box,
+                params=params,
+                sigma_interval_used=sigma_interval_used,
+                dt_s=float(dt_s),
+                supervisor_cfg=supervisor_cfg,
+                heat_shield=heat_shield,
+                t_s=float(t_s),
+            )
+
+            if (
+                result.interval_valid
+                and not result.interval_heat_violation
+                and interval_box_needs_split(result.x_interval_new, supervisor_cfg)
+            ):
+                result = split_and_propagate_interval_annotation(
+                    x_interval_old=working_box,
+                    params=params,
+                    sigma_interval_used=sigma_interval_used,
+                    dt_s=float(dt_s),
+                    supervisor_cfg=supervisor_cfg,
+                    heat_shield=heat_shield,
+                    t_s=float(t_s),
+                    split_depth=0,
+                    recentered_this_step=bool(recentered_this_step),
+                    recenter_reason=str(recenter_reason),
+                    split_reason=split_reason_from_box(result.x_interval_new, supervisor_cfg),
+                )
+
+        result.recentered_this_step = bool(result.recentered_this_step or recentered_this_step)
+        if recenter_reason and not result.recenter_reason:
+            result.recenter_reason = str(recenter_reason)
+        return result
+
+    except Exception as exc:
+        return make_invalid_interval_annotation(
+            x_interval_old=working_box,
+            sigma_interval_used=sigma_interval_used,
+            heat_shield=heat_shield,
+            failure_reason=f"live_interval_annotation_invalid: {exc}",
+        )
+
+
+def annotate_nominal_state_with_interval_supervisor(
+    x_nominal_old: List[float],
+    params: Dict[str, Any],
+    sigma_actual_after_rad: float,
+    x_interval_old: Optional[List[Interval]] = None,
+    supervisor_cfg: Optional[IntervalSupervisorConfig] = None,
+    dt_s: Optional[float] = None,
+    heat_shield: Optional[Any] = None,
+    t_s: float = 0.0,
+) -> IntervalAnnotationResult:
+    """
+    annotate one nominal step with an interval tube
+
+    input
+    nominal state parameters actual sigma old interval optional config heat shield and time
+
+    output
+    one interval annotation result
+    """
+    if x_interval_old is None:
+        if supervisor_cfg is None:
+            x_interval_old = nominal_state_to_interval_box(x_nominal_old)
+        else:
+            x_interval_old = inflate_nominal_state_to_interval_box(x_nominal_old, supervisor_cfg)
+
+    sigma_interval_used = promote(float(sigma_actual_after_rad))
+
+    try:
+        return build_interval_annotation(
+            x_interval_old=x_interval_old,
+            params=params,
+            sigma_interval_used=sigma_interval_used,
+            dt_s=dt_s,
+            supervisor_cfg=supervisor_cfg,
+            heat_shield=heat_shield,
+            t_s=t_s,
+            x_nominal_center=list(x_nominal_old),
+        )
+    except Exception as exc:
+        return make_invalid_interval_annotation(
+            x_interval_old=x_interval_old,
+            sigma_interval_used=sigma_interval_used,
+            heat_shield=heat_shield,
+            failure_reason=f"live_interval_annotation_invalid: {exc}",
+        )
+
 
 def nominal_aero_forces_from_state(
     x: List[float],
@@ -616,45 +1425,35 @@ def nominal_aero_forces_from_state(
     params: Dict[str, Any],
 ) -> Dict[str, float]:
     """
-    Compute aerodynamic force components from a nominal float state.
+    compute nominal aerodynamic force components
 
-    The returned components use the local basis [radial, north, east].
-    Additional scalar quantities are returned for the vertical plane and
-    lateral lift components that directly feed gamma_dot and chi_dot.
+    this resolves drag opposite velocity and rotates lift with bank
+    into radial north and east components
+
+    input
+    nominal state bank angle and parameter dictionary
+
+    output
+    aerodynamic force dictionary
     """
-    # Enforce the six state convention.
     if len(x) != 6:
         raise ValueError("x must have 6 state components")
 
-    # Unpack the nominal state.
     r_m, phi_rad, lam_rad, V_mps, gamma_rad, chi_rad = x
-
-    # Latitude and longitude are not needed directly inside the local
-    # aerodynamic decomposition, so they are explicitly ignored here.
     del phi_rad, lam_rad
 
-    # Convert radius into altitude for the atmosphere lookup.
     altitude_m = max(0.0, constants.altitude(r_m))
-
-    # Query the nominal atmosphere at the current altitude.
     atm = AtmosphereModel.US_Standard_ATM(altitude_m)
-
-    # Use zero density outside the supported atmosphere range.
     rho = atm["rho_kgm3"] if atm["rho_kgm3"] is not None else 0.0
-
-    # Dynamic pressure is one half rho V squared.
     q_pa = 0.5 * rho * V_mps * V_mps
 
-    # Pull aerodynamic parameters while preserving old alias names.
     surface_area = _get_param(params, "ref_area_m2", "S")
     CD = _get_param(params, "CD_const", "CD")
     CL = _get_param(params, "CL_const", "CL")
 
-    # Convert dynamic pressure into drag and lift magnitudes.
     drag_mag_N = q_pa * surface_area * CD
     lift_mag_N = q_pa * surface_area * CL
 
-    # Precompute sines and cosines used repeatedly in the decomposition.
     sin_gamma = math.sin(gamma_rad)
     cos_gamma = math.cos(gamma_rad)
     sin_chi = math.sin(chi_rad)
@@ -662,21 +1461,17 @@ def nominal_aero_forces_from_state(
     sin_sigma = math.sin(sigma_rad)
     cos_sigma = math.cos(sigma_rad)
 
-    # Drag acts opposite the velocity vector.
     D_r_N = -drag_mag_N * sin_gamma
     D_north_N = -drag_mag_N * cos_gamma * sin_chi
     D_east_N = -drag_mag_N * cos_gamma * cos_chi
 
-    # Bank rotates lift between the vertical plane and lateral direction.
     lift_vertical_plane_N = lift_mag_N * cos_sigma
     lift_lateral_left_N = -lift_mag_N * sin_sigma
 
-    # Resolve lift into radial, north, and east local components.
     L_r_N = lift_vertical_plane_N * cos_gamma
     L_north_N = -lift_mag_N * (cos_sigma * sin_gamma * sin_chi + sin_sigma * cos_chi)
     L_east_N = lift_mag_N * (-cos_sigma * sin_gamma * cos_chi + sin_sigma * sin_chi)
 
-    # Return a rich dictionary for both physics and logging.
     return {
         "rho_kgm3": float(rho),
         "q_pa": float(q_pa),
@@ -704,32 +1499,30 @@ def nominal_eom_step(
     dt_s: float,
 ) -> Dict[str, Any]:
     """
-    One Euler step of the corrected nominal translational dynamics.
+    advance the corrected nominal translational equations by one euler step
 
-    This helper exists so notebook code can mirror the same equations used
-    by the interval path instead of keeping a stale duplicate.
+    equations
+    drag acts only in v dot
+    vertical plane lift enters gamma dot
+    lateral lift enters chi dot
+
+    input
+    nominal state bank angle parameters and step size
+
+    output
+    next state derivative and aero summary
     """
-    # Enforce the six state convention.
     if len(x) != 6:
         raise ValueError("x must have 6 state components")
-
-    # Negative or zero time step is invalid for forward propagation.
     if dt_s <= 0.0:
         raise ValueError("dt_s must be positive")
 
-    # Unpack the nominal state.
     r_m, phi_rad, lam_rad, V_mps, gamma_rad, chi_rad = x
 
-    # Compute nominal aerodynamic forces at the current state.
     aero = nominal_aero_forces_from_state(x=x, sigma_rad=sigma_rad, params=params)
-
-    # Pull mass while preserving old alias names.
     mass_kg = _get_param(params, "mass_kg", "m")
-
-    # Compute gravity at the current radius.
     g_mps2 = constants.gravity(r_m)
 
-    # Precompute trigonometric values used by the equations of motion.
     cos_phi = math.cos(phi_rad)
     sin_phi = math.sin(phi_rad)
     cos_gamma = math.cos(gamma_rad)
@@ -737,49 +1530,33 @@ def nominal_eom_step(
     sin_chi = math.sin(chi_rad)
     cos_chi = math.cos(chi_rad)
 
-    # Small epsilon used to avoid singular denominators.
     eps = 1.0e-9
-
-    # Radius and speed are clamped away from zero for numerical safety.
     safe_r = max(r_m, constants.RADIUS_EARTH + 1.0)
     safe_V = max(abs(V_mps), eps)
 
-    # Guard cos phi before using it in longitude rate and tan phi.
     if abs(cos_phi) < eps:
         cos_phi = eps if cos_phi >= 0.0 else -eps
 
-    # Guard cos gamma before using it in heading rate.
     if abs(cos_gamma) < eps:
         cos_gamma = eps if cos_gamma >= 0.0 else -eps
 
-    # Build tan phi from the already guarded cosine.
     tan_phi = sin_phi / cos_phi
 
-    # Radial motion follows the vertical component of velocity.
     r_dot = V_mps * sin_gamma
-
-    # Latitude rate depends on the north component of horizontal velocity.
     phi_dot = (V_mps * cos_gamma * sin_chi) / safe_r
-
-    # Longitude rate depends on the east component of horizontal velocity.
     lam_dot = (V_mps * cos_gamma * cos_chi) / (safe_r * cos_phi)
-
-    # Speed decreases from drag and from climbing against gravity.
     V_dot = -aero["drag_mag_N"] / mass_kg - g_mps2 * sin_gamma
 
-    # Flight path angle changes from vertical plane lift and curvature terms.
     gamma_dot = (
         aero["lift_vertical_plane_N"] / (mass_kg * safe_V)
         + (safe_V / safe_r - g_mps2 / safe_V) * cos_gamma
     )
 
-    # Heading changes from lateral lift and spherical geometry coupling.
     chi_dot = (
         aero["lift_lateral_left_N"] / (mass_kg * safe_V * cos_gamma)
         - (safe_V / safe_r) * cos_gamma * cos_chi * tan_phi
     )
 
-    # Advance the nominal state using one explicit Euler step.
     x_next = [
         r_m + r_dot * dt_s,
         phi_rad + phi_dot * dt_s,
@@ -789,7 +1566,6 @@ def nominal_eom_step(
         chi_rad + chi_dot * dt_s,
     ]
 
-    # Return both the advanced state and the derivative information for logging.
     return {
         "x_next": x_next,
         "x_dot": [r_dot, phi_dot, lam_dot, V_dot, gamma_dot, chi_dot],
@@ -797,7 +1573,7 @@ def nominal_eom_step(
         "gravity_mps2": g_mps2,
     }
 
-# Interval aerodynamic force model
+
 def intv_aero_forces(
     r: Interval,
     V: Interval,
@@ -807,19 +1583,17 @@ def intv_aero_forces(
     params: Dict[str, Any],
 ) -> Dict[int, Dict[str, Interval]]:
     """
-    Interval version of the aerodynamic force model.
+    compute interval aerodynamic forces over all touched atmosphere layers
 
-    Returned components use the local basis [radial, north, east].
-    Additional scalars are returned for the vertical plane and lateral lift
-    components that directly feed gamma_dot and chi_dot.
+    input
+    interval state pieces sigma interval and parameters
+
+    output
+    dictionary of force dictionaries by layer
     """
-    # Convert interval radius into interval altitude.
     z_geometric_altitude = constants.intv_geometric_altitude(r)
-
-    # Query the interval atmosphere across all intersected layers.
     atm_intv = AtmosphereModel.intv_US_Standard_ATM(z_geometric_altitude)
 
-    # If the atmosphere model returns nothing, use zero aero forces.
     if not atm_intv:
         zero = promote(0.0)
         return {
@@ -845,15 +1619,11 @@ def intv_aero_forces(
             }
         }
 
-    # Create one aerodynamic dictionary per atmospheric layer.
     aero_forces_by_layer: Dict[int, Dict[str, Interval]] = {}
-
-    # Pull aerodynamic parameters while preserving old alias names.
     CD = _get_param(params, "CD_const", "CD")
     CL = _get_param(params, "CL_const", "CL")
     surface_area = _get_param(params, "ref_area_m2", "S")
 
-    # Precompute trigonometric terms in interval form.
     sin_gamma = gamma.sin()
     cos_gamma = gamma.cos()
     sin_chi = chi.sin()
@@ -861,33 +1631,24 @@ def intv_aero_forces(
     sin_sigma = sigma.sin()
     cos_sigma = sigma.cos()
 
-    # Process each atmospheric layer independently.
     for k in atm_intv.keys():
-        # Pull layer specific density.
         rho = atm_intv[k]["rho_kgm3"] if atm_intv[k]["rho_kgm3"] is not None else promote(0.0)
-
-        # Dynamic pressure in interval form.
         q = promote(0.5) * rho * V.pow_int(2)
 
-        # Drag and lift magnitudes in interval form.
         drag_mag = q * surface_area * CD
         lift_mag = q * surface_area * CL
 
-        # Resolve drag opposite the velocity direction.
         D_r = -drag_mag * sin_gamma
         D_north = -drag_mag * cos_gamma * sin_chi
         D_east = -drag_mag * cos_gamma * cos_chi
 
-        # Resolve lift into vertical plane and lateral pieces using bank.
         lift_vertical_plane = lift_mag * cos_sigma
         lift_lateral_left = -lift_mag * sin_sigma
 
-        # Resolve lift into the local radial, north, and east basis.
         L_r = lift_vertical_plane * cos_gamma
         L_north = -lift_mag * (cos_sigma * sin_gamma * sin_chi + sin_sigma * cos_chi)
         L_east = lift_mag * (-cos_sigma * sin_gamma * cos_chi + sin_sigma * sin_chi)
 
-        # Store the full layerwise result.
         aero_forces_by_layer[k] = {
             "q": q,
             "rho": rho,
@@ -911,7 +1672,6 @@ def intv_aero_forces(
 
     return aero_forces_by_layer
 
-# Interval equations of motion
 
 def intv_eom_3d(
     t: float,
@@ -920,37 +1680,30 @@ def intv_eom_3d(
     sigma: Interval,
 ) -> Dict[str, Interval]:
     """
-    Interval valued 3DOF equations of motion for milestone 1 atmospheric entry.
+    evaluate the interval valued three dof translational equations
 
-    The underlying model is the non rotating spherical Earth subset of the Lu
-    style bank modulated lift equations. The heading convention remains the
-    codebase chi convention, not the north referenced psi used in many papers.
+    input
+    time interval state parameters and bank interval
+
+    output
+    named derivative dictionary
     """
-    # Time is not used directly in the current translational model.
     del t
 
-    # Enforce the six component state convention.
     if len(X) != 6:
         raise ValueError("X must have 6 interval components")
 
-    # Unpack the interval state.
     r = X[0]
     phi = X[1]
     lam = X[2]
     V = X[3]
     gamma = X[4]
     chi = X[5]
-
-    # Longitude itself is not used directly inside the local EOM terms.
     del lam
 
-    # Pull mass while preserving old alias names.
     mass_kg = _get_param(params, "mass_kg", "m")
-
-    # Compute interval gravity at the current radius interval.
     g = constants.intv_gravity(r)
 
-    # Compute layerwise interval aerodynamic forces.
     aero = intv_aero_forces(
         r=r,
         V=V,
@@ -960,12 +1713,10 @@ def intv_eom_3d(
         params=params,
     )
 
-    # Build layerwise hulls for the force magnitudes used by the EOM.
     drag_mag = hull_intervals([aero[layer]["drag_mag"] for layer in aero])
     lift_vertical_plane = hull_intervals([aero[layer]["lift_vertical_plane"] for layer in aero])
     lift_lateral_left = hull_intervals([aero[layer]["lift_lateral_left"] for layer in aero])
 
-    # Precompute trigonometric interval terms.
     cos_phi = phi.cos()
     tan_phi = phi.sin() / cos_phi
     cos_gamma = gamma.cos()
@@ -973,25 +1724,13 @@ def intv_eom_3d(
     sin_chi = chi.sin()
     cos_chi = chi.cos()
 
-    # Radial motion follows the vertical component of velocity.
     r_dot = V * sin_gamma
-
-    # Latitude rate comes from the north component of horizontal motion.
     phi_dot = (V * cos_gamma * sin_chi) / r
-
-    # Longitude rate comes from the east component of horizontal motion.
     lam_dot = (V * cos_gamma * cos_chi) / (r * cos_phi)
-
-    # Speed rate comes from drag and gravity projection.
     V_dot = -drag_mag / mass_kg - g * sin_gamma
-
-    # Flight path angle rate comes from vertical plane lift and curvature terms.
     gamma_dot = (lift_vertical_plane / (mass_kg * V)) + (V / r - g / V) * cos_gamma
-
-    # Heading rate comes from lateral lift and spherical geometry coupling.
     chi_dot = (lift_lateral_left / (mass_kg * V * cos_gamma)) - (V / r) * cos_gamma * cos_chi * tan_phi
 
-    # Return the derivative dictionary in named form.
     return {
         "r_dot": r_dot,
         "phi_dot": phi_dot,
@@ -1009,11 +1748,15 @@ def f_interval(
     sigma_iv: Interval,
 ) -> List[Interval]:
     """
-    Ordered derivative adapter for interval integration.
-    """
-    # Convert the named derivative dictionary into state order.
-    dx = intv_eom_3d(t=t, X=X, params=params, sigma=sigma_iv)
+    convert the named interval derivative dictionary into state order
 
+    input
+    time interval state parameters and bank interval
+
+    output
+    ordered derivative box
+    """
+    dx = intv_eom_3d(t=t, X=X, params=params, sigma=sigma_iv)
     return [
         dx["r_dot"],
         dx["phi_dot"],
@@ -1024,181 +1767,39 @@ def f_interval(
     ]
 
 
-# Interval supervisor annotation helpers
-def build_interval_annotation(
-    x_interval_old: List[Interval],
-    params: Dict[str, Any],
-    sigma_interval_used: Interval,
-    dt_s: Optional[float] = None,
-    supervisor_cfg: Optional[IntervalSupervisorConfig] = None,
-    heat_shield: Optional[Any] = None,
-    t_s: float = 0.0,
-) -> IntervalAnnotationResult:
-    """
-    Propagate one interval translational step and return a rich annotation packet.
-    """
-    # Use the default entry step when a step size is not supplied.
-    if dt_s is None:
-        dt_s = float(getattr(constants, "ENTRY_DT_S", 0.25))
-
-    # Enforce the six state convention.
-    if len(x_interval_old) != 6:
-        raise ValueError("x_interval_old must have 6 interval components")
-
-    # Build atmosphere hull information from the current interval state.
-    atmospheric_hull = atmosphere_interval_hull_from_state_box(x_interval_old)
-    rho_interval = atmospheric_hull["rho_kgm3"]
-    altitude_interval = atmospheric_hull["altitude_m"]
-    temperature_interval = atmospheric_hull["T_K"]
-    pressure_interval = atmospheric_hull["p_Pa"]
-
-    # Compute interval dynamic pressure from density and speed.
-    q_interval = interval_dynamic_pressure_bounds(rho_interval, x_interval_old[3])
-
-    # Compute interval derivatives using the corrected interval EOM.
-    dx_interval = f_interval(
-        t=float(t_s),
-        X=x_interval_old,
-        params=params,
-        sigma_iv=sigma_interval_used,
-    )
-
-    # Advance the interval state with one Euler step.
-    x_interval_new = box_add(x_interval_old, box_scalar_mul(float(dt_s), dx_interval))
-
-    # Default heating outputs to None unless heating is requested.
-    heating_qdot_max_interval = None
-    heating_qdot_mean_interval = None
-    heating_Q_max_interval = None
-
-    # Propagate heating if the config requests it or if a live heat shield exists.
-    if (supervisor_cfg is not None and supervisor_cfg.include_heating) or (heat_shield is not None):
-        heating_info = interval_heating_envelope(
-            rho_interval=rho_interval,
-            V_interval=x_interval_old[3],
-            dt_s=float(dt_s),
-            heat_shield=heat_shield,
-        )
-
-        # Keep the updated shield object for the caller.
-        heat_shield = heating_info["heat_shield"]
-
-        # Expose useful heating summaries for logging and predictor screening.
-        heating_qdot_max_interval = heating_info["qdot_max"]
-        heating_qdot_mean_interval = heating_info["qdot_mean"]
-        heating_Q_max_interval = heating_info["Q_max"]
-
-    # Run simple interval bound checks if a config was supplied.
-    safety_info = classify_interval_against_limits(
-        x_interval_new=x_interval_new,
-        q_interval=q_interval,
-        cfg=supervisor_cfg,
-    )
-
-    # Return the complete annotation packet.
-    return IntervalAnnotationResult(
-        x_interval_old=list(x_interval_old),
-        x_interval_new=x_interval_new,
-        dx_interval=dx_interval,
-        sigma_interval_used=sigma_interval_used,
-        rho_interval=rho_interval,
-        q_interval=q_interval,
-        altitude_interval=altitude_interval,
-        temperature_interval=temperature_interval,
-        pressure_interval=pressure_interval,
-        state_widths_old=interval_component_widths(x_interval_old),
-        state_widths_new=interval_component_widths(x_interval_new),
-        dx_widths=interval_component_widths(dx_interval),
-        heating_qdot_max_interval=heating_qdot_max_interval,
-        heating_qdot_mean_interval=heating_qdot_mean_interval,
-        heating_Q_max_interval=heating_Q_max_interval,
-        heat_shield=heat_shield,
-        safety_status=safety_info["status"],
-        safety_checks=safety_info["checks"],
-        layer_indices=list(atmospheric_hull["layer_indices"]),
-    )
-
-
-def annotate_nominal_state_with_interval_supervisor(
-    x_nominal_old: List[float],
-    params: Dict[str, Any],
-    sigma_actual_after_rad: float,
-    x_interval_old: Optional[List[Interval]] = None,
-    supervisor_cfg: Optional[IntervalSupervisorConfig] = None,
-    dt_s: Optional[float] = None,
-    heat_shield: Optional[Any] = None,
-    t_s: float = 0.0,
-) -> IntervalAnnotationResult:
-    """
-    Build an interval annotation for a nominal translational step.
-
-    This wrapper is used by the live nominal simulation path. Unlike the
-    predictor corrector candidate rollout, this wrapper catches interval
-    propagation failures and returns a safe fallback packet so the nominal
-    trajectory can continue running and logging.
-    """
-    # If the caller did not provide an interval state, create one now.
-    if x_interval_old is None:
-        if supervisor_cfg is None:
-            x_interval_old = nominal_state_to_interval_box(x_nominal_old)
-        else:
-            x_interval_old = inflate_nominal_state_to_interval_box(x_nominal_old, supervisor_cfg)
-
-    # Promote the flown bank angle into an interval.
-    sigma_interval_used = promote(float(sigma_actual_after_rad))
-
-    try:
-        # Normal path. Build the real interval annotation.
-        return build_interval_annotation(
-            x_interval_old=x_interval_old,
-            params=params,
-            sigma_interval_used=sigma_interval_used,
-            dt_s=dt_s,
-            supervisor_cfg=supervisor_cfg,
-            heat_shield=heat_shield,
-            t_s=t_s,
-        )
-    except Exception as exc:
-        # Fallback path. Preserve the nominal run and surface the interval failure.
-        return make_invalid_interval_annotation(
-            x_interval_old=x_interval_old,
-            sigma_interval_used=sigma_interval_used,
-            heat_shield=heat_shield,
-            failure_reason=f"live_interval_annotation_invalid: {exc}",
-        )
-
-
-# Short horizon rollout utilities for guidance
 def _positive_violation_amount(interval_value: Interval, limit_value: Optional[float]) -> float:
     """
-    Return normalized positive violation amount using the interval upper bound.
+    return normalized positive violation amount from the interval upper bound
+
+    input
+    interval value and optional limit
+
+    output
+    nonnegative scalar violation amount
     """
-    # Without a limit there is no violation.
     if limit_value is None:
         return 0.0
 
-    # Normalize by the limit magnitude so different limits scale sensibly.
     denom = max(abs(float(limit_value)), 1.0)
-
-    # Only positive excess above the limit counts as a violation.
     return max(0.0, (float(interval_value.hi) - float(limit_value)) / denom)
 
 
 def _hull_or_default(a: Optional[Interval], b: Optional[Interval]) -> Interval:
     """
-    Merge two optional intervals.
+    merge two optional intervals into one interval
+
+    input
+    two optional intervals
+
+    output
+    one interval
     """
-    # If neither interval exists yet, return a zero interval.
     if a is None and b is None:
         return Interval(0.0, 0.0)
-
-    # If only one interval exists, return a copy of it.
     if a is None:
         return Interval(float(b.lo), float(b.hi))
     if b is None:
         return Interval(float(a.lo), float(a.hi))
-
-    # Otherwise build the hull.
     return a.hull(b)
 
 
@@ -1214,104 +1815,87 @@ def rollout_predictor_corrector_candidate(
     t0_s: float = 0.0,
     heat_rate_limit: Optional[float] = None,
     heat_load_limit: Optional[float] = None,
+    interval_screen_active: bool = True,
 ) -> PredictorCorrectorRolloutResult:
     """
-    Roll out one candidate sigma command for the guidance predictor corrector.
+    roll out one guidance candidate through nominal and interval dynamics
 
-    This utility is the heat aware prediction engine used by control.py.
-    The rollout propagates nominal state, interval state, and the interval
-    heat shield forward together so guidance can reject or penalize heat
-    infeasible candidates.
+    input
+    nominal start state candidate bank parameters horizon settings interval state and heat settings
 
-    Important milestone 1 note
-
-    The translational propagation is the corrected current 3DOF model.
-    The heat feasibility layer uses the current interval heat shield model.
-    This is a deliberate approximation rather than a literal implementation
-    of every Lu equation.
+    output
+    one rollout result used by guidance scoring
     """
-    # Enforce the six state convention.
     if len(x_nominal_old) != 6:
         raise ValueError("x_nominal_old must have 6 components")
-
-    # Require a positive step size.
     if dt_s <= 0.0:
         raise ValueError("dt_s must be positive")
-
-    # Require a positive horizon length.
     if horizon_steps <= 0:
         raise ValueError("horizon_steps must be positive")
 
-    # Build a local supervisor config that definitely enables heating when
-    # heat limits are being used during candidate evaluation.
     local_supervisor_cfg = supervisor_cfg
+    if bool(interval_screen_active):
+        if local_supervisor_cfg is None and (heat_rate_limit is not None or heat_load_limit is not None):
+            local_supervisor_cfg = IntervalSupervisorConfig(include_heating=True)
+        elif local_supervisor_cfg is not None and not local_supervisor_cfg.include_heating:
+            local_supervisor_cfg = copy.deepcopy(local_supervisor_cfg)
+            local_supervisor_cfg.include_heating = True
 
-    if local_supervisor_cfg is None and (heat_rate_limit is not None or heat_load_limit is not None):
-        local_supervisor_cfg = IntervalSupervisorConfig(include_heating=True)
+        if local_supervisor_cfg is not None:
+            if heat_rate_limit is not None:
+                local_supervisor_cfg.heat_rate_limit = float(heat_rate_limit)
+            if heat_load_limit is not None:
+                local_supervisor_cfg.heat_load_limit = float(heat_load_limit)
 
-    elif local_supervisor_cfg is not None and not local_supervisor_cfg.include_heating:
-        local_supervisor_cfg = copy.deepcopy(local_supervisor_cfg)
-        local_supervisor_cfg.include_heating = True
-
-    # Build or copy the interval state used by this candidate rollout.
-    if x_interval_old is None:
-        if local_supervisor_cfg is None:
-            x_interval = nominal_state_to_interval_box(x_nominal_old)
+    if bool(interval_screen_active):
+        if x_interval_old is None:
+            if local_supervisor_cfg is None:
+                x_interval = nominal_state_to_interval_box(x_nominal_old)
+            else:
+                x_interval = inflate_nominal_state_to_interval_box(x_nominal_old, local_supervisor_cfg)
         else:
-            x_interval = inflate_nominal_state_to_interval_box(x_nominal_old, local_supervisor_cfg)
+            x_interval = copy_interval_box(x_interval_old)
+
+        candidate_heat_shield = clone_interval_heat_shield(heat_shield)
+        interval_states: List[List[Interval]] = [copy_interval_box(x_interval)]
     else:
-        x_interval = [Interval(iv.lo, iv.hi) for iv in x_interval_old]
+        x_interval = None
+        candidate_heat_shield = None
+        interval_states = []
 
-    # Copy the nominal state so this candidate cannot alter the caller state.
     x_nominal = [float(v) for v in x_nominal_old]
-
-    # Promote the candidate sigma command into interval form once.
     sigma_iv = promote(float(sigma_cmd_rad))
-
-    # Clone the heat shield so each candidate evolves independently.
-    candidate_heat_shield = clone_interval_heat_shield(heat_shield)
-
-    # Store the full sequence of predicted nominal and interval states.
     nominal_states: List[List[float]] = [list(x_nominal)]
-    interval_states: List[List[Interval]] = [list(x_interval)]
-
-    # Store step by step summaries for debug logging.
     step_summaries: List[RolloutStepSummary] = []
 
-    # These track the overall worst heating across the entire horizon.
     max_heating_rate_interval: Optional[Interval] = None
     max_heat_load_interval: Optional[Interval] = None
-
-    # These fields summarize candidate feasibility.
     heat_feasible = True
     interval_valid = True
+    interval_failure_kind = "none"
     violation_amount = 0.0
     heat_penalty = 0.0
     failure_reason = ""
     first_violation_step = -1
     first_violation_time_s = math.nan
 
-    # Propagate the candidate one short horizon step at a time.
     for step_idx in range(int(horizon_steps)):
-        # Compute the physical time associated with this rollout step.
         t_step_s = float(t0_s + step_idx * dt_s)
-
-        # Save the nominal state before stepping for debug visibility.
         x_nom_before = list(x_nominal)
 
-        # Nominal prediction always uses the corrected translational model.
         nominal_step = nominal_eom_step(
             x=x_nominal,
             sigma_rad=float(sigma_cmd_rad),
             params=params,
             dt_s=float(dt_s),
         )
-
-        # Advance the nominal state.
         x_nominal = [float(v) for v in nominal_step["x_next"]]
 
-        try:
-            # Propagate the interval state and interval heating together.
+        qdot_interval = Interval(0.0, 0.0)
+        Q_interval = Interval(0.0, 0.0)
+        x_interval_after: Optional[List[Interval]] = None
+
+        if bool(interval_screen_active):
             annotation = build_interval_annotation(
                 x_interval_old=x_interval,
                 params=params,
@@ -1320,128 +1904,97 @@ def rollout_predictor_corrector_candidate(
                 supervisor_cfg=local_supervisor_cfg,
                 heat_shield=candidate_heat_shield,
                 t_s=float(t_step_s),
+                x_nominal_center=list(x_nom_before),
             )
 
-            # Update the working interval state for the next step.
-            x_interval = annotation.x_interval_new
+            if not annotation.interval_valid:
+                interval_valid = False
+                interval_failure_kind = "numerical"
+                failure_reason = str(annotation.interval_failure_reason or "interval_rollout_invalid")
+                violation_amount = max(violation_amount, 1.0)
 
-            # Keep the updated heat shield for the next step.
-            candidate_heat_shield = annotation.heat_shield
-
-            # Pull heating summaries if available.
-            qdot_interval = (
-                annotation.heating_qdot_max_interval
-                if annotation.heating_qdot_max_interval is not None
-                else Interval(0.0, 0.0)
-            )
-            Q_interval = (
-                annotation.heating_Q_max_interval
-                if annotation.heating_Q_max_interval is not None
-                else Interval(0.0, 0.0)
-            )
-
-            # Update the horizon wide hulls.
-            max_heating_rate_interval = _hull_or_default(max_heating_rate_interval, qdot_interval)
-            max_heat_load_interval = _hull_or_default(max_heat_load_interval, Q_interval)
-
-            # Track stepwise violation size and reason labels.
-            step_violation = 0.0
-            step_reason_parts: List[str] = []
-
-            # Check heating rate limit if one was provided.
-            if heat_rate_limit is not None:
-                rate_violation = _positive_violation_amount(qdot_interval, float(heat_rate_limit))
-                if rate_violation > 0.0:
-                    step_violation += rate_violation
-                    step_reason_parts.append("heat_rate_limit")
-
-            # Check integrated heat load limit if one was provided.
-            if heat_load_limit is not None:
-                load_violation = _positive_violation_amount(Q_interval, float(heat_load_limit))
-                if load_violation > 0.0:
-                    step_violation += load_violation
-                    step_reason_parts.append("heat_load_limit")
-
-            # If any limit was violated, mark the candidate infeasible.
-            if step_violation > 0.0:
-                heat_feasible = False
-
-                # Keep the maximum scalar violation across all steps.
-                violation_amount = max(violation_amount, float(step_violation))
-
-                # Accumulate heat penalty so guidance can optimize against it.
-                heat_penalty += float(step_violation)
-
-                # Record the first violating step only once.
                 if first_violation_step < 0:
                     first_violation_step = int(step_idx)
                     first_violation_time_s = float(t_step_s)
 
-                # Preserve the first failure reason for easy logging.
+                step_summary = RolloutStepSummary(
+                    step_index=int(step_idx),
+                    time_s=float(t_step_s),
+                    x_nominal_before=list(x_nom_before),
+                    x_nominal_after=list(x_nominal),
+                    x_interval_after=None,
+                    max_heating_rate_interval=_hull_or_default(max_heating_rate_interval, None),
+                    max_heat_load_interval=_hull_or_default(max_heat_load_interval, None),
+                    heat_feasible_after_step=bool(heat_feasible),
+                    interval_valid_after_step=False,
+                    failure_reason=str(failure_reason),
+                )
+                step_summaries.append(step_summary)
+                nominal_states.append(list(x_nominal))
+                break
+
+            x_interval = copy_interval_box(annotation.x_interval_new)
+            candidate_heat_shield = annotation.heat_shield
+            x_interval_after = copy_interval_box(x_interval)
+            interval_states.append(copy_interval_box(x_interval))
+
+            qdot_interval = annotation.heating_qdot_max_interval if annotation.heating_qdot_max_interval is not None else Interval(0.0, 0.0)
+            Q_interval = annotation.heating_Q_max_interval if annotation.heating_Q_max_interval is not None else Interval(0.0, 0.0)
+
+            max_heating_rate_interval = _hull_or_default(max_heating_rate_interval, qdot_interval)
+            max_heat_load_interval = _hull_or_default(max_heat_load_interval, Q_interval)
+
+            step_violation = 0.0
+            step_reason_parts: List[str] = []
+
+            if annotation.interval_heat_violation:
+                interval_failure_kind = "heat"
+
+                if heat_rate_limit is not None:
+                    rate_violation = _positive_violation_amount(qdot_interval, float(heat_rate_limit))
+                    if rate_violation > 0.0:
+                        step_violation += rate_violation
+                        step_reason_parts.append("heat_rate_limit")
+
+                if heat_load_limit is not None:
+                    load_violation = _positive_violation_amount(Q_interval, float(heat_load_limit))
+                    if load_violation > 0.0:
+                        step_violation += load_violation
+                        step_reason_parts.append("heat_load_limit")
+
+            if step_violation > 0.0:
+                heat_feasible = False
+                violation_amount = max(violation_amount, float(step_violation))
+                heat_penalty += float(step_violation)
+
+                if first_violation_step < 0:
+                    first_violation_step = int(step_idx)
+                    first_violation_time_s = float(t_step_s)
+
                 if not failure_reason:
-                    failure_reason = ",".join(step_reason_parts)
+                    failure_reason = ",".join(step_reason_parts) if step_reason_parts else str(annotation.interval_failure_reason)
 
-            # Build the per step summary packet for this valid step.
-            step_summary = RolloutStepSummary(
-                step_index=int(step_idx),
-                time_s=float(t_step_s),
-                x_nominal_before=list(x_nom_before),
-                x_nominal_after=list(x_nominal),
-                x_interval_after=list(x_interval),
-                max_heating_rate_interval=qdot_interval,
-                max_heat_load_interval=Q_interval,
-                heat_feasible_after_step=bool(heat_feasible),
-                interval_valid_after_step=True,
-                failure_reason=str(failure_reason),
-            )
+        step_summary = RolloutStepSummary(
+            step_index=int(step_idx),
+            time_s=float(t_step_s),
+            x_nominal_before=list(x_nom_before),
+            x_nominal_after=list(x_nominal),
+            x_interval_after=x_interval_after,
+            max_heating_rate_interval=qdot_interval,
+            max_heat_load_interval=Q_interval,
+            heat_feasible_after_step=bool(heat_feasible),
+            interval_valid_after_step=bool(interval_valid),
+            failure_reason=str(failure_reason),
+        )
 
-        except Exception as exc:
-            # Any denominator or interval failure makes this candidate invalid.
-            interval_valid = False
-            heat_feasible = False
-
-            # Store a readable failure reason for logging and RL export.
-            failure_reason = f"interval_rollout_invalid: {exc}"
-
-            # Force a nonzero violation so the candidate is strongly penalized.
-            violation_amount = max(violation_amount, 1.0)
-            heat_penalty += 1.0
-
-            # Record the first invalid step.
-            if first_violation_step < 0:
-                first_violation_step = int(step_idx)
-                first_violation_time_s = float(t_step_s)
-
-            # Build a final step summary that records invalid propagation.
-            step_summary = RolloutStepSummary(
-                step_index=int(step_idx),
-                time_s=float(t_step_s),
-                x_nominal_before=list(x_nom_before),
-                x_nominal_after=list(x_nominal),
-                x_interval_after=None,
-                max_heating_rate_interval=_hull_or_default(max_heating_rate_interval, None),
-                max_heat_load_interval=_hull_or_default(max_heat_load_interval, None),
-                heat_feasible_after_step=False,
-                interval_valid_after_step=False,
-                failure_reason=str(failure_reason),
-            )
-
-            # Record the failing step and stop this candidate rollout.
-            step_summaries.append(step_summary)
-            break
-
-        # Append successful step outputs after the try block.
         nominal_states.append(list(x_nominal))
-        interval_states.append(list(x_interval))
         step_summaries.append(step_summary)
 
-    # If no heating was computed at all, return zero intervals instead of None.
     if max_heating_rate_interval is None:
         max_heating_rate_interval = Interval(0.0, 0.0)
     if max_heat_load_interval is None:
         max_heat_load_interval = Interval(0.0, 0.0)
 
-    # Build the final candidate rollout result for guidance.
     return PredictorCorrectorRolloutResult(
         sigma_cmd_rad=float(sigma_cmd_rad),
         horizon_steps=int(horizon_steps),
@@ -1449,7 +2002,7 @@ def rollout_predictor_corrector_candidate(
         interval_states=interval_states,
         step_summaries=step_summaries,
         final_nominal_state=list(x_nominal),
-        final_interval_state=list(x_interval) if interval_valid else None,
+        final_interval_state=copy_interval_box(x_interval) if (bool(interval_screen_active) and interval_valid and x_interval is not None) else None,
         final_heat_shield=candidate_heat_shield,
         max_heating_rate_interval=max_heating_rate_interval,
         max_heat_load_interval=max_heat_load_interval,
@@ -1457,6 +2010,8 @@ def rollout_predictor_corrector_candidate(
         first_violation_time_s=float(first_violation_time_s),
         heat_feasible=bool(heat_feasible),
         interval_valid=bool(interval_valid),
+        interval_screen_used=bool(interval_screen_active),
+        interval_failure_kind=str(interval_failure_kind),
         violation_amount=float(violation_amount),
         heat_penalty=float(heat_penalty),
         failure_reason=str(failure_reason),

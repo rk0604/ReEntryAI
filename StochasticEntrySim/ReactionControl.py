@@ -1,242 +1,309 @@
-"""
-ReactionControl.py
-
-Milestone-1 physical RCS model for the entry capsule
-
-What this file does
--------------------
-This module replaces the old timing-only RCS placeholder with a physical,
-body-frame thruster model that can:
-
-- define fixed thrusters on the capsule body
-- compute force from each thruster in body coordinates
-- compute torque from each thruster using r x F
-- allocate roll thrusters from a commanded roll torque
-- respect the fixed Euler step dt = 0.25 s
-- return a real body-frame wrench for the attitude integrator
-
-Milestone-1 scope
------------------
-This file is intentionally scoped to the first useful step:
-- roll control is active
-- pitch and yaw geometry is already represented in the layout
-- pitch and yaw allocation can be added later without replacing the file
-
-Important design choice
------------------------
-This module works in the BODY frame only
-
-That is deliberate:
-- thrusters are fixed in body coordinates
-- force and torque are easiest to compute in body coordinates
-- world-frame pose conversion should stay in math_3d.py, where attitude
-  and frame transforms already belong
-
-Numerical behavior
-------------------
-The physics loop runs at dt = 0.25 s.
-To stay compatible with that fixed-step loop, minimum pulse width is modeled
-as one full simulation step.
-
-So each step, a selected thruster is either:
-- OFF for the whole step
-- ON for the whole step
-
-A small commanded torque is handled through a simple per-channel duty
-accumulator, which effectively creates pulse-width modulation across steps.
-"""
-
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Deque, Dict, Iterable, List, Optional
 
 import numpy as np
 import constants
 
 
-# Small math helpers ------------------------------------------------------------------
+# Small math helpers
 
 def clamp(value: float, lower: float, upper: float) -> float:
-    """
-    Clamp a scalar into [lower, upper].
-    """
+    # Keep a scalar inside a closed interval
     return max(lower, min(upper, value))
 
 
 def normalize(vec: np.ndarray, eps: float = 1.0e-12) -> np.ndarray:
-    """
-    Return vec normalized to unit length.
-
-    Raises
-    ------
-    ValueError if the vector norm is too small.
-    """
+    # Convert the input into a flat three component float array
     arr = np.asarray(vec, dtype=float).reshape(3)
+
+    # Compute Euclidean length so direction can be normalized
     n = float(np.linalg.norm(arr))
+
+    # A near zero vector cannot define a thrust direction
     if n < eps:
-        raise ValueError("Cannot normalize near-zero vector")
+        raise ValueError("Cannot normalize near zero vector")
+
+    # Return the unit direction
     return arr / n
 
-# Core thruster and wrench data models ------------------------------------------------------------------
+
+# Core thruster and wrench data models
 
 @dataclass
 class RCSThruster:
-    """
-    One body-fixed RCS thruster.
-
-    Parameters
-    ----------
-    name
-        Human-readable thruster identifier.
-
-    position_b_m
-        Thruster location in the BODY frame, meters, relative to the chosen
-        body origin or center of mass reference.
-
-    direction_b_unit
-        Unit thrust direction in the BODY frame.
-
-    max_thrust_N
-        Maximum thrust magnitude in Newtons.
-
-    min_pulse_s
-        Minimum pulse width this thruster can physically produce.
-        For milestone 1, this is typically one whole simulation step.
-    """
+    # Human readable thruster name
     name: str
+
+    # Thruster location in body coordinates in meters
     position_b_m: np.ndarray
+
+    # Unit thrust direction in body coordinates
     direction_b_unit: np.ndarray
+
+    # Maximum thrust level in Newtons
     max_thrust_N: float
+
+    # Minimum time the jet must remain on once it starts firing
     min_pulse_s: float = constants.ORION_CM_RCS_MIN_PULSE_S
 
+    # Minimum time the jet must remain off before it can fire again
+    min_off_pulse_s: float = constants.ORION_CM_RCS_MIN_OFF_PULSE_S
+
+    # End to end response delay before command demand reaches the jet logic
+    lag_s: float = constants.ORION_CM_RCS_LAG_S
+
     def __post_init__(self) -> None:
+        # Store body position as a three component float vector
         self.position_b_m = np.asarray(self.position_b_m, dtype=float).reshape(3)
+
+        # Normalize thrust direction once so later force scaling is correct
         self.direction_b_unit = normalize(self.direction_b_unit)
+
+        # Store all timing and thrust values as floats
         self.max_thrust_N = float(self.max_thrust_N)
         self.min_pulse_s = float(self.min_pulse_s)
+        self.min_off_pulse_s = float(self.min_off_pulse_s)
+        self.lag_s = float(self.lag_s)
 
+        # Physical validation for thrust magnitude
         if self.max_thrust_N <= 0.0:
             raise ValueError(f"Thruster {self.name} must have positive max_thrust_N")
+
+        # Physical validation for minimum on time
         if self.min_pulse_s <= 0.0:
             raise ValueError(f"Thruster {self.name} must have positive min_pulse_s")
 
+        # Physical validation for minimum off time
+        if self.min_off_pulse_s < 0.0:
+            raise ValueError(f"Thruster {self.name} must have nonnegative min_off_pulse_s")
+
+        # Physical validation for lag
+        if self.lag_s < 0.0:
+            raise ValueError(f"Thruster {self.name} must have nonnegative lag_s")
+
     def body_force(self, duty: float) -> np.ndarray:
-        """
-        Return body-frame force vector for a duty in [0, 1].
-        """
+        # Clamp duty so force never exceeds the physical maximum
         duty = clamp(float(duty), 0.0, 1.0)
+
+        # Force equals thrust magnitude times unit direction
         return self.direction_b_unit * (self.max_thrust_N * duty)
 
     def body_torque(self, duty: float) -> np.ndarray:
-        """
-        Return body-frame torque vector for a duty in [0, 1].
-
-        torque = r x F
-        """
+        # Torque equals position cross force in body coordinates
         return np.cross(self.position_b_m, self.body_force(duty))
 
 
 @dataclass
 class ThrusterFireCommand:
-    """
-    Per-step thruster command.
-
-    duty_by_name maps thruster name -> duty over the current full simulation step.
-    In milestone 1 the duties are usually either 0.0 or 1.0.
-    """
+    # Map from thruster name to duty for the current integration substep
     duty_by_name: Dict[str, float] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
+        # Empty command means no thruster is active this substep
         return len(self.duty_by_name) == 0
 
     def active_names(self) -> List[str]:
+        # Return every thruster with a positive commanded duty
         return [name for name, duty in self.duty_by_name.items() if duty > 0.0]
 
 
 @dataclass
 class RCSWrench:
-    """
-    Resulting body-frame wrench from a fire command.
-    """
+    # Net body force in Newtons
     force_b_N: np.ndarray
+
+    # Net body torque in Newton meters
     torque_b_Nm: np.ndarray
 
 
 @dataclass
 class RollChannelStepResult:
-    """
-    Convenience debug packet for one roll allocation step.
-    """
+    # Commanded roll torque that entered the allocator
     tau_roll_cmd_Nm: float
+
+    # Total available magnitude for the commanded roll direction
     tau_roll_capacity_Nm: float
+
+    # Requested average duty before pulse timing logic
     requested_duty: float
+
+    # True when any roll thruster actually fired this substep
     fired_this_step: bool
+
+    # Low level thruster command returned by the allocator
     fire_cmd: ThrusterFireCommand
+
+    # Real body force and torque generated by the fired thrusters
     wrench: RCSWrench
 
+    # Useful channel telemetry for debugging the timing model
+    roll_pos_backlog_s: float
+    roll_neg_backlog_s: float
+    roll_pos_is_on: bool
+    roll_neg_is_on: bool
 
-# Duty accumulation for fixed-step minimum pulse logic ------------------------------------------------------------------
-class PulseAccumulator:
-    """
-    Convert a fractional duty request into whole-step ON/OFF firing.
 
-    Why this exists
-    ---------------
-    The integrator uses a fixed step of dt = 0.25 s.
-    If minimum pulse width is also 0.25 s, then inside one step the jet cannot
-    fire for "half a step" physically in this simple model
+# Timed pulse channel model
 
-    So we accumulate requested duty across steps:
-    - if requested duty is large enough, fire this step
-    - otherwise, carry fractional demand forward
-    """
+class TimedPulseChannel:
+    # This object converts a requested average duty into a real timed jet state
+    # It models command lag minimum on time minimum off time and accumulated demand
 
-    def __init__(self) -> None:
-        self._accum = 0.0
+    def __init__(
+        self,
+        min_pulse_s: float,
+        min_off_pulse_s: float,
+        lag_s: float,
+    ) -> None:
+        # Store timing values as floats
+        self.min_pulse_s = float(min_pulse_s)
+        self.min_off_pulse_s = float(min_off_pulse_s)
+        self.lag_s = float(lag_s)
+
+        # Validate physical timing values
+        if self.min_pulse_s <= 0.0:
+            raise ValueError("min_pulse_s must be positive")
+        if self.min_off_pulse_s < 0.0:
+            raise ValueError("min_off_pulse_s must be nonnegative")
+        if self.lag_s < 0.0:
+            raise ValueError("lag_s must be nonnegative")
+
+        # Create an internal delay line that will be sized on first use
+        self._delay_steps = 0
+        self._delay_queue: Deque[float] = deque()
+
+        # Initialize dynamic state
+        self.reset()
 
     def reset(self) -> None:
-        self._accum = 0.0
+        # backlog_s stores requested on time not yet delivered by the jet
+        self._backlog_s = 0.0
 
-    def step(self, duty_request: float) -> bool:
-        """
-        Return True if the channel should fire for this entire simulation step
-        """
+        # is_on marks whether the channel is firing during the current substep
+        self._is_on = False
+
+        # on_lock_remaining_s enforces the minimum on time once firing begins
+        self._on_lock_remaining_s = 0.0
+
+        # off_lock_remaining_s enforces the minimum off time after turn off
+        self._off_lock_remaining_s = 0.0
+
+        # Delay line contents are reset to zero demand
+        if self._delay_steps > 0:
+            self._delay_queue = deque([0.0] * self._delay_steps, maxlen=self._delay_steps)
+        else:
+            self._delay_queue = deque()
+
+    def _ensure_delay_queue(self, dt_s: float) -> None:
+        # dt_s must be positive because timing logic advances forward in time
+        if dt_s <= 0.0:
+            raise ValueError("dt_s must be positive")
+
+        # Internal timing model needs dt small enough to resolve the on off and lag values
+        smallest_positive_time = min(
+            self.min_pulse_s,
+            self.min_off_pulse_s if self.min_off_pulse_s > 0.0 else self.min_pulse_s,
+            self.lag_s if self.lag_s > 0.0 else self.min_pulse_s,
+        )
+
+        if dt_s - smallest_positive_time > 1.0e-12:
+            raise ValueError("dt_s is too large for the timed pulse channel model")
+
+        # Convert lag into an integer number of delayed substeps
+        new_delay_steps = int(round(self.lag_s / dt_s))
+
+        # Ensure the chosen dt exactly resolves the configured lag
+        if abs(new_delay_steps * dt_s - self.lag_s) > 1.0e-12:
+            raise ValueError("lag_s must be an exact multiple of dt_s")
+
+        # Only rebuild the queue if the step size changed or the queue is uninitialized
+        if new_delay_steps != self._delay_steps or len(self._delay_queue) != new_delay_steps:
+            self._delay_steps = new_delay_steps
+            self._delay_queue = deque([0.0] * self._delay_steps, maxlen=self._delay_steps)
+
+    def _delayed_request(self, duty_request: float) -> float:
+        # Without lag the current request reaches the channel immediately
+        if self._delay_steps == 0:
+            return duty_request
+
+        # With lag the oldest delayed request becomes active now
+        delayed = self._delay_queue.popleft()
+        self._delay_queue.append(duty_request)
+        return float(delayed)
+
+    def step(self, duty_request: float, dt_s: float) -> bool:
+        # Configure and validate timing resolution for this substep
+        self._ensure_delay_queue(float(dt_s))
+
+        # Clamp the requested average duty into the physical range
         duty_request = clamp(float(duty_request), 0.0, 1.0)
-        self._accum += duty_request
 
-        if self._accum >= 1.0:
-            self._accum -= 1.0
+        # Apply the lag model before demand reaches the firing logic
+        delayed_request = self._delayed_request(duty_request)
+
+        # Convert delayed average duty into requested on time for this substep
+        self._backlog_s += delayed_request * float(dt_s)
+
+        # If the channel is currently on then this substep fires
+        if self._is_on:
+            # Delivered on time reduces the remaining backlog
+            self._backlog_s = max(0.0, self._backlog_s - float(dt_s))
+
+            # While minimum on lock remains the channel must stay on
+            if self._on_lock_remaining_s > 0.0:
+                self._on_lock_remaining_s = max(0.0, self._on_lock_remaining_s - float(dt_s))
+                return True
+
+            # After minimum on time the channel can stay on as long as backlog still exists
+            if self._backlog_s > 1.0e-15:
+                return True
+
+            # No remaining demand means the channel turns off after this fired substep
+            self._is_on = False
+            self._off_lock_remaining_s = self.min_off_pulse_s
             return True
 
+        # If the channel is off then the minimum off lock must expire first
+        if self._off_lock_remaining_s > 0.0:
+            self._off_lock_remaining_s = max(0.0, self._off_lock_remaining_s - float(dt_s))
+            return False
+
+        # Start firing only when enough accumulated on time exists to justify a real pulse
+        if self._backlog_s + 1.0e-15 >= self.min_pulse_s:
+            self._is_on = True
+
+            # The minimum on lock starts now and one substep is consumed immediately
+            self._on_lock_remaining_s = max(0.0, self.min_pulse_s - float(dt_s))
+
+            # This substep delivers real on time immediately
+            self._backlog_s = max(0.0, self._backlog_s - float(dt_s))
+
+            return True
+
+        # Otherwise remain off and keep storing requested on time in backlog
         return False
 
     @property
-    def residual(self) -> float:
-        return self._accum
+    def backlog_s(self) -> float:
+        # Expose remaining undelivered on time for logging
+        return float(self._backlog_s)
 
-# Physical RCS system ------------------------------------------------------------------
+    @property
+    def is_on(self) -> bool:
+        # Expose current firing state for logging
+        return bool(self._is_on)
+
+
+# Physical RCS system
 
 class CapsuleRCSSystem:
-    """
-    Physical body-frame RCS system for the entry capsule.
-
-    Layout assumptions
-    ------------------
-    - Thrusters are fixed in body coordinates.
-    - Body-frame force and torque are computed exactly from the thruster layout
-    - The roll allocator uses symmetric tangential jets
-    - Axial jets are stored now for future pitch/yaw control, even though
-      milestone 1 does not allocate them yet
-
-    Main API
-    --------
-    reset()
-    allocate_roll_step(tau_roll_cmd_Nm, dt_s)
-    body_wrench(fire_cmd)
-    step_roll_channel(tau_roll_cmd_Nm, dt_s)
-    """
+    # This object owns the full body frame thruster layout and roll channel timing logic
+    # Thruster forces and torques are computed exactly in body coordinates
+    # Positive and negative roll channels are timed independently
 
     def __init__(
         self,
@@ -245,16 +312,21 @@ class CapsuleRCSSystem:
         roll_neg_names: Iterable[str],
         axial_names: Optional[Iterable[str]] = None,
     ):
+        # Copy thruster layout and named channel membership
         self.thrusters: Dict[str, RCSThruster] = dict(thrusters)
         self.roll_pos_names: List[str] = list(roll_pos_names)
         self.roll_neg_names: List[str] = list(roll_neg_names)
         self.axial_names: List[str] = list(axial_names) if axial_names is not None else []
 
+        # Positive roll channel must exist
         if not self.roll_pos_names:
             raise ValueError("roll_pos_names cannot be empty")
+
+        # Negative roll channel must exist
         if not self.roll_neg_names:
             raise ValueError("roll_neg_names cannot be empty")
 
+        # Every named thruster must exist in the layout
         missing = [
             name
             for name in (self.roll_pos_names + self.roll_neg_names + self.axial_names)
@@ -263,123 +335,132 @@ class CapsuleRCSSystem:
         if missing:
             raise ValueError(f"Unknown thruster names in layout: {missing}")
 
-        # Separate accumulators for positive-roll and negative-roll channels
-        self._roll_pos_pwm = PulseAccumulator()
-        self._roll_neg_pwm = PulseAccumulator()
+        # Build one timed pulse channel for positive roll
+        pos_timing = self._channel_timing_from_names(self.roll_pos_names)
+        self._roll_pos_channel = TimedPulseChannel(
+            min_pulse_s=pos_timing["min_pulse_s"],
+            min_off_pulse_s=pos_timing["min_off_pulse_s"],
+            lag_s=pos_timing["lag_s"],
+        )
 
-    # Lifecycle
+        # Build one timed pulse channel for negative roll
+        neg_timing = self._channel_timing_from_names(self.roll_neg_names)
+        self._roll_neg_channel = TimedPulseChannel(
+            min_pulse_s=neg_timing["min_pulse_s"],
+            min_off_pulse_s=neg_timing["min_off_pulse_s"],
+            lag_s=neg_timing["lag_s"],
+        )
+
+    def _channel_timing_from_names(self, names: Iterable[str]) -> Dict[str, float]:
+        # Pull timing values from the first thruster in the channel
+        name_list = list(names)
+        first = self.thrusters[name_list[0]]
+
+        min_pulse_s = float(first.min_pulse_s)
+        min_off_pulse_s = float(first.min_off_pulse_s)
+        lag_s = float(first.lag_s)
+
+        # All thrusters in the same roll channel should share the same timing values
+        for name in name_list[1:]:
+            thr = self.thrusters[name]
+
+            if abs(float(thr.min_pulse_s) - min_pulse_s) > 1.0e-12:
+                raise ValueError("All thrusters in a roll channel must share min_pulse_s")
+
+            if abs(float(thr.min_off_pulse_s) - min_off_pulse_s) > 1.0e-12:
+                raise ValueError("All thrusters in a roll channel must share min_off_pulse_s")
+
+            if abs(float(thr.lag_s) - lag_s) > 1.0e-12:
+                raise ValueError("All thrusters in a roll channel must share lag_s")
+
+        return {
+            "min_pulse_s": min_pulse_s,
+            "min_off_pulse_s": min_off_pulse_s,
+            "lag_s": lag_s,
+        }
 
     def reset(self) -> None:
-        """
-        Reset internal PWM state for a new trajectory.
-        """
-        self._roll_pos_pwm.reset()
-        self._roll_neg_pwm.reset()
-
-    # Basic access helpers
+        # Reset positive and negative roll channel timing states
+        self._roll_pos_channel.reset()
+        self._roll_neg_channel.reset()
 
     def get_thruster(self, name: str) -> RCSThruster:
+        # Direct layout access helper
         return self.thrusters[name]
 
     def names(self) -> List[str]:
+        # Return all thruster names in the layout
         return list(self.thrusters.keys())
 
-    # Wrench evaluation ------------------------------------------------------------------
-
     def body_wrench(self, fire_cmd: ThrusterFireCommand) -> RCSWrench:
-        """
-        Sum the body-frame force and torque from a fire command.
-        """
+        # Initialize zero net force and zero net torque in body coordinates
         force_b = np.zeros(3, dtype=float)
         torque_b = np.zeros(3, dtype=float)
 
+        # Sum every active thruster contribution
         for name, duty in fire_cmd.duty_by_name.items():
             thr = self.thrusters[name]
             force_b += thr.body_force(duty)
             torque_b += thr.body_torque(duty)
 
+        # Return net body wrench for the current substep
         return RCSWrench(force_b_N=force_b, torque_b_Nm=torque_b)
 
-    # Roll-channel capability ------------------------------------------------------------------
-
     def roll_torque_capacity_Nm(self, positive: bool = True) -> float:
-        """
-        Return the magnitude of the total z-axis roll torque produced when the
-        whole positive-roll or negative-roll channel fires at full thrust.
-        """
+        # Choose the positive or negative roll channel
         names = self.roll_pos_names if positive else self.roll_neg_names
 
+        # Sum z axis torque contribution when every jet in the channel fires at full thrust
         tau_z = 0.0
         for name in names:
             thr = self.thrusters[name]
             tau_z += thr.body_torque(duty=1.0)[2]
 
+        # Capacity is the magnitude of the signed z torque sum
         return abs(float(tau_z))
-
-    # Roll allocator ------------------------------------------------------------------
 
     def allocate_roll_step(
         self,
         tau_roll_cmd_Nm: float,
         dt_s: float,
     ) -> ThrusterFireCommand:
-        """
-        Allocate body-fixed roll thrusters for one simulation step.
-
-        Inputs
-        ------
-        tau_roll_cmd_Nm
-            Commanded roll torque about body z.
-
-        dt_s
-            Current simulation step size.
-
-        Behavior
-        --------
-        - Positive command -> positive-roll channel
-        - Negative command -> negative-roll channel
-        - Requested duty is abs(cmd) / channel_capacity
-        - Minimum pulse width is modeled as one whole step
-        - If the channel fires, all jets in that channel fire for the full step
-
-        This is intentionally simple and stable for milestone 1.
-        """
+        # Time step must be positive for timing state propagation
         if dt_s <= 0.0:
             raise ValueError("dt_s must be positive")
 
+        # Default output is no active thruster
         fire = ThrusterFireCommand()
 
-        if abs(tau_roll_cmd_Nm) <= 1.0e-12:
-            return fire
-
+        # Compute requested average duty for the commanded direction
+        requested_duty = 0.0
         sign_positive = tau_roll_cmd_Nm > 0.0
-        channel_names = self.roll_pos_names if sign_positive else self.roll_neg_names
-        channel_capacity = self.roll_torque_capacity_Nm(positive=sign_positive)
 
-        if channel_capacity <= 1.0e-12:
-            return fire
+        if abs(tau_roll_cmd_Nm) > 1.0e-12:
+            channel_capacity = self.roll_torque_capacity_Nm(positive=sign_positive)
 
-        requested_duty = clamp(abs(float(tau_roll_cmd_Nm)) / channel_capacity, 0.0, 1.0)
+            if channel_capacity > 1.0e-12:
+                requested_duty = clamp(abs(float(tau_roll_cmd_Nm)) / channel_capacity, 0.0, 1.0)
 
-        # Milestone-1 minimum pulse logic:
-        # one step is the smallest firing unit.
-        pwm = self._roll_pos_pwm if sign_positive else self._roll_neg_pwm
-        fire_this_step = pwm.step(requested_duty)
+        # Feed the proper request into the positive and negative timed channels
+        if sign_positive and requested_duty > 0.0:
+            fire_pos = self._roll_pos_channel.step(requested_duty, float(dt_s))
+            fire_neg = self._roll_neg_channel.step(0.0, float(dt_s))
+        elif (not sign_positive) and requested_duty > 0.0:
+            fire_pos = self._roll_pos_channel.step(0.0, float(dt_s))
+            fire_neg = self._roll_neg_channel.step(requested_duty, float(dt_s))
+        else:
+            fire_pos = self._roll_pos_channel.step(0.0, float(dt_s))
+            fire_neg = self._roll_neg_channel.step(0.0, float(dt_s))
 
-        if not fire_this_step:
-            return fire
+        # If positive roll channel is active then all positive roll jets fire fully
+        if fire_pos:
+            for name in self.roll_pos_names:
+                fire.duty_by_name[name] = 1.0
 
-        for name in channel_names:
-            thr = self.thrusters[name]
-
-            # If the thruster min pulse is larger than dt, then this simple
-            # model is not consistent and should fail loudly.
-            if thr.min_pulse_s - dt_s > 1.0e-12:
-                raise ValueError(
-                    f"Thruster {name} min_pulse_s={thr.min_pulse_s} exceeds dt_s={dt_s}"
-                )
-
-            fire.duty_by_name[name] = 1.0
+        # If negative roll channel is active then all negative roll jets fire fully
+        if fire_neg:
+            for name in self.roll_neg_names:
+                fire.duty_by_name[name] = 1.0
 
         return fire
 
@@ -388,27 +469,27 @@ class CapsuleRCSSystem:
         tau_roll_cmd_Nm: float,
         dt_s: float,
     ) -> RollChannelStepResult:
-        """
-        Convenience wrapper that:
-        1. allocates roll thrusters
-        2. computes the resulting wrench
-        3. returns a debug-rich result packet
-        """
+        # Determine which signed capacity applies to the current command
         sign_positive = tau_roll_cmd_Nm > 0.0
         tau_capacity = 0.0
         requested_duty = 0.0
 
         if abs(tau_roll_cmd_Nm) > 1.0e-12:
             tau_capacity = self.roll_torque_capacity_Nm(positive=sign_positive)
+
             if tau_capacity > 1.0e-12:
                 requested_duty = clamp(abs(float(tau_roll_cmd_Nm)) / tau_capacity, 0.0, 1.0)
 
+        # Allocate real timed thruster firing for this substep
         fire_cmd = self.allocate_roll_step(
             tau_roll_cmd_Nm=tau_roll_cmd_Nm,
             dt_s=dt_s,
         )
+
+        # Convert the active thruster set into a physical body wrench
         wrench = self.body_wrench(fire_cmd)
 
+        # Return debug rich timing and wrench data
         return RollChannelStepResult(
             tau_roll_cmd_Nm=float(tau_roll_cmd_Nm),
             tau_roll_capacity_Nm=float(tau_capacity),
@@ -416,104 +497,90 @@ class CapsuleRCSSystem:
             fired_this_step=not fire_cmd.is_empty(),
             fire_cmd=fire_cmd,
             wrench=wrench,
+            roll_pos_backlog_s=float(self._roll_pos_channel.backlog_s),
+            roll_neg_backlog_s=float(self._roll_neg_channel.backlog_s),
+            roll_pos_is_on=bool(self._roll_pos_channel.is_on),
+            roll_neg_is_on=bool(self._roll_neg_channel.is_on),
         )
 
 
-# Orion-inspired milestone-1 12-thruster layout
+# Orion inspired twelve thruster layout
+
 def build_orion_cm_rcs_12(
     ring_radius_m: float = constants.CAPSULE_RCS_RING_RADIUS_M,
     ring_z_m: float = constants.CAPSULE_RCS_RING_Z_M,
     thrust_N: float = constants.ORION_CM_RCS_THRUST_N,
     min_pulse_s: float = constants.ORION_CM_RCS_MIN_PULSE_S,
+    min_off_pulse_s: float = constants.ORION_CM_RCS_MIN_OFF_PULSE_S,
+    lag_s: float = constants.ORION_CM_RCS_LAG_S,
 ) -> CapsuleRCSSystem:
-    """
-    Build a symmetric 12-thruster Orion-inspired crew-module layout.
+    # Build a symmetric crew module style layout with four pods
+    # Each pod contains one axial jet one positive roll jet and one negative roll jet
 
-    Layout
-    ------
-    Four pods around the shoulder ring:
-    - one axial jet per pod
-    - one positive-roll tangential jet per pod
-    - one negative-roll tangential jet per pod
-
-    Naming
-    ------
-    POD0_AX
-    POD0_RPOS
-    POD0_RNEG
-    ...
-    POD3_AX
-    POD3_RPOS
-    POD3_RNEG
-
-    Body-axis convention
-    --------------------
-    x_b, y_b, z_b form a right-handed body frame.
-    z_b is the roll axis used by milestone-1 bank control.
-
-    Geometry
-    --------
-    Pod azimuths are:
-    0 deg, 90 deg, 180 deg, 270 deg
-
-    Tangential direction at pod azimuth psi is:
-        t_hat = [-sin(psi), cos(psi), 0]
-
-    This makes the RPOS channel produce positive z torque and the RNEG
-    channel produce negative z torque.
-    """
     thrusters: Dict[str, RCSThruster] = {}
     roll_pos_names: List[str] = []
     roll_neg_names: List[str] = []
     axial_names: List[str] = []
 
-    azimuths = (
-        0.0,
-        0.5 * math.pi,
-        1.0 * math.pi,
-        1.5 * math.pi,
-    )
+    # Pod azimuths are equally spaced around the shoulder ring
+    azimuths = tuple(constants.CAPSULE_RCS_POD_AZIMUTHS_RAD)
 
     for pod_idx, psi in enumerate(azimuths):
+        # Convert azimuth into planar cosine and sine values
         c = math.cos(psi)
         s = math.sin(psi)
 
+        # Pod position lies on the shoulder ring in body coordinates
         position_b = np.array([ring_radius_m * c, ring_radius_m * s, ring_z_m], dtype=float)
 
+        # Axial jet points along positive body z
         axial_dir = np.array([0.0, 0.0, 1.0], dtype=float)
+
+        # Tangential direction at pod azimuth produces roll torque about body z
         tangential_dir = np.array([-s, c, 0.0], dtype=float)
 
+        # Build consistent pod thruster names
         ax_name = f"POD{pod_idx}_AX"
         rp_name = f"POD{pod_idx}_RPOS"
         rn_name = f"POD{pod_idx}_RNEG"
 
+        # Store one axial thruster for future pitch yaw or translational use
         thrusters[ax_name] = RCSThruster(
             name=ax_name,
             position_b_m=position_b,
             direction_b_unit=axial_dir,
             max_thrust_N=thrust_N,
             min_pulse_s=min_pulse_s,
+            min_off_pulse_s=min_off_pulse_s,
+            lag_s=lag_s,
         )
         axial_names.append(ax_name)
 
+        # Positive roll jet uses the positive tangential direction
         thrusters[rp_name] = RCSThruster(
             name=rp_name,
             position_b_m=position_b,
             direction_b_unit=tangential_dir,
             max_thrust_N=thrust_N,
             min_pulse_s=min_pulse_s,
+            min_off_pulse_s=min_off_pulse_s,
+            lag_s=lag_s,
         )
         roll_pos_names.append(rp_name)
 
+        # Negative roll jet uses the opposite tangential direction
         thrusters[rn_name] = RCSThruster(
             name=rn_name,
             position_b_m=position_b,
             direction_b_unit=-tangential_dir,
             max_thrust_N=thrust_N,
             min_pulse_s=min_pulse_s,
+            min_off_pulse_s=min_off_pulse_s,
+            lag_s=lag_s,
         )
         roll_neg_names.append(rn_name)
 
+    # Return the full physical RCS system
     return CapsuleRCSSystem(
         thrusters=thrusters,
         roll_pos_names=roll_pos_names,
@@ -522,16 +589,11 @@ def build_orion_cm_rcs_12(
     )
 
 
-# compatibility helpers
+# Compatibility helpers
 
 @dataclass
 class LegacyPulseResult:
-    """
-    Small compatibility packet for older logs or notebooks that still expect
-    something pulse-like from an RCS object.
-
-    This is not used by the new milestone-1 control stack directly
-    """
+    # Simple packet for older logging code
     fired: bool
     active_names: List[str]
     requested_duty: float
@@ -540,22 +602,14 @@ class LegacyPulseResult:
 
 
 class LegacyPulseAdapter:
-    """
-    Thin adapter that exposes a quantize-like interface on top of the new
-    physical roll-channel allocator.
-
-    Use this only if some surrounding code still expects an object with a
-    quantize_on_time-like flavor during migration.
-
-    New code should use:
-        rcs.step_roll_channel(...)
-    directly.
-    """
+    # Thin adapter that exposes older pulse style telemetry on top of the new timed channel model
 
     def __init__(self, rcs_system: CapsuleRCSSystem):
+        # Store the physical RCS system
         self.rcs = rcs_system
 
     def reset(self) -> None:
+        # Reset the physical channel timing states
         self.rcs.reset()
 
     def quantize_tau_roll(
@@ -563,35 +617,20 @@ class LegacyPulseAdapter:
         tau_roll_cmd_Nm: float,
         dt_s: float,
     ) -> LegacyPulseResult:
+        # Step the real timed roll channel model
         result = self.rcs.step_roll_channel(
             tau_roll_cmd_Nm=tau_roll_cmd_Nm,
             dt_s=dt_s,
         )
+
+        # Convert remaining backlog into a pulse fraction style residual for older logs
+        pos_min_pulse = max(constants.ORION_CM_RCS_MIN_PULSE_S, 1.0e-12)
+        neg_min_pulse = max(constants.ORION_CM_RCS_MIN_PULSE_S, 1.0e-12)
+
         return LegacyPulseResult(
             fired=result.fired_this_step,
             active_names=result.fire_cmd.active_names(),
             requested_duty=result.requested_duty,
-            residual_pos=self.rcs._roll_pos_pwm.residual,
-            residual_neg=self.rcs._roll_neg_pwm.residual,
+            residual_pos=float(self.rcs._roll_pos_channel.backlog_s / pos_min_pulse),
+            residual_neg=float(self.rcs._roll_neg_channel.backlog_s / neg_min_pulse),
         )
-
-
-# ------------------------------------------------------------------------------
-# Example milestone-1 usage
-# ------------------------------------------------------------------------------
-#
-# rcs = build_orion_cm_rcs_12()
-#
-# # Every 0.25 s physics step:
-# roll_step = rcs.step_roll_channel(
-#     tau_roll_cmd_Nm=ctrl_out.tau_roll_cmd_Nm,
-#     dt_s=constants.ENTRY_DT_S,
-# )
-#
-# F_rcs_b = roll_step.wrench.force_b_N
-# tau_rcs_b = roll_step.wrench.torque_b_Nm
-#
-# Important:
-# - control.py owns sigma_cmd and sigma_target
-# - ReactionControl.py turns tau_roll_cmd into a real body wrench
-# - math_3d.py integrates roll rate, attitude, and sigma_actual

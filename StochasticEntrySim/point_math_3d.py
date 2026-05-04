@@ -2,105 +2,63 @@ import math
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import numpy as np
+
 import AtmosphereModel
 import constants
 from control import ReentryState, SigmaControlStack
-from ReactionControl import CapsuleRCSSystem
+from math_3d import nominal_aero_forces_from_state, nominal_eom_step
+from ReactionControl import CapsuleRCSSystem, RCSWrench, ThrusterFireCommand
 
 
-"""
-milestone1_nominal.py
-
-This file contains the nominal milestone 1 simulation path.
-
-It includes the float translational dynamics, attitude helpers,
-control bridge logic, and the closed loop nominal step.
-
-This keeps math_3d.py focused on interval math and interval
-supervisor annotations.
-
-Translational state convention
-
-X = [r, phi, lam, V, gamma, chi]
-
-r      radial distance from Earth center in meters
-phi    geocentric latitude in radians
-lam    longitude in radians
-V      speed magnitude in meters per second
-gamma  flight path angle in radians
-chi    heading angle in radians
-"""
-
-
-# Small math helpers used throughout the nominal simulation path.
+# Small math helpers used throughout the nominal simulation path
 
 def wrap_to_pi(angle_rad: float) -> float:
-    """
-    Wrap an angle into the range from negative pi to positive pi.
-    """
-    # Repeatedly subtract full turns until the angle is inside the target range.
+    # Keep angles inside the principal interval used everywhere else in the sim
     while angle_rad > math.pi:
         angle_rad -= 2.0 * math.pi
 
-    # Repeatedly add full turns until the angle is inside the target range.
     while angle_rad < -math.pi:
         angle_rad += 2.0 * math.pi
 
-    # Return the wrapped angle.
     return angle_rad
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
-    """
-    Clamp a scalar into a closed interval.
-    """
-    # Limit the value so it cannot go below the lower bound or above the upper bound.
+    # Keep a scalar inside a closed interval
     return max(lower, min(upper, value))
 
 
 def normalize(vec: List[float], eps: Optional[float] = None) -> List[float]:
-    """
-    Normalize a three component vector and return a plain Python list.
-    """
-    # Pull a default norm tolerance from constants if one was not provided.
+    # Pull the default norm threshold from constants when none is supplied
     if eps is None:
         eps = getattr(constants, "EPS_NORM", 1.0e-12)
 
-    # Convert all components to float so downstream math stays consistent.
+    # Convert all components to float so downstream math stays consistent
     x = float(vec[0])
     y = float(vec[1])
     z = float(vec[2])
 
-    # Compute the Euclidean norm of the vector.
+    # Euclidean norm of the vector
     n = math.sqrt(x * x + y * y + z * z)
 
-    # Return a zero vector if the norm is too small to normalize safely.
+    # Return a zero vector if the input is too small to normalize safely
     if n < eps:
         return [0.0, 0.0, 0.0]
 
-    # Return the normalized vector components.
     return [x / n, y / n, z / n]
 
 
 def dot3(a: List[float], b: List[float]) -> float:
-    """
-    Return the three dimensional dot product of two vectors.
-    """
-    # Multiply corresponding components and sum them.
+    # Standard three dimensional dot product
     return float(a[0]) * float(b[0]) + float(a[1]) * float(b[1]) + float(a[2]) * float(b[2])
 
 
 def cross3(a: List[float], b: List[float]) -> List[float]:
-    """
-    Return the three dimensional cross product a cross b.
-    """
-    # Read the first vector components as floats.
+    # Standard three dimensional cross product
     ax, ay, az = float(a[0]), float(a[1]), float(a[2])
-
-    # Read the second vector components as floats.
     bx, by, bz = float(b[0]), float(b[1]), float(b[2])
 
-    # Return the standard cross product result.
     return [
         ay * bz - az * by,
         az * bx - ax * bz,
@@ -109,10 +67,7 @@ def cross3(a: List[float], b: List[float]) -> List[float]:
 
 
 def mat_vec_mul(M: List[List[float]], v: List[float]) -> List[float]:
-    """
-    Multiply a three by three matrix by a three component vector.
-    """
-    # Compute each output row explicitly for clarity and predictable ordering.
+    # Three by three matrix times three component vector
     return [
         float(M[0][0]) * float(v[0]) + float(M[0][1]) * float(v[1]) + float(M[0][2]) * float(v[2]),
         float(M[1][0]) * float(v[0]) + float(M[1][1]) * float(v[1]) + float(M[1][2]) * float(v[2]),
@@ -121,10 +76,7 @@ def mat_vec_mul(M: List[List[float]], v: List[float]) -> List[float]:
 
 
 def mat_mul_3x3(A: List[List[float]], B: List[List[float]]) -> List[List[float]]:
-    """
-    Multiply two three by three matrices.
-    """
-    # Build the output matrix row by row using the standard matrix product rule.
+    # Three by three matrix product
     return [
         [
             float(A[i][0]) * float(B[0][j])
@@ -137,87 +89,121 @@ def mat_mul_3x3(A: List[List[float]], B: List[List[float]]) -> List[List[float]]
 
 
 def safe_nonzero(value: float, eps: float = 1.0e-12) -> float:
-    """
-    Prevent division by zero in the float dynamics path.
-    """
-    # Return the original value if it is already far enough from zero.
+    # Prevent division by zero in the float dynamics path
     if abs(value) >= eps:
         return value
 
-    # Preserve the sign when replacing a near zero value with a small safe fallback.
     return eps if value >= 0.0 else -eps
 
 
 def _get_param(params: Dict[str, Any], *keys: str, default: Optional[float] = None) -> float:
-    """
-    Fetch the first matching numeric parameter from a dictionary.
-    """
-    # Check each candidate key in order and return the first one that exists.
+    # Return the first matching numeric parameter from a dictionary
     for key in keys:
         if key in params:
             return float(params[key])
 
-    # Raise an error if no key matched and no default was supplied.
     if default is None:
-        raise KeyError(f"Missing required parameter. Tried keys={keys}")
+        raise KeyError(f"Missing required parameter Tried keys={keys}")
 
-    # Return the fallback value when provided.
     return float(default)
 
 
 def add_scaled_state(x: List[float], dx: List[float], dt_s: float) -> List[float]:
-    """
-    Return x plus dt times dx for a flat state vector.
-    """
-    # Apply a forward Euler style state update component by component.
+    # Forward Euler update for a flat state vector
     return [float(x[i]) + float(dt_s) * float(dx[i]) for i in range(len(x))]
 
 
-# Capsule attitude state and helper result objects used by milestone 1.
-
 @dataclass
 class CapsuleAttitudeState:
-    """
-    Minimal rigid body attitude state for milestone 1.
-
-    q_ba stores the quaternion that maps body frame vectors into
-    aerodynamic frame vectors.
-
-    omega_b_rad_s stores body angular rates relative to the
-    aerodynamic frame.
-
-    sigma_rel_rad stores the actual bank angle.
-    """
+    # q_ba maps body frame vectors into aerodynamic frame vectors
     q_ba: List[float]
+
+    # omega_b_rad_s stores body angular rate relative to the aerodynamic frame
     omega_b_rad_s: List[float]
+
+    # sigma_rel_rad stores the actual bank angle represented by the attitude
     sigma_rel_rad: float
 
 
 @dataclass
+class AggregatedRollChannelStepResult:
+    # Outer step roll torque command from the controller
+    tau_roll_cmd_Nm: float
+
+    # Magnitude of available roll torque for the active direction
+    tau_roll_capacity_Nm: float
+
+    # Requested average duty for the outer step
+    requested_duty: float
+
+    # True if any internal RCS substep fired
+    fired_this_step: bool
+
+    # Average duty by thruster across the full outer step
+    fire_cmd: ThrusterFireCommand
+
+    # Time averaged body wrench over the full outer step
+    wrench: RCSWrench
+
+    # Remaining undelivered positive roll demand in seconds
+    roll_pos_backlog_s: float
+
+    # Remaining undelivered negative roll demand in seconds
+    roll_neg_backlog_s: float
+
+    # Positive roll channel firing state after the last internal substep
+    roll_pos_is_on: bool
+
+    # Negative roll channel firing state after the last internal substep
+    roll_neg_is_on: bool
+
+    # Number of internal RCS substeps inside this outer step
+    num_internal_steps: int
+
+    # Number of internal substeps that actually fired any roll thruster
+    num_fired_internal_steps: int
+
+    # Full list of internal roll packets for debugging if needed
+    substeps: List[Any]
+
+
+@dataclass
 class Milestone1StepResult:
-    """
-    Result packet for one nominal closed loop milestone 1 step.
-    """
+    # Outer time at the start of the nominal step
     t_s: float
+
+    # Translational state before the step
     x_old: List[float]
+
+    # Translational state after the step
     x_new: List[float]
+
+    # Attitude state before the step
     att_old: CapsuleAttitudeState
+
+    # Attitude state after the step
     att_new: CapsuleAttitudeState
+
+    # Actual bank before the outer step
     sigma_actual_before_rad: float
+
+    # Actual bank after the outer step
     sigma_actual_after_rad: float
+
+    # High level control output computed once for the outer step
     control_out: Any
+
+    # Time averaged roll realization packet across the outer step
     roll_step: Any
+
+    # Translational derivative used for the outer step Euler update
     dx_trans: List[float]
 
 
 def make_initial_capsule_attitude(sigma0_rad: float = 0.0) -> CapsuleAttitudeState:
-    """
-    Construct an initial roll only capsule attitude state.
-    """
-    # Build a pure roll quaternion about the aerodynamic z axis.
+    # Initialize the capsule in a pure roll state relative to the aerodynamic frame
     q_ba = quat_from_axis_angle([0.0, 0.0, 1.0], sigma0_rad)
 
-    # Start with zero body rate and the wrapped initial bank angle.
     return CapsuleAttitudeState(
         q_ba=q_ba,
         omega_b_rad_s=[0.0, 0.0, 0.0],
@@ -225,38 +211,30 @@ def make_initial_capsule_attitude(sigma0_rad: float = 0.0) -> CapsuleAttitudeSta
     )
 
 
-# Quaternion helpers used by the roll attitude model.
+# Quaternion helpers used by the roll attitude model
 
 def quat_normalize(q: List[float]) -> List[float]:
-    """
-    Normalize a quaternion [w, x, y, z].
-    """
-    # Convert all quaternion components to floats.
+    # Convert quaternion components to floats
     w, x, y, z = [float(v) for v in q]
 
-    # Compute the quaternion magnitude.
+    # Euclidean magnitude of the quaternion
     n = math.sqrt(w * w + x * x + y * y + z * z)
 
-    # Fall back to identity if the input magnitude is too small.
+    # Fall back to identity if the quaternion is too small
     if n < getattr(constants, "EPS_NORM", 1.0e-12):
         return [1.0, 0.0, 0.0, 0.0]
 
-    # Return the unit quaternion.
     return [w / n, x / n, y / n, z / n]
 
 
 def quat_from_axis_angle(axis: List[float], angle_rad: float) -> List[float]:
-    """
-    Build a quaternion [w, x, y, z] from an axis and angle.
-    """
-    # Normalize the rotation axis before constructing the quaternion.
+    # Normalize the rotation axis first
     ax = normalize(axis)
 
-    # Use the half angle form of the axis angle quaternion equation.
+    # Axis angle to quaternion uses the half angle form
     half = 0.5 * float(angle_rad)
     s = math.sin(half)
 
-    # Build and normalize the quaternion to avoid drift from numerical noise.
     return quat_normalize([
         math.cos(half),
         float(ax[0]) * s,
@@ -266,13 +244,9 @@ def quat_from_axis_angle(axis: List[float], angle_rad: float) -> List[float]:
 
 
 def quat_to_dcm(q: List[float]) -> List[List[float]]:
-    """
-    Convert a quaternion [w, x, y, z] into a three by three direction cosine matrix.
-    """
-    # Normalize first so the resulting matrix stays orthonormal.
+    # Normalize before converting so the DCM stays orthonormal
     w, x, y, z = quat_normalize(q)
 
-    # Return the standard quaternion to DCM conversion.
     return [
         [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w),       2.0 * (x * z + y * w)],
         [2.0 * (x * y + z * w),       1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
@@ -280,98 +254,79 @@ def quat_to_dcm(q: List[float]) -> List[List[float]]:
     ]
 
 
-# Frame helpers that move between local level, aerodynamic, body, and world coordinates.
+# Frame helpers that move between local level aerodynamic body and world coordinates
 
 def local_level_frame(phi_rad: float, lam_rad: float) -> Tuple[List[float], List[float], List[float]]:
-    """
-    Return local north, east, and up unit vectors in the world frame.
-    """
-    # Build the local north direction from latitude and longitude.
+    # Local north direction in world coordinates
     north = [
         -math.sin(phi_rad) * math.cos(lam_rad),
         -math.sin(phi_rad) * math.sin(lam_rad),
         math.cos(phi_rad),
     ]
 
-    # Build the local east direction.
+    # Local east direction in world coordinates
     east = [
         -math.sin(lam_rad),
         math.cos(lam_rad),
         0.0,
     ]
 
-    # Build the local up direction pointing radially away from Earth center.
+    # Local up direction points radially away from Earth center
     up = [
         math.cos(phi_rad) * math.cos(lam_rad),
         math.cos(phi_rad) * math.sin(lam_rad),
         math.sin(phi_rad),
     ]
 
-    # Normalize all three basis directions before returning them.
     return normalize(north), normalize(east), normalize(up)
 
 
 def position_world_from_state(x: List[float]) -> List[float]:
-    """
-    Convert [r, phi, lam, ...] into a world frame position vector.
-    """
-    # Read the spherical position states.
+    # Convert spherical position into a world position vector
     r = float(x[0])
     phi = float(x[1])
     lam = float(x[2])
 
-    # Reuse the local up direction as the outward radial direction.
     _, _, up = local_level_frame(phi, lam)
 
-    # Scale the radial unit vector by the radial distance.
     return [r * up[0], r * up[1], r * up[2]]
 
 
 def velocity_hat_from_state(x: List[float]) -> List[float]:
-    """
-    Build the unit velocity direction in the world frame.
-    """
-    # Read the translational state as floats.
+    # Read the translational state
     _, phi, lam, _, gamma, chi = [float(v) for v in x]
 
-    # Build the local level basis at the current position.
+    # Build the local basis at the current location
     north, east, up = local_level_frame(phi, lam)
 
-    # Resolve the velocity direction into world coordinates using gamma and chi.
+    # Resolve the velocity direction using gamma and chi
     v_hat = [
         math.cos(gamma) * math.sin(chi) * north[0] + math.cos(gamma) * math.cos(chi) * east[0] + math.sin(gamma) * up[0],
         math.cos(gamma) * math.sin(chi) * north[1] + math.cos(gamma) * math.cos(chi) * east[1] + math.sin(gamma) * up[1],
         math.cos(gamma) * math.sin(chi) * north[2] + math.cos(gamma) * math.cos(chi) * east[2] + math.sin(gamma) * up[2],
     ]
 
-    # Normalize before returning so it behaves as a unit direction vector.
     return normalize(v_hat)
 
 
 def aero_frame_dcm_from_state(x: List[float]) -> List[List[float]]:
-    """
-    Build R_wa, the DCM mapping aerodynamic frame vectors into world frame vectors.
-    """
-    # Read only the state components needed to form the local frame.
+    # Build the aerodynamic frame basis in world coordinates
     _, phi, lam, _, _, _ = [float(v) for v in x]
 
-    # Get the local north direction and the radial up direction.
     north, _, up = local_level_frame(phi, lam)
-
-    # Build the velocity direction in world coordinates.
     v_hat = velocity_hat_from_state(x)
 
-    # Define the aerodynamic z axis opposite the velocity direction.
+    # Aerodynamic z points opposite the velocity direction
     z_a_w = normalize([-v_hat[0], -v_hat[1], -v_hat[2]])
 
-    # Project the radial up direction into the plane normal to z_a_w to form x_a_w.
+    # Aerodynamic x is the projection of local up into the plane normal to aerodynamic z
     x_a_w = [
         up[0] - dot3(up, z_a_w) * z_a_w[0],
         up[1] - dot3(up, z_a_w) * z_a_w[1],
         up[2] - dot3(up, z_a_w) * z_a_w[2],
     ]
 
-    # If the up vector is nearly aligned with z_a_w, use north as a backup reference.
+    # Use north as a fallback if local up is nearly aligned with aerodynamic z
     if math.sqrt(dot3(x_a_w, x_a_w)) < getattr(constants, "EPS_NORM", 1.0e-12):
         x_a_w = [
             north[0] - dot3(north, z_a_w) * z_a_w[0],
@@ -379,13 +334,11 @@ def aero_frame_dcm_from_state(x: List[float]) -> List[List[float]]:
             north[2] - dot3(north, z_a_w) * z_a_w[2],
         ]
 
-    # Normalize the aerodynamic x axis after projection.
     x_a_w = normalize(x_a_w)
 
-    # Form the aerodynamic y axis from the cross product.
+    # Aerodynamic y completes the right handed frame
     y_a_w = normalize(cross3(z_a_w, x_a_w))
 
-    # Return the world from aerodynamic direction cosine matrix.
     return [
         [x_a_w[0], y_a_w[0], z_a_w[0]],
         [x_a_w[1], y_a_w[1], z_a_w[1]],
@@ -394,45 +347,26 @@ def aero_frame_dcm_from_state(x: List[float]) -> List[List[float]]:
 
 
 def sigma_from_q_ba(q_ba: List[float]) -> float:
-    """
-    Extract actual bank angle from the body to aero attitude quaternion.
-    """
-    # Convert the quaternion into a body to aerodynamic rotation matrix.
+    # Convert body to aerodynamic attitude into the actual bank angle
     R_ba = quat_to_dcm(q_ba)
-
-    # Read the body x axis expressed in the aerodynamic frame.
     x_b_in_a = [R_ba[0][0], R_ba[1][0], R_ba[2][0]]
 
-    # Recover the roll angle about the aerodynamic z axis.
     sigma = math.atan2(x_b_in_a[1], x_b_in_a[0])
 
-    # Apply the configured sign convention before wrapping the result.
     sigma_sign = getattr(constants, "SIGMA_SIGN", 1.0)
     return wrap_to_pi(sigma_sign * sigma)
 
 
 def body_to_world_dcm(x_trans: List[float], q_ba: List[float]) -> List[List[float]]:
-    """
-    Return R_wb, the DCM mapping body frame vectors into world frame vectors.
-    """
-    # Build the world from aerodynamic rotation from the translational state.
+    # Compose world from aerodynamic with aerodynamic from body
     R_wa = aero_frame_dcm_from_state(x_trans)
-
-    # Build the aerodynamic from body rotation from the quaternion.
     R_ba = quat_to_dcm(q_ba)
-
-    # Compose both transforms to get world from body.
     return mat_mul_3x3(R_wa, R_ba)
 
 
 def heat_shield_normal_world(x_trans: List[float], q_ba: List[float]) -> List[float]:
-    """
-    Return the heat shield normal in the world frame.
-    """
-    # Convert from body frame to world frame.
+    # Map body z into world coordinates so the current shield normal is available
     R_wb = body_to_world_dcm(x_trans, q_ba)
-
-    # Map the body z axis into world coordinates.
     return mat_vec_mul(R_wb, [0.0, 0.0, 1.0])
 
 
@@ -442,29 +376,18 @@ def thruster_world_pose(
     thruster_position_b_m: List[float],
     thruster_direction_b_unit: List[float],
 ) -> Tuple[List[float], List[float]]:
-    """
-    Convert a body fixed thruster pose into world coordinates.
-    """
-    # Build the body to world rotation.
+    # Convert a body fixed thruster pose into the world frame
     R_wb = body_to_world_dcm(x_trans, q_ba)
-
-    # Get the capsule center of mass position in world coordinates.
     r_cm_w = position_world_from_state(x_trans)
-
-    # Rotate the local thruster position offset into the world frame.
     r_thr_w_local = mat_vec_mul(R_wb, thruster_position_b_m)
-
-    # Rotate and normalize the thruster direction into the world frame.
     d_thr_w = normalize(mat_vec_mul(R_wb, thruster_direction_b_unit))
 
-    # Add the rotated local offset to the center of mass position.
     r_thr_w = [
         r_cm_w[0] + r_thr_w_local[0],
         r_cm_w[1] + r_thr_w_local[1],
         r_cm_w[2] + r_thr_w_local[2],
     ]
 
-    # Return the world position and unit direction of the thruster.
     return r_thr_w, d_thr_w
 
 
@@ -474,36 +397,31 @@ def step_capsule_roll_state(
     Izz_kgm2: Optional[float] = None,
     dt_s: Optional[float] = None,
 ) -> CapsuleAttitudeState:
-    """
-    Advance the milestone 1 roll only attitude state by one fixed step.
-    """
-    # Pull default inertia if one was not provided.
+    # Advance the roll only attitude model for one time step
     if Izz_kgm2 is None:
         Izz_kgm2 = float(getattr(constants, "CAPSULE_IZZ_KGM2", 20000.0))
 
-    # Pull the default fixed time step if one was not provided.
     if dt_s is None:
         dt_s = float(getattr(constants, "ENTRY_DT_S", 0.25))
 
-    # Read the current roll rate from the body rate vector.
+    # Current roll rate is the body z rate in this milestone model
     roll_rate_old = float(att.omega_b_rad_s[2])
 
-    # Read the body roll torque from the RCS wrench.
+    # Body z torque is the roll control torque
     tau_roll = float(tau_rcs_b_Nm[2])
 
-    # Convert torque into roll angular acceleration.
+    # Angular acceleration follows rigid body dynamics about body z
     roll_accel = tau_roll / safe_nonzero(Izz_kgm2)
 
-    # Integrate roll rate forward by one fixed step.
+    # Integrate roll rate first
     roll_rate_new = roll_rate_old + dt_s * roll_accel
 
-    # Integrate bank angle forward using the updated roll rate.
+    # Then integrate bank angle using the updated roll rate
     sigma_new = wrap_to_pi(float(att.sigma_rel_rad) + dt_s * roll_rate_new)
 
-    # Rebuild the attitude quaternion from the updated roll angle.
+    # Rebuild the quaternion from the new roll angle
     q_ba_new = quat_from_axis_angle([0.0, 0.0, 1.0], sigma_new)
 
-    # Return the updated roll only attitude state.
     return CapsuleAttitudeState(
         q_ba=q_ba_new,
         omega_b_rad_s=[0.0, 0.0, roll_rate_new],
@@ -511,7 +429,7 @@ def step_capsule_roll_state(
     )
 
 
-# Aerodynamic force model used by the float entry dynamics.
+# Aerodynamic force model used by the float entry dynamics
 
 def aero_forces(
     r: float,
@@ -523,73 +441,66 @@ def aero_forces(
     sigma_cmd_rad: Optional[float] = None,
 ) -> Tuple[float, float, float, float, float, float, float, float]:
     """
-    Compute drag and lift components in the spherical three dimensional frame.
+    Return nominal aerodynamic force components using the canonical model
+
+    This helper keeps the legacy return order used by the notebook
+    The actual force decomposition is delegated to math_3d so the live path
+    and the predictor path share one translational model
+
+    Input
+    r radius in meters
+    V speed in meters per second
+    gamma flight path angle in radians
+    chi heading angle in radians measured from east toward north
+    params aerodynamic parameter dictionary
+    sigma_actual_rad realized bank angle in radians when available
+    sigma_cmd_rad commanded bank angle used only as a fallback
+
+    Output
+    D_r
+    Dtheta
+    Dphi
+    Lr
+    Ltheta
+    Lphi
+    rho
+    q
     """
-    # Prefer actual bank when available, otherwise fall back to commanded bank or zero.
+    # Realized bank must drive the flown translational dynamics
     sigma_used = float(
         sigma_actual_rad
         if sigma_actual_rad is not None
         else (sigma_cmd_rad if sigma_cmd_rad is not None else 0.0)
     )
 
-    # Convert radius to altitude above the Earth surface.
-    altitude_m = float(r) - float(constants.RADIUS_EARTH)
+    # The canonical force model only needs radius speed gamma chi and sigma
+    x_state = [
+        float(r),
+        0.0,
+        0.0,
+        float(V),
+        float(gamma),
+        float(chi),
+    ]
 
-    # Prevent negative altitude from entering the atmosphere model.
-    altitude_m = max(0.0, altitude_m)
+    # Pull the canonical decomposition from math_3d
+    aero = nominal_aero_forces_from_state(
+        x=x_state,
+        sigma_rad=float(sigma_used),
+        params=params,
+    )
 
-    # Query the atmosphere model at the current altitude.
-    atm = AtmosphereModel.US_Standard_ATM(altitude_m)
-
-    # Use zero density if the atmosphere model returns a missing value.
-    rho = atm["rho_kgm3"] if atm["rho_kgm3"] is not None else 0.0
-
-    # Compute dynamic pressure.
-    q = 0.5 * rho * V * V
-
-    # Read aerodynamic coefficients and reference area from params.
-    CD = _get_param(params, "CD_const", "CD")
-    CL = _get_param(params, "CL_const", "CL")
-    surface_area = _get_param(params, "ref_area_m2", "S")
-
-    # Convert dynamic pressure into total drag and lift magnitudes.
-    drag_mag = q * surface_area * CD
-    lift_mag = q * surface_area * CL
-
-    # Resolve the velocity direction in the local spherical basis.
-    v_r = math.sin(gamma)
-    v_theta = math.cos(gamma) * math.cos(chi)
-    v_phi = math.cos(gamma) * math.sin(chi)
-
-    # Drag points opposite the velocity direction.
-    D_r = -drag_mag * v_r
-    Dtheta = drag_mag * v_theta
-    Dphi = -drag_mag * v_phi
-
-    # e1 defines the lift direction associated with bank equal to zero.
-    e1_r = math.cos(gamma)
-    e1_theta = -math.sin(gamma) * math.cos(chi)
-    e1_phi = -math.sin(gamma) * math.sin(chi)
-
-    # e2 defines the lift direction ninety degrees away in bank.
-    e2_r = 0.0
-    e2_theta = math.sin(chi)
-    e2_phi = -math.cos(chi)
-
-    # Compute the bank rotation weights.
-    cos_sig = math.cos(sigma_used)
-    sin_sig = math.sin(sigma_used)
-
-    # Resolve lift into spherical components after bank rotation.
-    Lr = lift_mag * (e1_r * cos_sig + e2_r * sin_sig)
-    Ltheta = lift_mag * (e1_theta * cos_sig + e2_theta * sin_sig)
-    Lphi = lift_mag * (e1_phi * cos_sig + e2_phi * sin_sig)
-
-    # Return force components together with density and dynamic pressure.
-    return D_r, Dtheta, Dphi, Lr, Ltheta, Lphi, float(rho), float(q)
-
-
-# Float equations of motion for the nominal translational state.
+    # Return the legacy component order so existing notebook code stays valid
+    return (
+        float(aero["D_r_N"]),
+        float(aero["Dtheta"]),
+        float(aero["Dphi"]),
+        float(aero["L_r_N"]),
+        float(aero["Ltheta"]),
+        float(aero["Lphi"]),
+        float(aero["rho_kgm3"]),
+        float(aero["q_pa"]),
+    )
 
 def eom_3d(
     t: float,
@@ -599,54 +510,42 @@ def eom_3d(
     sigma_cmd_rad: Optional[float] = None,
 ) -> Dict[str, float]:
     """
-    Float spherical three dimensional equations of motion for atmospheric entry.
+    Return live translational derivatives from the canonical nominal model
+
+    This removes the stale duplicate live dynamics
+    The live nominal simulation now uses the same equations as the predictor
+    rollout in math_3d
+
+    Input
+    t time in seconds
+    X six component translational state
+    params aerodynamic and mass parameter dictionary
+    sigma_actual_rad realized bank angle in radians when available
+    sigma_cmd_rad commanded bank angle used only as a fallback
+
+    Output
+    Dictionary with r_dot phi_dot lam_dot V_dot gamma_dot chi_dot
     """
-    # Unpack the translational state.
-    r, phi, lam, V, gamma, chi = [float(v) for v in X]
+    # Time is kept only for signature compatibility
+    del t
 
-    # Read the vehicle mass and local gravity.
-    m = _get_param(params, "mass_kg", "m")
-    g = float(constants.gravity(r))
-
-    # Compute aerodynamic force components at the current state.
-    Dr, Dtheta, Dphi, Lr, Ltheta, Lphi, _, _ = aero_forces(
-        r=r,
-        V=V,
-        gamma=gamma,
-        chi=chi,
-        params=params,
-        sigma_actual_rad=sigma_actual_rad,
-        sigma_cmd_rad=sigma_cmd_rad,
+    # Realized bank must drive the flown translational dynamics
+    sigma_used = float(
+        sigma_actual_rad
+        if sigma_actual_rad is not None
+        else (sigma_cmd_rad if sigma_cmd_rad is not None else 0.0)
     )
 
-    # Protect denominators that can become numerically small.
-    cos_phi = safe_nonzero(math.cos(phi))
-    cos_gamma = safe_nonzero(math.cos(gamma))
-    V_safe = safe_nonzero(V)
-    r_safe = safe_nonzero(r)
+    # Use the canonical nominal equations from math_3d
+    nominal_step = nominal_eom_step(
+        x=[float(v) for v in X],
+        sigma_rad=float(sigma_used),
+        params=params,
+        dt_s=1.0,
+    )
 
-    # Radial rate comes from the vertical component of velocity.
-    r_dot = V * math.sin(gamma)
+    r_dot, phi_dot, lam_dot, V_dot, gamma_dot, chi_dot = nominal_step["x_dot"]
 
-    # Latitude rate depends on the northward component of motion.
-    phi_dot = (V * math.cos(gamma) * math.sin(chi)) / r_safe
-
-    # Longitude rate depends on the eastward component and the local cosine latitude factor.
-    lam_dot = (V * math.cos(gamma) * math.cos(chi)) / (r_safe * cos_phi)
-
-    # Speed rate includes aerodynamic acceleration along the velocity direction and gravity.
-    V_dot = (Dr + Lr) / m - g * math.sin(gamma)
-
-    # Flight path angle rate includes normal lift and spherical curvature effects.
-    gamma_dot = (Ltheta / (m * V_safe)) + (V_safe / r_safe - g / V_safe) * math.cos(gamma)
-
-    # Tangent of latitude appears in the heading dynamics.
-    phi_tan = math.sin(phi) / cos_phi
-
-    # Heading rate includes lateral lift and spherical transport terms.
-    chi_dot = (Lphi / (m * V_safe * cos_gamma)) + (V_safe / r_safe) * math.sin(chi) * phi_tan
-
-    # Return the derivatives in a named dictionary.
     return {
         "r_dot": float(r_dot),
         "phi_dot": float(phi_dot),
@@ -656,7 +555,6 @@ def eom_3d(
         "chi_dot": float(chi_dot),
     }
 
-
 def f_float(
     t: float,
     X: List[float],
@@ -664,10 +562,7 @@ def f_float(
     sigma_actual_rad: Optional[float] = None,
     sigma_cmd_rad: Optional[float] = None,
 ) -> List[float]:
-    """
-    Ordered derivative adapter for the float equations of motion.
-    """
-    # Evaluate the named derivative form first.
+    # Ordered derivative adapter for the translational state
     dx = eom_3d(
         t=t,
         X=X,
@@ -676,7 +571,6 @@ def f_float(
         sigma_cmd_rad=sigma_cmd_rad,
     )
 
-    # Return the derivatives in the same order as the state vector.
     return [
         dx["r_dot"],
         dx["phi_dot"],
@@ -687,7 +581,7 @@ def f_float(
     ]
 
 
-# Control bridge helpers that connect the guidance stack to the nominal dynamics.
+# Control bridge helpers that connect the guidance stack to the nominal dynamics
 
 def make_control_step_fn(
     control: SigmaControlStack,
@@ -695,14 +589,10 @@ def make_control_step_fn(
     params: Dict[str, Any],
     dt_s: Optional[float] = None,
 ) -> Callable[[float, List[float], float, float], Any]:
-    """
-    Build a helper with the form control_step_fn(t, x, sigma_actual_rad, roll_rate_rad_s).
-    """
-    # Use the nominal entry time step when one is not supplied explicitly.
+    # This helper presents the controller with the current translational state actual bank and roll rate
     if dt_s is None:
         dt_s = float(getattr(constants, "ENTRY_DT_S", 0.25))
 
-    # Read the mass once since it is passed into every control step.
     mass_kg = _get_param(params, "mass_kg", "m")
 
     def control_step_fn(
@@ -711,10 +601,9 @@ def make_control_step_fn(
         sigma_actual_rad: float,
         roll_rate_rad_s: float,
     ):
-        # Unpack the translational state for the controller facing state object.
+        # Build the controller facing state object from the translational state
         r, phi, lam, V, gamma, chi = [float(v) for v in x]
 
-        # Build the controller input state using the current actual bank and roll rate.
         state = ReentryState(
             r_m=r,
             phi_rad=phi,
@@ -726,7 +615,7 @@ def make_control_step_fn(
             roll_rate_rad_s=float(roll_rate_rad_s),
         )
 
-        # Recompute aerodynamic forces so lift and drag magnitudes can be passed into control.
+        # Compute total lift and drag magnitudes for the control stack
         Dr, Dtheta, Dphi, Lr, Ltheta, Lphi, _, _ = aero_force_fn(
             r=r,
             V=V,
@@ -736,13 +625,9 @@ def make_control_step_fn(
             sigma_actual_rad=sigma_actual_rad,
         )
 
-        # Convert component forces into total lift magnitude.
         lift_mag = math.sqrt(Lr * Lr + Ltheta * Ltheta + Lphi * Lphi)
-
-        # Convert component forces into total drag magnitude.
         drag_mag = math.sqrt(Dr * Dr + Dtheta * Dtheta + Dphi * Dphi)
 
-        # Advance the control stack by one step and return its output object.
         return control.step(
             t_s=float(t),
             dt_s=float(dt_s),
@@ -752,7 +637,6 @@ def make_control_step_fn(
             mass_kg=float(mass_kg),
         )
 
-    # Return the closure that matches the desired control step signature.
     return control_step_fn
 
 
@@ -763,10 +647,7 @@ def make_sigma_fn(
     sigma_actual_provider: Callable[[], Tuple[float, float]],
     dt_s: Optional[float] = None,
 ) -> Callable[[float, List[float]], float]:
-    """
-    Backward compatible adapter for older code that still wants sigma_fn(t, x).
-    """
-    # Reuse the richer control step helper internally.
+    # Backward compatible adapter for older call sites that still expect sigma_fn
     control_step_fn = make_control_step_fn(
         control=control,
         aero_force_fn=aero_force_fn,
@@ -775,10 +656,10 @@ def make_sigma_fn(
     )
 
     def sigma_fn(t: float, x: List[float]) -> float:
-        # Query the current actual bank and roll rate from the external provider.
+        # Query the current realized bank and roll rate from the external provider
         sigma_actual_rad, roll_rate_rad_s = sigma_actual_provider()
 
-        # Step the controller so any internal state continues to evolve normally.
+        # Step the controller so internal control state still evolves
         _ = control_step_fn(
             t=float(t),
             x=list(x),
@@ -786,14 +667,74 @@ def make_sigma_fn(
             roll_rate_rad_s=float(roll_rate_rad_s),
         )
 
-        # Return the current actual bank angle for legacy call sites.
+        # Return the realized bank for older code paths
         return float(sigma_actual_rad)
 
-    # Return the backward compatible adapter.
     return sigma_fn
 
 
-# Closed loop milestone 1 step that advances control, RCS, attitude, and translation together.
+def _aggregate_roll_substeps(roll_substeps: List[Any]) -> AggregatedRollChannelStepResult:
+    # At least one internal substep must exist
+    if not roll_substeps:
+        raise ValueError("roll_substeps cannot be empty")
+
+    num_internal_steps = len(roll_substeps)
+    num_fired_internal_steps = 0
+
+    # Sum wrench across internal substeps so the average outer step wrench can be formed
+    total_force_b = np.zeros(3, dtype=float)
+    total_torque_b = np.zeros(3, dtype=float)
+
+    # Accumulate average duty by thruster across the outer step
+    duty_totals: Dict[str, float] = {}
+
+    for substep in roll_substeps:
+        total_force_b += np.asarray(substep.wrench.force_b_N, dtype=float)
+        total_torque_b += np.asarray(substep.wrench.torque_b_Nm, dtype=float)
+
+        if bool(substep.fired_this_step):
+            num_fired_internal_steps += 1
+
+        for name, duty in substep.fire_cmd.duty_by_name.items():
+            duty_totals[name] = duty_totals.get(name, 0.0) + float(duty)
+
+    # Convert summed duty into average duty over the whole outer step
+    avg_duty_by_name = {
+        name: total / float(num_internal_steps)
+        for name, total in duty_totals.items()
+        if total > 0.0
+    }
+
+    avg_fire_cmd = ThrusterFireCommand(duty_by_name=avg_duty_by_name)
+
+    # Time averaged outer step wrench
+    avg_wrench = RCSWrench(
+        force_b_N=total_force_b / float(num_internal_steps),
+        torque_b_Nm=total_torque_b / float(num_internal_steps),
+    )
+
+    # Keep some channel telemetry from the final internal substep because it is the latest true state
+    last = roll_substeps[-1]
+    first = roll_substeps[0]
+
+    return AggregatedRollChannelStepResult(
+        tau_roll_cmd_Nm=float(first.tau_roll_cmd_Nm),
+        tau_roll_capacity_Nm=float(first.tau_roll_capacity_Nm),
+        requested_duty=float(first.requested_duty),
+        fired_this_step=bool(num_fired_internal_steps > 0),
+        fire_cmd=avg_fire_cmd,
+        wrench=avg_wrench,
+        roll_pos_backlog_s=float(last.roll_pos_backlog_s),
+        roll_neg_backlog_s=float(last.roll_neg_backlog_s),
+        roll_pos_is_on=bool(last.roll_pos_is_on),
+        roll_neg_is_on=bool(last.roll_neg_is_on),
+        num_internal_steps=int(num_internal_steps),
+        num_fired_internal_steps=int(num_fired_internal_steps),
+        substeps=list(roll_substeps),
+    )
+
+
+# Closed loop milestone one step that advances control RCS attitude and translation together
 
 def step_closed_loop_milestone1(
     t_s: float,
@@ -805,36 +746,41 @@ def step_closed_loop_milestone1(
     dt_s: Optional[float] = None,
     Izz_kgm2: Optional[float] = None,
 ) -> Milestone1StepResult:
-    """
-    Advance one full nominal milestone 1 closed loop step.
-
-    The nominal step runs first because control, thruster firing,
-    attitude propagation, and actual bank angle all belong to the
-    primary simulator path.
-    """
-    # Fill in default time step and roll inertia when they are not provided.
+    # Fill in default outer step size and roll inertia when not supplied
     if dt_s is None:
         dt_s = float(getattr(constants, "ENTRY_DT_S", 0.25))
+
     if Izz_kgm2 is None:
         Izz_kgm2 = float(getattr(constants, "CAPSULE_IZZ_KGM2", 20000.0))
 
-    # Copy the incoming translational state so the result keeps both old and new values.
+    # Internal RCS and roll propagation runs on a smaller substep than translational physics
+    internal_dt_s = float(getattr(constants, "RCS_INTERNAL_DT_S", dt_s))
+    internal_steps = int(round(float(dt_s) / internal_dt_s))
+
+    # The outer step must be an exact multiple of the internal actuator step
+    if internal_steps <= 0:
+        raise ValueError("internal_steps must be positive")
+
+    if abs(internal_steps * internal_dt_s - float(dt_s)) > 1.0e-12:
+        raise ValueError("dt_s must be an exact multiple of RCS_INTERNAL_DT_S")
+
+    # Copy translational state so both old and new values are preserved in the result packet
     x_old = [float(v) for v in x_trans]
 
-    # Copy the incoming attitude state so the old state is preserved in the result object.
+    # Copy attitude state so the old state is preserved
     att_old = CapsuleAttitudeState(
         q_ba=list(att.q_ba),
         omega_b_rad_s=list(att.omega_b_rad_s),
         sigma_rel_rad=float(att.sigma_rel_rad),
     )
 
-    # Recover the actual bank angle represented by the old quaternion.
+    # Recover the current actual bank represented by the old quaternion
     sigma_actual_before_rad = float(sigma_from_q_ba(att.q_ba))
 
-    # Read the current roll rate from the old attitude state.
+    # Current roll rate is the body z angular rate in this roll only model
     roll_rate_rad_s = float(att.omega_b_rad_s[2])
 
-    # Run the controller using the current translational and attitude state.
+    # High level controller is evaluated once per outer step
     control_out = control_step_fn(
         float(t_s),
         list(x_old),
@@ -842,27 +788,45 @@ def step_closed_loop_milestone1(
         float(roll_rate_rad_s),
     )
 
-    # Advance the RCS roll channel using the commanded roll torque.
-    roll_step = rcs.step_roll_channel(
-        tau_roll_cmd_Nm=float(control_out.tau_roll_cmd_Nm),
-        dt_s=float(dt_s),
+    # Timed RCS firing and rigid body roll propagation happen on the faster internal substep
+    att_running = CapsuleAttitudeState(
+        q_ba=list(att_old.q_ba),
+        omega_b_rad_s=list(att_old.omega_b_rad_s),
+        sigma_rel_rad=float(att_old.sigma_rel_rad),
     )
 
-    # Propagate the roll attitude using the torque actually delivered by the RCS system.
-    att_new = step_capsule_roll_state(
-        att=att_old,
-        tau_rcs_b_Nm=list(roll_step.wrench.torque_b_Nm),
-        Izz_kgm2=float(Izz_kgm2),
-        dt_s=float(dt_s),
-    )
+    roll_substeps: List[Any] = []
 
-    # Recompute the actual bank angle after the roll state update.
+    for substep_idx in range(internal_steps):
+        # Use the same outer torque command across all internal actuator substeps
+        roll_step_i = rcs.step_roll_channel(
+            tau_roll_cmd_Nm=float(control_out.tau_roll_cmd_Nm),
+            dt_s=float(internal_dt_s),
+        )
+
+        roll_substeps.append(roll_step_i)
+
+        # Integrate actual roll motion using the real torque delivered in this internal substep
+        att_running = step_capsule_roll_state(
+            att=att_running,
+            tau_rcs_b_Nm=list(roll_step_i.wrench.torque_b_Nm),
+            Izz_kgm2=float(Izz_kgm2),
+            dt_s=float(internal_dt_s),
+        )
+
+    # Final attitude after all internal substeps is the realized outer step attitude
+    att_new = att_running
+
+    # Recompute the actual bank after the internal actuator and attitude update
     sigma_actual_after_rad = float(sigma_from_q_ba(att_new.q_ba))
 
-    # Keep the scalar bank value in sync with the quaternion.
+    # Keep the scalar bank field synchronized with the quaternion
     att_new.sigma_rel_rad = sigma_actual_after_rad
 
-    # Evaluate the translational state derivative using the updated actual bank angle.
+    # Aggregate the internal actuator packets into one outer step packet for logging
+    roll_step = _aggregate_roll_substeps(roll_substeps)
+
+    # Translational dynamics still advance on the outer Euler step using the realized final bank
     dx_trans = f_float(
         t=float(t_s),
         X=list(x_old),
@@ -870,10 +834,8 @@ def step_closed_loop_milestone1(
         sigma_actual_rad=float(sigma_actual_after_rad),
     )
 
-    # Advance the translational state with a forward Euler step.
     x_new = add_scaled_state(x_old, dx_trans, float(dt_s))
 
-    # Return a complete packet containing both old and new states plus control and RCS details.
     return Milestone1StepResult(
         t_s=float(t_s),
         x_old=x_old,

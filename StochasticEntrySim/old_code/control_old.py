@@ -298,7 +298,6 @@ class GuidancePredictionContext:
     supervisor_cfg: Optional[IntervalSupervisorConfig] = None
     trajectory_id: str = ""
     guidance_cycle_index: int = -1
-    interval_active: bool = True
 
 
 # Protocols still a work in progress
@@ -448,7 +447,6 @@ class SimpleBankGuidance:
         supervisor_cfg: Optional[IntervalSupervisorConfig] = None,
         trajectory_id: str = "",
         guidance_cycle_index: int = -1,
-        interval_active: bool = True,
     ) -> None:
         """
         Store the live interval and heat context for the next guidance update.
@@ -463,7 +461,6 @@ class SimpleBankGuidance:
             supervisor_cfg=supervisor_cfg,
             trajectory_id=str(trajectory_id),
             guidance_cycle_index=int(guidance_cycle_index),
-            interval_active=bool(interval_active),
         )
 
     def get_last_debug(self) -> Dict[str, Any]:
@@ -779,7 +776,6 @@ class SimpleBankGuidance:
                 t0_s=float(t_s),
                 heat_rate_limit=self.heat_rate_limit,
                 heat_load_limit=self.heat_load_limit,
-                interval_screen_active=bool(ctx.interval_active),
             )
 
             # Compute predicted terminal targeting quantities from the final state.
@@ -797,20 +793,16 @@ class SimpleBankGuidance:
             if not rollout.heat_feasible:
                 heat_penalty += float(self.infeasible_penalty)
 
-            # Add an even larger penalty only when interval screening was active
-            # and interval propagation became numerically invalid.
-            if bool(rollout.interval_screen_used) and not rollout.interval_valid:
+            # Add an even larger penalty if interval propagation became invalid.
+            if not rollout.interval_valid:
                 heat_penalty += float(self.invalid_interval_penalty)
 
             # Total cost is geometry plus heat related penalties.
             total_cost = float(geometry_cost + heat_penalty)
 
-            # A candidate is fully feasible when heat remained feasible and
-            # any active interval screen also remained numerically valid.
-            candidate_fully_feasible = bool(
-                rollout.heat_feasible
-                and (not bool(rollout.interval_screen_used) or bool(rollout.interval_valid))
-            )
+            # A candidate is treated as fully feasible only if both the heat
+            # limits and interval propagation remained valid.
+            candidate_fully_feasible = bool(rollout.heat_feasible and rollout.interval_valid)
 
             # Convert the rollout result into a debug rich dictionary.
             candidate_debug = {
@@ -827,8 +819,6 @@ class SimpleBankGuidance:
                 "total_cost": float(total_cost),
                 "heat_feasible": bool(rollout.heat_feasible),
                 "interval_valid": bool(rollout.interval_valid),
-                "interval_screen_used": bool(rollout.interval_screen_used),
-                "interval_failure_kind": str(rollout.interval_failure_kind),
                 "fully_feasible": bool(candidate_fully_feasible),
                 "violation_amount": float(rollout.violation_amount),
                 "first_violation_step": int(rollout.first_violation_step),
@@ -884,8 +874,6 @@ class SimpleBankGuidance:
             "candidate_failure_reason": [str(c["failure_reason"]) for c in candidate_dicts],
             "selected_candidate_index": int(best_index),
             "selected_candidate_heat_feasible": bool(chosen["fully_feasible"]),
-            "selected_interval_screen_used": bool(chosen.get("interval_screen_used", True)),
-            "selected_interval_failure_kind": str(chosen.get("interval_failure_kind", "")),
             "any_feasible_candidate": bool(any_feasible_candidate),
             "chosen_sigma_cmd_deg": float(chosen["sigma_cmd_deg"]),
             "chosen_sigma_mag_deg": float(chosen["sigma_mag_deg"]),
