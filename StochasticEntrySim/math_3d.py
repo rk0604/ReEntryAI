@@ -711,14 +711,14 @@ def atmosphere_interval_hull_from_state_box(x_box: List[Interval]) -> Dict[str, 
         }
 
     layer_indices = list(atm_by_layer.keys())
-    temperature_intervals = [atm_by_layer[k]["T_K"] for k in layer_indices]
-    pressure_intervals = [atm_by_layer[k]["p_Pa"] for k in layer_indices]
+    temperature_intervals = [atm_by_layer[k]["T_K"] for k in layer_indices if atm_by_layer[k]["T_K"] is not None]
+    pressure_intervals = [atm_by_layer[k]["p_Pa"] for k in layer_indices if atm_by_layer[k]["p_Pa"] is not None]
     density_intervals = [atm_by_layer[k]["rho_kgm3"] for k in layer_indices]
 
     return {
         "altitude_m": z_geometric_altitude,
-        "T_K": hull_intervals(temperature_intervals),
-        "p_Pa": hull_intervals(pressure_intervals),
+        "T_K": hull_intervals(temperature_intervals) if temperature_intervals else None,
+        "p_Pa": hull_intervals(pressure_intervals) if pressure_intervals else None,
         "rho_kgm3": hull_intervals(density_intervals),
         "layer_indices": layer_indices,
     }
@@ -1419,6 +1419,152 @@ def annotate_nominal_state_with_interval_supervisor(
         )
 
 
+def aero_coefficients_from_speed_altitude(V_mps: float, altitude_m: float, params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compute aerodynamic coefficients using a reduced-order speed-based schedule.
+    
+    This is not the official Orion aerodatabase. It is a scheduled Orion-like
+    coefficient model where CD and L/D are scheduled, and CL is computed as CD * L/D.
+    It preserves the old constant model as a fallback.
+    """
+    model_name = params.get("aero_model", "constant")
+    V_kms = V_mps / 1000.0
+    V_kfps = V_mps * 0.00328084  # proxy for FMV in the Orion CM hypersonic database
+
+    if model_name == "orion_cm_trim":
+        # Trim CD and L/D scheduled vs the blended velocity parameter FMV from
+        # Bibb, Walker, Brauckmann, Robinson, "Development of the Orion Crew Module
+        # Static Aerodynamic Database, Part I: Hypersonic" (NASA Langley / JSC).
+        # Paper covers 8 <= FMV <= 40 at trim (Cm_cg = 0); trim alpha varies from
+        # ~167 deg at low FMV to ~157 deg at high FMV, giving L/D ~0.27 to 0.40.
+        # Below FMV = 8 we use Apollo CM trim values (NASA TN D-3522), which
+        # show subsonic L/D ~0.25-0.28 down to Mach 0.5 — the bare capsule still
+        # makes meaningful lift subsonic, only the *damping* goes negative.
+        # Format: (FMV, CD_trim, LD_trim)
+        default_trim_schedule = [
+            (0.0,  1.05, 0.22),  # very low speed — Apollo low-Mach trim
+            (0.4,  1.15, 0.25),  # subsonic
+            (0.7,  1.30, 0.27),  # high subsonic (Apollo damping turns negative)
+            (1.0,  1.55, 0.28),  # transonic drag rise (~Mach 1)
+            (2.0,  1.50, 0.30),  # low supersonic
+            (5.0,  1.50, 0.36),  # supersonic L/D peak
+            (8.0,  1.52, 0.40),  # hypersonic low FMV (matches paper trim)
+            (10.0, 1.50, 0.39),
+            (15.0, 1.52, 0.33),
+            (20.0, 1.54, 0.30),
+            (25.0, 1.55, 0.27),
+            (30.0, 1.55, 0.27),
+            (35.0, 1.55, 0.28),
+            (40.0, 1.55, 0.30),
+        ]
+        schedule = params.get("orion_trim_schedule", default_trim_schedule)
+        schedule = sorted(schedule, key=lambda x: x[0])
+
+        FMV = V_kfps
+
+        if FMV <= schedule[0][0]:
+            CD = schedule[0][1]
+            LD = schedule[0][2]
+            region_string = "below_table"
+        elif FMV >= schedule[-1][0]:
+            CD = schedule[-1][1]
+            LD = schedule[-1][2]
+            region_string = "above_table"
+        else:
+            CD = schedule[0][1]
+            LD = schedule[0][2]
+            region_string = "interpolated"
+            for i in range(len(schedule) - 1):
+                f0, cd0, ld0 = schedule[i]
+                f1, cd1, ld1 = schedule[i + 1]
+                if f0 <= FMV <= f1:
+                    alpha = (FMV - f0) / (f1 - f0) if f1 > f0 else 0.0
+                    CD = cd0 + alpha * (cd1 - cd0)
+                    LD = ld0 + alpha * (ld1 - ld0)
+                    break
+
+        CL = CD * LD
+
+    elif model_name == "scheduled_orion_like":
+        # Default simple speed-based schedule with smooth linear interpolation
+        # V_kms, CD, LD
+        default_schedule = [
+            (0.0,  1.50, 0.10),
+            (1.0,  1.45, 0.15),
+            (2.0,  1.35, 0.22),
+            (5.0,  1.25, 0.27),
+            (7.5,  1.20, 0.28),
+            (11.0, 1.15, 0.24),
+        ]
+        schedule = params.get("aero_schedule", default_schedule)
+        
+        # Sort schedule by V_kms just in case
+        schedule = sorted(schedule, key=lambda x: x[0])
+        
+        if V_kms <= schedule[0][0]:
+            CD = schedule[0][1]
+            LD = schedule[0][2]
+        elif V_kms >= schedule[-1][0]:
+            CD = schedule[-1][1]
+            LD = schedule[-1][2]
+        else:
+            CD = schedule[0][1]
+            LD = schedule[0][2]
+            # Linear interpolation
+            for i in range(len(schedule) - 1):
+                v0, cd0, ld0 = schedule[i]
+                v1, cd1, ld1 = schedule[i+1]
+                if v0 <= V_kms <= v1:
+                    alpha = (V_kms - v0) / (v1 - v0) if v1 > v0 else 0.0
+                    CD = cd0 + alpha * (cd1 - cd0)
+                    LD = ld0 + alpha * (ld1 - ld0)
+                    break
+        
+        CL = CD * LD
+        region_string = "interpolated"
+        if V_kms <= schedule[0][0]:
+            region_string = "low_speed_clamp"
+        elif V_kms >= schedule[-1][0]:
+            region_string = "high_speed_clamp"
+
+    else:
+        # Fallback to constant model
+        CD = _get_param(params, "CD_const", "CD")
+        CL = _get_param(params, "CL_const", "CL")
+        LD = CL / CD if CD != 0.0 else 0.0
+        region_string = "constant"
+
+    # ------------------------------------------------------------------
+    # CPAS (parachute) modifiers. The main loop pushes the current chute
+    # drag CD*A and lift scale into params via the cpas_* keys below.
+    # We fold them into the effective aero coefficients here so the same
+    # CD/CL pipeline that feeds the EOMs and the predictor-corrector
+    # rollouts automatically sees the chute contribution.
+    # ------------------------------------------------------------------
+    cpas_drag_cdA_extra_m2 = float(params.get("cpas_drag_cdA_extra_m2", 0.0))
+    cpas_lift_scale = float(params.get("cpas_lift_scale", 1.0))
+    ref_area_m2 = float(params.get("ref_area_m2", 0.0))
+    if cpas_drag_cdA_extra_m2 > 0.0 and ref_area_m2 > 0.0:
+        CD = CD + cpas_drag_cdA_extra_m2 / ref_area_m2
+    if cpas_lift_scale != 1.0:
+        CL = CL * cpas_lift_scale
+    LD = (CL / CD) if CD != 0.0 else 0.0
+
+    return {
+        "aero_model": model_name,
+        "CD": float(CD),
+        "CL": float(CL),
+        "LD": float(LD),
+        "V_kms": float(V_kms),
+        "V_kfps": float(V_kfps),
+        "FMV": float(V_kfps),
+        "altitude_m": float(altitude_m),
+        "schedule_region": region_string,
+        "cpas_drag_cdA_extra_m2": float(cpas_drag_cdA_extra_m2),
+        "cpas_lift_scale": float(cpas_lift_scale),
+    }
+
+
 def nominal_aero_forces_from_state(
     x: List[float],
     sigma_rad: float,
@@ -1440,16 +1586,29 @@ def nominal_aero_forces_from_state(
         raise ValueError("x must have 6 state components")
 
     r_m, phi_rad, lam_rad, V_mps, gamma_rad, chi_rad = x
-    del phi_rad, lam_rad
 
     altitude_m = max(0.0, constants.altitude(r_m))
-    atm = AtmosphereModel.US_Standard_ATM(altitude_m)
+
+    atm = AtmosphereModel.US_Standard_ATM(
+        altitude_m,
+        lat_deg=math.degrees(phi_rad),
+        lon_deg=math.degrees(lam_rad),
+        date=params.get("entry_datetime_utc", None),
+        f107=params.get("f107", 150.0),
+        f107a=params.get("f107a", 150.0),
+        ap=params.get("ap", 7.0),
+    )
     rho = atm["rho_kgm3"] if atm["rho_kgm3"] is not None else 0.0
     q_pa = 0.5 * rho * V_mps * V_mps
 
     surface_area = _get_param(params, "ref_area_m2", "S")
-    CD = _get_param(params, "CD_const", "CD")
-    CL = _get_param(params, "CL_const", "CL")
+    coeffs = aero_coefficients_from_speed_altitude(
+        V_mps=V_mps,
+        altitude_m=altitude_m,
+        params=params,
+    )
+    CD = coeffs["CD"]
+    CL = coeffs["CL"]
 
     drag_mag_N = q_pa * surface_area * CD
     lift_mag_N = q_pa * surface_area * CL
@@ -1489,6 +1648,12 @@ def nominal_aero_forces_from_state(
         "Dphi": float(D_north_N),
         "Ltheta": float(L_east_N),
         "Lphi": float(L_north_N),
+        "CD": float(CD),
+        "CL": float(CL),
+        "LD": float(coeffs["LD"]),
+        "aero_model": coeffs["aero_model"],
+        "aero_schedule_region": coeffs["schedule_region"],
+        "V_kms": coeffs["V_kms"],
     }
 
 
@@ -1620,9 +1785,19 @@ def intv_aero_forces(
         }
 
     aero_forces_by_layer: Dict[int, Dict[str, Interval]] = {}
-    CD = _get_param(params, "CD_const", "CD")
-    CL = _get_param(params, "CL_const", "CL")
     surface_area = _get_param(params, "ref_area_m2", "S")
+
+    # Evaluate scheduled coefficient model using interval endpoints
+    # This is a reduced-order approximation to compute a conservative interval.
+    z_mid = float(z_geometric_altitude.lo + z_geometric_altitude.hi) / 2.0
+    v_lo = float(V.lo)
+    v_hi = float(V.hi)
+    
+    coeffs_lo = aero_coefficients_from_speed_altitude(V_mps=v_lo, altitude_m=z_mid, params=params)
+    coeffs_hi = aero_coefficients_from_speed_altitude(V_mps=v_hi, altitude_m=z_mid, params=params)
+    
+    CD_iv = Interval(min(coeffs_lo["CD"], coeffs_hi["CD"]), max(coeffs_lo["CD"], coeffs_hi["CD"]))
+    CL_iv = Interval(min(coeffs_lo["CL"], coeffs_hi["CL"]), max(coeffs_lo["CL"], coeffs_hi["CL"]))
 
     sin_gamma = gamma.sin()
     cos_gamma = gamma.cos()
@@ -1635,8 +1810,8 @@ def intv_aero_forces(
         rho = atm_intv[k]["rho_kgm3"] if atm_intv[k]["rho_kgm3"] is not None else promote(0.0)
         q = promote(0.5) * rho * V.pow_int(2)
 
-        drag_mag = q * surface_area * CD
-        lift_mag = q * surface_area * CL
+        drag_mag = q * surface_area * CD_iv
+        lift_mag = q * surface_area * CL_iv
 
         D_r = -drag_mag * sin_gamma
         D_north = -drag_mag * cos_gamma * sin_chi

@@ -504,6 +504,7 @@ class SimpleBankGuidance:
         return {
             "mass_kg": float(constants.CAPSULE_MASS_KG),
             "ref_area_m2": float(constants.CAPSULE_REFERENCE_AREA_M2),
+            "aero_model": "scheduled_orion_like",
             "CD_const": 1.05,
             "CL_const": 0.32,
         }
@@ -719,6 +720,19 @@ class SimpleBankGuidance:
         # This keeps compatibility with the old class behavior.
         if float(state.V_mps) > float(self.velocity_enable_mps):
             self._last_debug["selected_failure_reason"] = "guidance_disabled_above_velocity_enable"
+            return 0.0
+
+        # Gamma safety override: if the capsule has pitched into a steep dive,
+        # abandon cross-range tracking and roll wings-level (sigma = 0) so all
+        # available lift goes vertical. Without this, the predictor-corrector
+        # keeps commanding ~70 deg bank toward an unreachable target while
+        # gamma collapses past -78 deg and trips the cos_gamma safety gate
+        # well above the drogue deploy altitude.
+        gamma_safety_threshold_rad = math.radians(30.0)
+        if abs(float(state.gamma_rad)) > gamma_safety_threshold_rad:
+            self._last_debug["selected_failure_reason"] = "gamma_safety_override_wings_level"
+            self._last_debug["chosen_sigma_cmd_deg"] = 0.0
+            self._last_debug["chosen_sigma_mag_deg"] = 0.0
             return 0.0
 
         # Determine commanded bank sign from the heading offset logic.
@@ -1008,7 +1022,15 @@ class BasicObservationProvider:
         altitude_m = max(0.0, state.r_m - constants.RADIUS_EARTH)
 
         # Query the nominal atmosphere at the current altitude.
-        atm = AtmosphereModel.US_Standard_ATM(altitude_m)
+        atm = AtmosphereModel.US_Standard_ATM(
+            altitude_m,
+            lat_deg=math.degrees(state.phi_rad),
+            lon_deg=math.degrees(state.lam_rad),
+            date=self.params.get("entry_datetime_utc", None),
+            f107=self.params.get("f107", 150.0),
+            f107a=self.params.get("f107a", 150.0),
+            ap=self.params.get("ap", 7.0),
+        )
 
         # Use zero density outside the supported atmosphere range.
         rho = atm["rho_kgm3"] if atm["rho_kgm3"] is not None else 0.0
