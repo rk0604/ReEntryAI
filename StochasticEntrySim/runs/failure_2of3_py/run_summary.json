@@ -1,0 +1,35 @@
+{
+  "trajectory_id": "traj_000",
+  "num_logged_steps": 2986,
+  "termination_reason": "nominal_ground_reached",
+  "final_t_s": 746.25,
+  "final_alt_m": 0.6376600591465831,
+  "final_V_mps": 9.040530664480086,
+  "final_gamma_deg": -89.99999998911193,
+  "aero_model": "orion_cm_trim",
+  "cpas_summary": {
+    "phase": "landed",
+    "fbc_jettisoned": true,
+    "fbc_jettison_t_s": 437.5,
+    "drogue_deploy_t_s": 445.25,
+    "pilot_deploy_t_s": 515.5,
+    "main_deploy_t_s": 523.25,
+    "landed_t_s": 746.5,
+    "mass_shed_kg_total": 150.0,
+    "mains_operational_mask": [
+      true,
+      true,
+      false
+    ],
+    "pendulum_azimuth_deg": 230.19364744483815
+  },
+  "cpas_drogue_deploy_t_s": 445.25,
+  "cpas_pilot_deploy_t_s": 515.5,
+  "cpas_main_deploy_t_s": 523.25,
+  "cpas_landed_t_s": 746.5,
+  "output_files": {
+    "trajectory_csv": "C:\\Users\\Risha\\Desktop\\ReEntryAI\\StochasticEntrySim\\runs\\failure_2of3_py\\trajectory_success.csv",
+    "failed_heat_step_csv": "C:\\Users\\Risha\\Desktop\\ReEntryAI\\StochasticEntrySim\\runs\\failure_2of3_py\\trajectory_failed_heat_steps.csv",
+    "cpas_events_csv": "C:\\Users\\Risha\\Desktop\\ReEntryAI\\StochasticEntrySim\\runs\\failure_2of3_py\\cpas_events.csv"
+  }
+}

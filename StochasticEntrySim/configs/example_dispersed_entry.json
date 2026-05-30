@@ -1,0 +1,25 @@
+{
+  "run_id":     "dispersed_entry_01",
+  "run_name":   "Perturbed entry conditions (steep, fast, off-azimuth)",
+  "output_dir": "runs/dispersed_entry_01",
+  "seed":       1729,
+
+  "initial_state": {
+    "altitude_m":   118000.0,
+    "velocity_mps": 11000.0,
+    "gamma_deg":    -6.2,
+    "chi_deg":      85.0,
+    "phi_deg":       1.5,
+    "lambda_deg":   -0.5
+  },
+
+  "cpas": {
+    "wind_east_mps":  12.0,
+    "wind_north_mps": -5.0
+  },
+
+  "mission": {
+    "target_phi_deg":    15.0,
+    "target_lambda_deg": 15.0
+  }
+}

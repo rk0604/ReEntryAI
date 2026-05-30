@@ -1,0 +1,28 @@
+{
+  "run_id":     "failure_2of3",
+  "run_name":   "Forced 2-of-3 main failure (pendulum mode)",
+  "output_dir": "runs/failure_2of3",
+  "seed":       42,
+
+  "initial_state": {
+    "altitude_m":   115000.0,
+    "velocity_mps": 10500.0,
+    "gamma_deg":    -5.5,
+    "chi_deg":      90.0,
+    "phi_deg":      0.0,
+    "lambda_deg":   0.0
+  },
+
+  "cpas": {
+    "enable_stochastic_failure": false,
+    "num_mains_operational":     2,
+    "pendulum_target_amplitude_deg": 25.0,
+    "wind_east_mps":  8.0,
+    "wind_north_mps": -3.0
+  },
+
+  "mission": {
+    "target_phi_deg":    15.0,
+    "target_lambda_deg": 15.0
+  }
+}

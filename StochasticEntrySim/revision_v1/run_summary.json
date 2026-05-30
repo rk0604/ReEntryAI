@@ -1,36 +1,45 @@
 {
-  "trajectory_id": "revision_v1_traj_000",
-  "num_logged_steps": 3268,
+  "trajectory_id": "default",
+  "num_logged_steps": 2575,
   "termination_reason": "nominal_ground_reached",
   "sim_terminated_by_nominal_heat": false,
   "interval_failed_detected": true,
-  "interval_recenter_count": 11,
+  "interval_recenter_count": 10,
   "interval_split_count": 0,
-  "guidance_updates": 817,
-  "thruster_fire_events": 3148,
-  "final_t_s": 816.75,
-  "final_alt_m": 0.30370744317770004,
-  "final_V_mps": 7.46223599922433,
-  "final_gamma_deg": -89.99999998831802,
+  "guidance_updates": 644,
+  "thruster_fire_events": 2540,
+  "final_t_s": 643.5,
+  "final_alt_m": 1.6573631521314383,
+  "final_V_mps": 7.500444354348097,
+  "final_gamma_deg": -90.00000001261239,
   "aero_model": "orion_cm_trim",
   "target_phi_deg": 14.999999999999998,
   "target_lam_deg": 14.999999999999998,
   "output_files": {
-    "trajectory_csv": "c:\\Users\\Risha\\Desktop\\ReEntryAI\\StochasticEntrySim\\revision_v1\\trajectory.csv",
-    "thruster_fires_csv": "c:\\Users\\Risha\\Desktop\\ReEntryAI\\StochasticEntrySim\\revision_v1\\thruster_fires.csv",
-    "failed_heat_csv": "c:\\Users\\Risha\\Desktop\\ReEntryAI\\StochasticEntrySim\\revision_v1\\failed_heat_cycles.csv"
+    "trajectory_csv": "C:\\Users\\Risha\\Desktop\\ReEntryAI\\StochasticEntrySim\\revision_v1\\trajectory.csv",
+    "thruster_fires_csv": "C:\\Users\\Risha\\Desktop\\ReEntryAI\\StochasticEntrySim\\revision_v1\\thruster_fires.csv",
+    "failed_heat_csv": "C:\\Users\\Risha\\Desktop\\ReEntryAI\\StochasticEntrySim\\revision_v1\\failed_heat_cycles.csv"
   },
   "cpas_summary": {
     "phase": "landed",
-    "drogue_deploy_t_s": 445.0,
-    "pilot_deploy_t_s": 515.0,
-    "main_deploy_t_s": 524.5,
-    "landed_t_s": 817.0
+    "fbc_jettisoned": true,
+    "fbc_jettison_t_s": 285.0,
+    "drogue_deploy_t_s": 292.75,
+    "pilot_deploy_t_s": 362.0,
+    "main_deploy_t_s": 369.75,
+    "landed_t_s": 643.75,
+    "mass_shed_kg_total": 150.0,
+    "mains_operational_mask": [
+      true,
+      true,
+      true
+    ],
+    "pendulum_azimuth_deg": 230.19364744483815
   },
-  "cpas_events_csv": "c:\\Users\\Risha\\Desktop\\ReEntryAI\\StochasticEntrySim\\revision_v1\\cpas_events.csv",
+  "cpas_events_csv": "C:\\Users\\Risha\\Desktop\\ReEntryAI\\StochasticEntrySim\\revision_v1\\cpas_events.csv",
   "cpas_total_fires": 0,
-  "cpas_drogue_deploy_t_s": 445.0,
-  "cpas_pilot_deploy_t_s": 515.0,
-  "cpas_main_deploy_t_s": 524.5,
-  "cpas_landed_t_s": 817.0
+  "cpas_drogue_deploy_t_s": 292.75,
+  "cpas_pilot_deploy_t_s": 362.0,
+  "cpas_main_deploy_t_s": 369.75,
+  "cpas_landed_t_s": 643.75
 }

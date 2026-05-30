@@ -13,10 +13,19 @@ import control
 import ReactionControl
 import cpas
 import plotting
+import mission_config
 
 from pathlib import Path
 
 from interval_math import Interval, promote
+
+
+# --- Load mission config -------------------------------------------------
+# Single JSON file controls every routinely-varied parameter. Override the
+# path via the SIM_CONFIG env var:
+#   SIM_CONFIG=configs/example_failure_2of3.json python run_sim.py
+MISSION_CFG = mission_config.load_config()
+print(mission_config.summarize(MISSION_CFG))
 
 # This file was originally a Jupyter notebook; a few cells still call
 # IPython's display(). Provide a no-op shim so the script runs headless.
@@ -169,6 +178,7 @@ params = {
     "CD_const": 1.15,
     "CL_const": 0.28,
 }
+mission_config.apply_aero_to_params(MISSION_CFG, params)
 
 # Define the simulation time step and total duration
 dt_s = float(constants.ENTRY_DT_S)
@@ -178,9 +188,12 @@ num_steps = int(t_final_s / dt_s)
 # Define the moment of inertia for the roll axis
 Izz_kgm2 = float(constants.CAPSULE_IZZ_KGM2)
 
-# Define the landing target latitude and longitude in radians
-target_phi_rad = math.radians(15.00)
-target_lam_rad = math.radians(15.00)
+# Define the landing target latitude and longitude (in radians).
+# Pulled from the mission config so a single JSON change retargets the run.
+_targets = mission_config.mission_targets(MISSION_CFG)
+target_phi_rad = float(_targets["target_phi_rad"])
+target_lam_rad = float(_targets["target_lam_rad"])
+_cos_gamma_term_gate = float(_targets["cos_gamma_termination_gate"])
 
 # Configure the guidance loop and scheduler
 control_cfg = CapsuleControlConfig(
@@ -314,14 +327,10 @@ rcs_system.reset()
 # chi
 
 # Define the starting conditions for the spacecraft trajectory
-x_nominal = [
-    constants.RADIUS_EARTH + 115_000.0,
-    math.radians(0.0),
-    math.radians(0.0),
-    10_500.0,
-    math.radians(-5.5),
-    math.radians(90.0),
-]
+# (sourced from the loaded mission config)
+x_nominal = mission_config.initial_state_vector(
+    MISSION_CFG, float(constants.RADIUS_EARTH)
+)
 
 # Initialize the starting bank angle and roll rate to zero
 sigma_actual_0_rad = 0.0
@@ -416,11 +425,13 @@ interval_heat_shield = None
 # Store failed heat guidance cycles for later RL teaching
 failed_heat_rows = []
 
-# Output folder for the run_sim.py driver. Sits at the same level as the
-# notebook's revision_v1/ folder, so the two parallel drivers don't overwrite
-# each other.
-PY_OUTPUT_DIR = Path(__file__).parent / "revision_v1_py"
+# Output folder for the run_sim.py driver. Comes from the mission config
+# (typically runs/<run_id>) so each config gets its own folder. We append
+# "_py" so the run_sim and notebook drivers can co-exist without trampling
+# each other when both run the same config.
+PY_OUTPUT_DIR = Path(str(MISSION_CFG.output_dir) + "_py")
 PY_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+print(f"[run_sim] writing outputs to {PY_OUTPUT_DIR}")
 
 # Define output file names once here so later save cells can reuse them
 success_trajectory_csv_path = str(PY_OUTPUT_DIR / "trajectory_success.csv")
@@ -923,10 +934,26 @@ def control_step_fn_main(t_s, x_state, sigma_actual_rad, roll_rate_rad_s):
     )
 
 # --- CPAS (parachute) integration ---
-cpas_inst = cpas.CPAS()
-cpas_events_log = []  # one row per phase transition (drogue/pilot/main/landed)
+import random as _cpas_rng_mod
+import os as _os_cpas
+
+# Build CPASConfig from the mission config; fall back to defaults for any
+# field the JSON omits. CPAS_NUM_MAINS env var still overrides if set, for
+# quick deterministic failure-mode testing without editing the JSON.
+_cpas_config = mission_config.build_cpas_config(MISSION_CFG)
+_cpas_num_env = _os_cpas.environ.get("CPAS_NUM_MAINS", "").strip()
+if _cpas_num_env:
+    _n_mains = max(0, min(3, int(_cpas_num_env)))
+    print(f"[CPAS] CPAS_NUM_MAINS={_n_mains} env override -> deterministic failure mode")
+    _cpas_config.enable_stochastic_failure = False
+    _cpas_config.num_mains_operational = _n_mains
+cpas_inst = cpas.CPAS(config=_cpas_config, rng=_cpas_rng_mod.Random(int(MISSION_CFG.seed)))
+print(f"[CPAS] mains operational: {cpas_inst.state.mains_operational_mask}")
+
+cpas_events_log = []  # one row per phase transition / disreef / squid / FBC
 params["cpas_drag_cdA_extra_m2"] = 0.0
 params["cpas_lift_scale"] = 1.0
+_R_EARTH = float(constants.RADIUS_EARTH)
 
 for k in range(num_steps):
     t_s = k * dt_s
@@ -943,9 +970,12 @@ for k in range(num_steps):
         mach_now = float(x_nom[3]) / math.sqrt(1.4 * 287.0 * float(T_now))
     else:
         mach_now = None
-    cpas_out = cpas_inst.step(t_s=t_s, alt_m=alt_now_m, V_mps=float(x_nom[3]), mach=mach_now)
+    cpas_out = cpas_inst.step(t_s=t_s, alt_m=alt_now_m, V_mps=float(x_nom[3]),
+                              mach=mach_now, dt_s=float(dt_s))
     params["cpas_drag_cdA_extra_m2"] = float(cpas_out.drag_area_cdA_m2)
     params["cpas_lift_scale"] = float(cpas_out.lift_scale)
+    if cpas_out.mass_shed_delta_kg > 0.0:
+        params["mass_kg"] = max(1.0, float(params["mass_kg"]) - float(cpas_out.mass_shed_delta_kg))
     for ev in cpas_out.events:
         cpas_events_log.append({
             "t_s": float(t_s),
@@ -955,15 +985,17 @@ for k in range(num_steps):
             "mach": float(mach_now) if mach_now is not None else float("nan"),
             "phase": str(cpas_out.phase),
             "event": str(ev),
+            "reefing_stage": int(cpas_out.reefing_stage),
+            "num_mains_active": int(cpas_out.num_mains_active),
         })
-        print(f"  CPAS {ev} at t={t_s:.1f}s alt={alt_now_m:.1f}m V={float(x_nom[3]):.1f}m/s")
+        print(f"  CPAS {ev:>18s} at t={t_s:6.1f}s alt={alt_now_m:7.1f}m V={float(x_nom[3]):6.1f}m/s")
 
     nom_cos_gamma = math.cos(x_nom[4])
 
     # cos_gamma safety gate only applies pre-deployment. Once chutes are out
     # the bank/heading channels are dead and a near-vertical descent is the
     # expected physical mode.
-    if cpas_out.phase == "stowed" and abs(nom_cos_gamma) < 0.2:
+    if cpas_out.phase == "stowed" and abs(nom_cos_gamma) < _cos_gamma_term_gate:
         termination_reason = "nominal_cos_gamma_too_small"
         print(f"Stopping at t = {t_s:.2f} s because nominal cos gamma is too small for stable heading propagation")
         break
@@ -1242,6 +1274,17 @@ for k in range(num_steps):
         "cpas_open_fraction": float(cpas_out.open_fraction),
         "cpas_force_vertical": int(bool(cpas_out.force_vertical)),
         "cpas_events": ",".join(cpas_out.events) if cpas_out.events else "",
+        "cpas_fbc_jettisoned": int(bool(cpas_out.fbc_jettisoned)),
+        "cpas_mass_shed_kg": float(cpas_out.mass_shed_kg),
+        "cpas_reefing_stage": int(cpas_out.reefing_stage),
+        "cpas_num_mains_active": int(cpas_out.num_mains_active),
+        "cpas_num_mains_squidding": int(cpas_out.num_mains_squidding),
+        "cpas_pendulum_angle_deg": float(math.degrees(cpas_out.pendulum_angle_rad)),
+        "cpas_pendulum_rate_deg_s": float(math.degrees(cpas_out.pendulum_rate_rad_s)),
+        "cpas_pendulum_lateral_v_mps": float(cpas_out.pendulum_lateral_v_mps),
+        "cpas_wind_east_mps": float(cpas_out.wind_east_mps),
+        "cpas_wind_north_mps": float(cpas_out.wind_north_mps),
+        "cpas_mass_kg_now": float(params["mass_kg"]),
 
         "r_m": float(x_nom[0]),
         "phi_rad": float(x_nom[1]),
@@ -1260,6 +1303,12 @@ for k in range(num_steps):
         "lift_mag_N": float(nominal_step_aero["lift_mag_N"]),
         "lift_vertical_plane_N": float(nominal_step_aero["lift_vertical_plane_N"]),
         "lift_lateral_left_N": float(nominal_step_aero["lift_lateral_left_N"]),
+        # Aero coefficients (Bibb 2010 orion_cm_trim, blended-FMV lookup).
+        # Logged here so the dashboard / aero_coefficients plot can render
+        # the same CD/CL/LD trace the notebook driver already provides.
+        "CD": float(nominal_step_aero["CD"]),
+        "CL": float(nominal_step_aero["CL"]),
+        "LD": float(nominal_step_aero["LD"]),
         "gravity_mps2": float(gravity_mps2),
 
         "range_to_go_m": float(obs.get("range_to_go_m", np.nan)),
@@ -1411,6 +1460,10 @@ for k in range(num_steps):
                 }
             )
 
+    # Apply wind drift and pendulum lateral velocity under chutes
+    # (shared helper -- the notebook driver uses the same call).
+    cpas.apply_horizontal_drift_to_state(x_nom_next, cpas_out, dt_s, _R_EARTH)
+
     x_nom = list(x_nom_next)
     att_nom = step_result.att_new
 
@@ -1516,10 +1569,17 @@ def _run_sim_save_fig(name):
     plt.savefig(path, bbox_inches="tight")
     print(f"  saved {path}")
 
-print(f"Rendering figures into {PY_FIG_DIR} ...")
+import os as _os_for_plot_categories
+_pc_env = _os_for_plot_categories.environ.get("PLOT_CATEGORIES", "").strip()
+PLOT_CATEGORIES = set(c.strip() for c in _pc_env.split(",") if c.strip()) if _pc_env else None
+if PLOT_CATEGORIES:
+    print(f"Rendering figures into {PY_FIG_DIR} -- filtered to categories: {sorted(PLOT_CATEGORIES)}")
+else:
+    print(f"Rendering figures into {PY_FIG_DIR} (all categories)")
 plotting.render_all_figures(
     df,
     _run_sim_save_fig,
+    only=PLOT_CATEGORIES,
     target_phi_rad=float(target_phi_rad),
     target_lam_rad=float(target_lam_rad),
     thruster_fires_df=thruster_fires_df,

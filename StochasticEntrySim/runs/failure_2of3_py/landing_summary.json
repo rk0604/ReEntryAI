@@ -1,0 +1,14 @@
+{
+  "termination_reason": "nominal_ground_reached",
+  "final_t_s": 746.25,
+  "final_alt_km": 0.0006376600591465831,
+  "final_V_mps": 9.040530664480086,
+  "final_gamma_deg": -89.99999998911193,
+  "final_chi_deg": 26.614444568189185,
+  "final_phi_deg": 17.104247462917943,
+  "final_lam_deg": 2.2398689625494193,
+  "cpas_drogue_deploy_t_s": 445.25,
+  "cpas_pilot_deploy_t_s": 515.5,
+  "cpas_main_deploy_t_s": 523.25,
+  "cpas_landed_t_s": 746.5
+}

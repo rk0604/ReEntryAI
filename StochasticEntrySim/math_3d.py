@@ -1431,6 +1431,36 @@ def aero_coefficients_from_speed_altitude(V_mps: float, altitude_m: float, param
     V_kms = V_mps / 1000.0
     V_kfps = V_mps * 0.00328084  # proxy for FMV in the Orion CM hypersonic database
 
+    # Properly blended FMV per Bibb et al. 2010 Eq. 1:
+    #   FMV = Mach          if U <=  8.8 kfps  (~2680 m/s)
+    #   FMV = V_kfps        if U >=  9.8 kfps  (~2987 m/s)
+    #   linear blend between
+    # Mach needs the local atmospheric temperature. We accept it via params
+    # (cheap: the main loop populates params['T_K'] once per step from the
+    # atmosphere query it already does); if absent we query atmosphere here
+    # so the function still returns the right answer in isolation.
+    def _fmv_blended(V_mps_, V_kfps_, T_K_):
+        if V_kfps_ >= 9.8:
+            return V_kfps_
+        if T_K_ is None or not (T_K_ == T_K_) or T_K_ <= 0.0:
+            return V_kfps_  # no temperature available -> degrade to old behaviour
+        mach_ = V_mps_ / math.sqrt(1.4 * 287.053 * T_K_)
+        if V_kfps_ <= 8.8:
+            return mach_
+        # 8.8 kfps < V_kfps < 9.8 kfps: linear blend
+        alpha = (V_kfps_ - 8.8) / (9.8 - 8.8)
+        return (1.0 - alpha) * mach_ + alpha * V_kfps_
+
+    _T_K_in_params = params.get("T_K", None)
+    if _T_K_in_params is None and model_name == "orion_cm_trim":
+        # Pay the atmosphere query so FMV is correct in the subsonic regime
+        try:
+            import AtmosphereModel as _atm_mod
+            _, _T_K_in_params = _atm_mod.get_atmosphere_state(float(altitude_m))
+        except Exception:
+            _T_K_in_params = None
+    FMV_blended = _fmv_blended(V_mps, V_kfps, _T_K_in_params)
+
     if model_name == "orion_cm_trim":
         # Trim CD and L/D scheduled vs the blended velocity parameter FMV from
         # Bibb, Walker, Brauckmann, Robinson, "Development of the Orion Crew Module
@@ -1460,7 +1490,10 @@ def aero_coefficients_from_speed_altitude(V_mps: float, altitude_m: float, param
         schedule = params.get("orion_trim_schedule", default_trim_schedule)
         schedule = sorted(schedule, key=lambda x: x[0])
 
-        FMV = V_kfps
+        # Use the properly-blended FMV from above (Bibb 2010 Eq. 1) so
+        # the subsonic/transonic regime is keyed on Mach instead of the
+        # numerically-different V_kfps proxy.
+        FMV = FMV_blended
 
         if FMV <= schedule[0][0]:
             CD = schedule[0][1]
@@ -1557,7 +1590,7 @@ def aero_coefficients_from_speed_altitude(V_mps: float, altitude_m: float, param
         "LD": float(LD),
         "V_kms": float(V_kms),
         "V_kfps": float(V_kfps),
-        "FMV": float(V_kfps),
+        "FMV": float(FMV_blended),
         "altitude_m": float(altitude_m),
         "schedule_region": region_string,
         "cpas_drag_cdA_extra_m2": float(cpas_drag_cdA_extra_m2),
