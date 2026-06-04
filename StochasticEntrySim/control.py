@@ -43,7 +43,11 @@ from typing import Any, Dict, List, Optional, Protocol
 
 import AtmosphereModel
 import constants
-from math_3d import IntervalSupervisorConfig, rollout_predictor_corrector_candidate
+from math_3d import (
+    IntervalSupervisorConfig,
+    rollout_predictor_corrector_candidate,
+    rollout_nominal_to_terminal,
+)
 
 
 # Small math helpers ------------------------------------------------------------
@@ -395,9 +399,27 @@ class SimpleBankGuidance:
     low_speed_mps: float = 1500.0
     high_speed_mps: float = 7800.0
 
-    # Prediction horizon settings.
+    # Prediction horizon settings (short interval/heat screen).
     predictor_horizon_steps: int = constants.PREDICTOR_CORRECTOR_HORIZON_STEPS
     prediction_dt_s: float = constants.ENTRY_DT_S
+
+    # --- Continuous predictor-corrector (Lu 2014) ---
+    # When enabled, the bank-angle MAGNITUDE is found by a golden-section
+    # search that drives the predicted terminal miss distance to a minimum,
+    # using a long nominal rollout all the way to drogue-deploy altitude.
+    # The bank SIGN still comes from the existing heading-offset logic.
+    # Set to False to fall back to the legacy discrete-bin selector.
+    use_continuous_predictor: bool = True
+    # Altitude at which the entry phase ends and the long rollout stops.
+    terminal_prediction_altitude_m: float = 7600.0
+    # Coarse timestep for the long forward prediction (s).
+    long_prediction_dt_s: float = 2.0
+    # Hard cap on long-rollout Euler steps (safety against skip-out).
+    long_prediction_max_steps: int = 600
+    # Upper bound of the bank-magnitude search (deg).
+    sigma_search_max_deg: float = 90.0
+    # Golden-section iterations (≈ this many + 2 rollout evals per cycle).
+    sigma_search_iters: int = 16
 
     # Candidate bank grid in degrees.
     candidate_bank_deg: List[float] = field(
@@ -652,6 +674,187 @@ class SimpleBankGuidance:
         # Return the total geometric cost.
         return float(range_term + heading_term + cross_track_term)
 
+    # ------------------------------------------------------------------
+    # Continuous bank-magnitude solver (Lu 2014, Fixes 1 + 2)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _golden_section_minimize(f, a: float, b: float, iters: int) -> float:
+        """Minimize a unimodal scalar function f on [a, b] by golden section.
+
+        Returns the argmin. Uses ~iters + 2 evaluations of f.
+        """
+        invphi = (math.sqrt(5.0) - 1.0) / 2.0    # 0.6180339887
+        invphi2 = (3.0 - math.sqrt(5.0)) / 2.0   # 0.3819660113
+        c = a + invphi2 * (b - a)
+        d = a + invphi * (b - a)
+        fc = f(c)
+        fd = f(d)
+        for _ in range(int(iters)):
+            if fc < fd:
+                b, d, fd = d, c, fc
+                c = a + invphi2 * (b - a)
+                fc = f(c)
+            else:
+                a, c, fc = c, d, fd
+                d = a + invphi * (b - a)
+                fd = f(d)
+        return 0.5 * (a + b)
+
+    def _terminal_miss_distance(self, sigma_cmd_rad, x_nominal_old, rollout_params, t_s):
+        """Predicted great-circle miss distance to the target if the capsule
+        holds this constant bank to drogue-deploy altitude (Lu Eq. 18-20)."""
+        roll = rollout_nominal_to_terminal(
+            x_nominal_old=x_nominal_old,
+            sigma_cmd_rad=float(sigma_cmd_rad),
+            params=rollout_params,
+            dt_s=float(self.long_prediction_dt_s),
+            terminal_altitude_m=float(self.terminal_prediction_altitude_m),
+            max_steps=int(self.long_prediction_max_steps),
+        )
+        xf = roll["x_final"]
+        sph = spherical_range_and_course(
+            phi_rad=float(xf[1]), lam_rad=float(xf[2]),
+            target_phi_rad=float(self.target_phi_rad),
+            target_lam_rad=float(self.target_lam_rad),
+            radius_m=float(constants.RADIUS_EARTH),
+        )
+        miss_m = float(sph["range_to_go_m"])
+        # If the rollout skipped out / capped without reaching terminal
+        # altitude, penalize so the search avoids that bank region. Skip-out
+        # happens at LOW bank (too much vertical lift), so this penalty keeps
+        # the cost unimodal and pushes the solution toward higher bank.
+        if not roll["reached_terminal"]:
+            miss_m += 5.0e6
+        return miss_m, roll
+
+    def _solve_sigma_magnitude(self, bank_sign, x_nominal_old, rollout_params, t_s):
+        """Golden-section search for the bank magnitude minimizing terminal
+        miss distance. Returns (best_sigma_mag_rad, best_miss_m, eval_log)."""
+        sigma_max = math.radians(float(self.sigma_search_max_deg))
+        eval_log: List[Dict[str, float]] = []
+
+        def cost(mag_rad):
+            if mag_rad < 1.0e-9 or bank_sign == 0.0:
+                sigma = 0.0
+            else:
+                sigma = float(bank_sign) * float(mag_rad)
+            sigma = clamp(sigma, float(constants.SIGMA_MIN_RAD), float(constants.SIGMA_MAX_RAD))
+            miss_m, roll = self._terminal_miss_distance(sigma, x_nominal_old, rollout_params, t_s)
+            eval_log.append({
+                "sigma_mag_deg": math.degrees(float(mag_rad)),
+                "sigma_cmd_deg": math.degrees(float(sigma)),
+                "miss_m": float(miss_m),
+                "reached_terminal": bool(roll["reached_terminal"]),
+            })
+            return miss_m
+
+        best_mag = self._golden_section_minimize(cost, 0.0, sigma_max, int(self.sigma_search_iters))
+        best_miss = cost(best_mag)
+        return float(best_mag), float(best_miss), eval_log
+
+    def _compute_sigma_cmd_continuous(
+        self, t_s, state, obs, bank_sign,
+        heading_error_rad, deadband_rad,
+        current_altitude_m, current_altitude_rate_mps,
+        current_range_to_go_m, current_cross_track_error_m,
+    ) -> float:
+        """Continuous predictor-corrector path (Fixes 1+2): solve bank
+        magnitude by minimizing predicted terminal miss, keep sign from the
+        heading-offset logic, run one short heat screen for feasibility."""
+        x_nominal_old = self._state_to_vector(state)
+        rollout_params = self._rollout_params()
+        ctx = self._prediction_context
+
+        best_mag_rad, best_miss_m, eval_log = self._solve_sigma_magnitude(
+            bank_sign, x_nominal_old, rollout_params, t_s
+        )
+
+        if best_mag_rad < 1.0e-9 or bank_sign == 0.0:
+            sigma_cmd_rad = 0.0
+        else:
+            sigma_cmd_rad = float(bank_sign) * float(best_mag_rad)
+        sigma_cmd_rad = clamp(
+            sigma_cmd_rad,
+            float(constants.SIGMA_MIN_RAD),
+            float(constants.SIGMA_MAX_RAD),
+        )
+
+        # Short interval/heat screen at the chosen bank, for feasibility flags
+        # and the heating debug keys the loggers expect.
+        screen = rollout_predictor_corrector_candidate(
+            x_nominal_old=x_nominal_old,
+            sigma_cmd_rad=float(sigma_cmd_rad),
+            params=rollout_params,
+            dt_s=float(self.prediction_dt_s),
+            horizon_steps=int(self.predictor_horizon_steps),
+            x_interval_old=ctx.x_interval_old,
+            supervisor_cfg=ctx.supervisor_cfg,
+            heat_shield=ctx.heat_shield,
+            t0_s=float(t_s),
+            heat_rate_limit=self.heat_rate_limit,
+            heat_load_limit=self.heat_load_limit,
+            interval_screen_active=bool(ctx.interval_active),
+        )
+        heat_feasible = bool(screen.heat_feasible)
+
+        # Build candidate_dicts from the search evaluations so the candidate
+        # plots still have data. Mark the closest-to-chosen as selected.
+        candidate_dicts: List[Dict[str, Any]] = []
+        for i, e in enumerate(eval_log):
+            candidate_dicts.append({
+                "candidate_index": int(i),
+                "sigma_mag_deg": float(e["sigma_mag_deg"]),
+                "sigma_cmd_deg": float(e["sigma_cmd_deg"]),
+                "bank_sign": float(bank_sign),
+                "terminal_range_to_go_m": float(e["miss_m"]),
+                "geometry_cost": float(e["miss_m"]),
+                "heat_penalty": 0.0,
+                "total_cost": float(e["miss_m"]),
+                "heat_feasible": bool(heat_feasible),
+                "fully_feasible": bool(heat_feasible),
+                "reached_terminal": bool(e["reached_terminal"]),
+                "failure_reason": "",
+            })
+        sel_idx = min(range(len(candidate_dicts)),
+                      key=lambda i: candidate_dicts[i]["total_cost"]) if candidate_dicts else -1
+
+        self._last_debug = {
+            "guidance_cycle_index": int(ctx.guidance_cycle_index),
+            "trajectory_id": str(ctx.trajectory_id),
+            "current_altitude_m": float(current_altitude_m),
+            "current_altitude_rate_mps": float(current_altitude_rate_mps),
+            "current_range_to_go_m": float(current_range_to_go_m),
+            "current_heading_error_rad": float(heading_error_rad),
+            "current_cross_track_error_m": float(current_cross_track_error_m),
+            "heading_deadband_deg": math.degrees(deadband_rad),
+            "predictor_mode": "continuous",
+            "candidate_dicts": list(candidate_dicts),
+            "candidate_sigma_deg": [float(c["sigma_cmd_deg"]) for c in candidate_dicts],
+            "candidate_total_cost": [float(c["total_cost"]) for c in candidate_dicts],
+            "candidate_heat_feasible": [bool(c["fully_feasible"]) for c in candidate_dicts],
+            "candidate_failure_reason": [str(c["failure_reason"]) for c in candidate_dicts],
+            "selected_candidate_index": int(sel_idx),
+            "selected_candidate_heat_feasible": bool(heat_feasible),
+            "selected_interval_screen_used": bool(screen.interval_screen_used),
+            "selected_interval_failure_kind": str(screen.interval_failure_kind),
+            "any_feasible_candidate": bool(heat_feasible),
+            "chosen_sigma_cmd_deg": math.degrees(float(sigma_cmd_rad)),
+            "chosen_sigma_mag_deg": math.degrees(float(best_mag_rad)),
+            "selected_geometry_cost": float(best_miss_m),
+            "selected_heat_penalty": float(self.weight_heat * float(screen.heat_penalty)),
+            "selected_total_cost": float(best_miss_m),
+            "selected_failure_reason": "" if heat_feasible else "heat_infeasible_at_solution",
+            "selected_violation_amount": float(screen.violation_amount),
+            "selected_first_violation_step": int(screen.first_violation_step),
+            "selected_first_violation_time_s": float(screen.first_violation_time_s),
+            "selected_max_heating_rate_lo": float(screen.max_heating_rate_interval.lo),
+            "selected_max_heating_rate_hi": float(screen.max_heating_rate_interval.hi),
+            "selected_max_heat_load_lo": float(screen.max_heat_load_interval.lo),
+            "selected_max_heat_load_hi": float(screen.max_heat_load_interval.hi),
+            "predicted_terminal_miss_m": float(best_miss_m),
+        }
+        return float(sigma_cmd_rad)
+
     def compute_sigma_cmd(
         self,
         t_s: float,
@@ -741,6 +944,19 @@ class SimpleBankGuidance:
             heading_offset_psi_rad=heading_offset_psi_rad,
         )
 
+        # Continuous predictor-corrector path (Lu 2014, Fixes 1 + 2): solve
+        # the bank magnitude that minimizes predicted terminal miss distance.
+        if self.use_continuous_predictor:
+            return self._compute_sigma_cmd_continuous(
+                t_s=t_s, state=state, obs=obs, bank_sign=bank_sign,
+                heading_error_rad=heading_error_rad, deadband_rad=deadband_rad,
+                current_altitude_m=current_altitude_m,
+                current_altitude_rate_mps=current_altitude_rate_mps,
+                current_range_to_go_m=current_range_to_go_m,
+                current_cross_track_error_m=current_cross_track_error_m,
+            )
+
+        # --- Legacy discrete-bin selector (use_continuous_predictor=False) ---
         # Build the candidate magnitude list in degrees.
         candidate_mags_deg = self._candidate_magnitude_list_deg(
             heading_error_rad=heading_error_rad,

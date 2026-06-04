@@ -666,6 +666,12 @@ def nominal_heating_envelope_from_state(
         "qdot_mean": heat_shield.qdot_mean(),
         "Q_max": heat_shield.Q_max(),
         "rho_kgm3": float(rho),
+        # Stagnation-point heating component breakdown (convective vs
+        # radiative) plus the radiative-equilibrium wall temperature.
+        "qdot_conv_stag": heat_shield.qdot_conv_stag,
+        "qdot_rad_stag": heat_shield.qdot_rad_stag,
+        "qdot_total_stag": heat_shield.qdot_total_stag,
+        "T_wall_stag_K": heat_shield.T_wall_stag_K,
     }
 
 
@@ -1467,19 +1473,35 @@ def aero_coefficients_from_speed_altitude(V_mps: float, altitude_m: float, param
         # Static Aerodynamic Database, Part I: Hypersonic" (NASA Langley / JSC).
         # Paper covers 8 <= FMV <= 40 at trim (Cm_cg = 0); trim alpha varies from
         # ~167 deg at low FMV to ~157 deg at high FMV, giving L/D ~0.27 to 0.40.
-        # Below FMV = 8 we use Apollo CM trim values (NASA TN D-3522), which
-        # show subsonic L/D ~0.25-0.28 down to Mach 0.5 — the bare capsule still
-        # makes meaningful lift subsonic, only the *damping* goes negative.
+        # Below FMV = 8 (i.e. below ~Mach 8, where blended FMV is Mach number)
+        # we use the ORION-SPECIFIC subsonic/supersonic static aero database:
+        #   Bibb et al., "Development of the Orion Crew Module Static
+        #   Aerodynamic Database, Part II: Subsonic/Supersonic," AIAA 2011-3507
+        #   / NASA NTRS 20110013645. Covers M = 0.2-4.0 at trim (alpha ~145-175
+        #   deg, heat-shield forward).
+        # Key Orion-specific facts taken directly from that paper:
+        #   - SUBSONIC trim CD is ~0.7-0.9 (frontal-area reference) -- explicitly
+        #     LOWER than the historical Apollo flight data, so the previous
+        #     Apollo surrogate over-predicted subsonic drag.
+        #   - CD rises through the transonic drag rise toward the hypersonic
+        #     value ~1.55 (Bibb Part I) above M ~ 5.
+        # L/D values below taper smoothly from the Part I hypersonic trim
+        # (~0.40 at M=8) down to ~0.10 at very low subsonic Mach where trim
+        # lift authority collapses; the paper notes L/D is secondary to drag
+        # in this regime.
         # Format: (FMV, CD_trim, LD_trim)
         default_trim_schedule = [
-            (0.0,  1.05, 0.22),  # very low speed — Apollo low-Mach trim
-            (0.4,  1.15, 0.25),  # subsonic
-            (0.7,  1.30, 0.27),  # high subsonic (Apollo damping turns negative)
-            (1.0,  1.55, 0.28),  # transonic drag rise (~Mach 1)
-            (2.0,  1.50, 0.30),  # low supersonic
-            (5.0,  1.50, 0.36),  # supersonic L/D peak
-            (8.0,  1.52, 0.40),  # hypersonic low FMV (matches paper trim)
-            (10.0, 1.50, 0.39),
+            (0.0,  0.83, 0.10),  # very low subsonic — Orion CD ~0.8, minimal lift
+            (0.5,  0.85, 0.15),  # subsonic (Orion Part II: CD 0.7-0.9)
+            (0.7,  0.88, 0.20),  # high subsonic (matches M=0.7 fig, CD<Apollo)
+            (0.9,  1.02, 0.23),  # transonic onset — drag rise begins
+            (1.1,  1.28, 0.25),  # transonic drag rise
+            (1.5,  1.38, 0.28),  # low supersonic
+            (2.0,  1.43, 0.30),  # supersonic
+            (3.0,  1.47, 0.33),  # supersonic
+            (5.0,  1.50, 0.36),  # high supersonic, approaching hypersonic
+            (8.0,  1.52, 0.40),  # hypersonic low FMV (Bibb Part I) -- blend point
+            (10.0, 1.50, 0.39),  # ---- below: Bibb 2010 Part I hypersonic ----
             (15.0, 1.52, 0.33),
             (20.0, 1.54, 0.30),
             (25.0, 1.55, 0.27),
@@ -1684,6 +1706,7 @@ def nominal_aero_forces_from_state(
         "CD": float(CD),
         "CL": float(CL),
         "LD": float(coeffs["LD"]),
+        "FMV": float(coeffs.get("FMV", coeffs.get("V_kfps", 0.0))),
         "aero_model": coeffs["aero_model"],
         "aero_schedule_region": coeffs["schedule_region"],
         "V_kms": coeffs["V_kms"],
@@ -2009,6 +2032,91 @@ def _hull_or_default(a: Optional[Interval], b: Optional[Interval]) -> Interval:
     if b is None:
         return Interval(float(a.lo), float(a.hi))
     return a.hull(b)
+
+
+def rollout_nominal_to_terminal(
+    x_nominal_old: List[float],
+    sigma_cmd_rad: float,
+    params: Dict[str, Any],
+    dt_s: float,
+    terminal_altitude_m: float,
+    max_steps: int,
+) -> Dict[str, Any]:
+    """
+    Propagate ONLY the nominal translational state forward under a constant
+    bank angle until the predicted altitude drops below terminal_altitude_m
+    (typically drogue-deploy altitude, where the entry phase ends and the
+    bank angle no longer matters), or until max_steps is reached.
+
+    This is the long-horizon predictor used by the continuous bank-magnitude
+    solver (Lu 2014 Eq. 18-24). Unlike rollout_predictor_corrector_candidate,
+    it does NOT propagate the interval box or the heat shield — it is a cheap
+    nominal-only forward integration whose sole job is to estimate where the
+    capsule lands as a function of bank angle. Heat feasibility is still
+    screened separately on the short horizon by the interval rollout.
+
+    A coarse dt_s (e.g. 1-2 s) keeps the cost low; the predictor only needs
+    the terminal POSITION, not a flight-accurate trajectory.
+
+    Returns a dict:
+        x_final              -- final 6-state vector
+        reached_terminal     -- True if alt fell below terminal_altitude_m
+        steps_used           -- number of Euler steps taken
+        terminated_reason    -- "terminal_alt" | "max_steps" | "singular"
+    """
+    if len(x_nominal_old) != 6:
+        raise ValueError("x_nominal_old must have 6 components")
+    if dt_s <= 0.0:
+        raise ValueError("dt_s must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+
+    # Use a CPAS-free copy of params: during the entry/guidance phase the
+    # chutes are not deployed, and we never want a frozen chute-drag term
+    # leaking into a long forward prediction.
+    pred_params = dict(params)
+    pred_params["cpas_drag_cdA_extra_m2"] = 0.0
+    pred_params["cpas_lift_scale"] = 1.0
+
+    x_nominal = [float(v) for v in x_nominal_old]
+    r_earth = float(constants.RADIUS_EARTH)
+    terminated_reason = "max_steps"
+    steps_used = 0
+
+    for step_idx in range(int(max_steps)):
+        steps_used = step_idx + 1
+
+        # Stop if the flight-path geometry is about to go singular (cos gamma
+        # near zero makes the longitude/heading channels blow up). Treat the
+        # current state as the terminal prediction.
+        if abs(math.cos(x_nominal[4])) < 0.05:
+            terminated_reason = "singular"
+            break
+
+        nominal_step = nominal_eom_step(
+            x=x_nominal,
+            sigma_rad=float(sigma_cmd_rad),
+            params=pred_params,
+            dt_s=float(dt_s),
+        )
+        x_nominal = [float(v) for v in nominal_step["x_next"]]
+
+        # Guard against a NaN / non-finite blow-up in the coarse integration.
+        if not all(math.isfinite(v) for v in x_nominal):
+            terminated_reason = "singular"
+            break
+
+        alt_m = x_nominal[0] - r_earth
+        if alt_m <= float(terminal_altitude_m):
+            terminated_reason = "terminal_alt"
+            break
+
+    return {
+        "x_final": list(x_nominal),
+        "reached_terminal": bool(terminated_reason == "terminal_alt"),
+        "steps_used": int(steps_used),
+        "terminated_reason": str(terminated_reason),
+    }
 
 
 def rollout_predictor_corrector_candidate(

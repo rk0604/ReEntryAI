@@ -177,11 +177,62 @@ ORION_CM_RADIUS_M = 0.5 * ORION_CM_DIAMETER_M
 # Heat shield radius in meters.
 HEAT_SHIELD_RADIUS_M = ORION_CM_RADIUS_M
 
-# Effective nose radius for stagnation heating in meters.
-HEAT_SHIELD_NOSE_RADIUS_M = 1.0
+# Effective nose radius (radius of curvature) of the Orion CM heat shield
+# spherical section, in metres. The blunt heat shield has R_c ~ 6 m; this
+# replaces an earlier 1.0 m placeholder. R_n drives BOTH the convective
+# (smaller R_n -> hotter) and radiative (larger R_n -> hotter, more
+# radiating gas volume) stagnation heating, so a realistic value matters.
+HEAT_SHIELD_NOSE_RADIUS_M = 6.0
 
 # Radial exponent for how heating falls off away from the center.
 HEAT_SHIELD_RADIAL_EXP = 1.0
+
+# --- Stagnation-point heating model constants ---
+# Sutton-Graves convective coefficient (Earth air), SI. With rho [kg/m^3],
+# R_n [m], V [m/s] this gives convective flux in W/m^2.
+#   Sutton, K. & Graves, R.A., NASA TR R-376 (1971).
+SUTTON_GRAVES_K_EARTH = 1.7415e-4
+
+# Tauber-Sutton stagnation radiative heating (Earth), q_rad = C * R_n^a *
+# rho^b * f(V), with a ~= 1, b ~= 1.2 for Earth (Tauber & Sutton, J.
+# Spacecraft & Rockets 28(1):40-42, 1991). Output here is W/m^2 after the
+# W/cm^2 -> W/m^2 conversion. Radiation is negligible below ~9 km/s.
+#
+# NOTE: f(V) below is a physically-anchored CALIBRATION (radiative ~30-45%
+# of convective near 11 km/s, matching Apollo 4 flight data; zero below
+# 9 km/s) used because the exact Tauber-Sutton 1991 Table 1 is paywalled.
+# Replace TAUBER_SUTTON_FV_EARTH with the transcribed original table before
+# publication; the structure and the C/a/b parametrization are exact.
+TAUBER_SUTTON_C_EARTH = 4.736e4   # W/cm^2 base coefficient
+TAUBER_SUTTON_A_EARTH = 1.0       # R_n exponent (Earth)
+TAUBER_SUTTON_B_EARTH = 1.2       # rho exponent (Earth)
+TAUBER_SUTTON_WCM2_TO_WM2 = 1.0e4
+# (velocity m/s, f(V)) — monotone, ~exponential; calibrated, see note above.
+TAUBER_SUTTON_FV_EARTH = (
+    (8000.0, 0.00),
+    (9000.0, 0.05),
+    (9500.0, 0.15),
+    (10000.0, 0.45),
+    (10500.0, 0.90),
+    (11000.0, 1.68),
+    (11500.0, 2.90),
+    (12000.0, 4.80),
+    (13000.0, 11.0),
+    (14000.0, 22.0),
+    (15000.0, 40.0),
+    (16000.0, 68.0),
+)
+
+# Surface (wall) radiative-equilibrium emissivity for Avcoat char, and the
+# Stefan-Boltzmann constant, used to back out wall temperature from net flux:
+#   T_w = (q_net / (eps * sigma))^0.25
+HEAT_SHIELD_EMISSIVITY = 0.85
+STEFAN_BOLTZMANN_W_M2_K4 = 5.670374419e-8
+
+# Tauber-Wakefield radiative-cooling coupling constant (Earth). The shock
+# layer loses energy to radiation, reducing the radiative flux reaching the
+# wall:  q_coupled = q_uncoupled / (1 + Gamma * q_unc / (0.5*rho*V^3))^0.7
+TAUBER_WAKEFIELD_GAMMA_EARTH = 3.45
 
 # Circular projected reference area in square meters.
 CAPSULE_REFERENCE_AREA_M2 = math.pi * HEAT_SHIELD_RADIUS_M ** 2
@@ -198,6 +249,15 @@ CAPSULE_RCS_NUM_THRUSTERS = 12
 # Crew module single thruster force in Newtons.
 # This is 160 pounds force converted to Newtons.
 ORION_CM_RCS_THRUST_N = 160.0 * 4.4482216152605
+
+# RCS propellant specific impulse (s). Orion CM RCS uses MMH/NTO hypergolic
+# bipropellant; a representative vacuum Isp is ~290 s. Used to convert
+# thruster on-time into propellant mass for fuel-usage telemetry:
+#     mdot_per_thruster = thrust_N / (Isp * g0)
+ORION_CM_RCS_ISP_S = 290.0
+
+# Standard gravity used for Isp -> mass-flow conversion and load-factor (g).
+STANDARD_GRAVITY_MPS2 = 9.80665
 
 # Minimum time a thruster stays on once it starts firing.
 ORION_CM_RCS_MIN_PULSE_S = 0.060
@@ -508,6 +568,13 @@ class HeatShield:
         # Q stores accumulated cell heat load intervals.
         self.Q = [type(base_iv)(0.0, 0.0) for _ in range(len(self.cell_area))]
 
+        # Stagnation-level component breakdown (set each update()).
+        z = type(base_iv)(0.0, 0.0)
+        self.qdot_conv_stag = z
+        self.qdot_rad_stag = z
+        self.qdot_total_stag = z
+        self.T_wall_stag_K = z
+
     def clone(self) -> "HeatShield":
         """
         Return a deep copy of the heat shield thermal state.
@@ -532,25 +599,85 @@ class HeatShield:
 
     def stagnation_qdot(self, rho, V):
         """
-        Sutton Graves style stagnation point convective heating.
+        Sutton-Graves stagnation-point CONVECTIVE heating (Earth air).
 
-        rho can be float or interval
-        V can be float or interval
+            q_conv = k * sqrt(rho / R_n) * V^3        [W/m^2]
+            k = 1.7415e-4 (Earth)   -- NASA TR R-376 (Sutton & Graves 1971)
 
-        The model computes a stagnation heating proxy proportional to
-        square root of density divided by nose radius and multiplied by
-        velocity cubed.
+        rho and V may be float or interval.
         """
-        # Promote inputs so the same equation works for nominal and interval use.
         rho_iv = promote(rho)
         V_iv = promote(V)
-
-        # Build a constant interval coefficient once in the same interval type.
         iv_type = type(rho_iv)
-        k = iv_type(1.83e-4, 1.83e-4)
-
-        # Apply the Sutton Graves style heating relation.
+        k = iv_type(SUTTON_GRAVES_K_EARTH, SUTTON_GRAVES_K_EARTH)
         return k * (rho_iv / self.nose_radius).sqrt() * V_iv.pow_int(3)
+
+    def _f_of_V(self, V_mps: float) -> float:
+        """Tauber-Sutton velocity function f(V) by linear interpolation of the
+        (calibrated) Earth table. Monotone increasing; 0 below the table."""
+        tbl = TAUBER_SUTTON_FV_EARTH
+        if V_mps <= tbl[0][0]:
+            return float(tbl[0][1])
+        if V_mps >= tbl[-1][0]:
+            return float(tbl[-1][1])
+        for i in range(len(tbl) - 1):
+            v0, f0 = tbl[i]
+            v1, f1 = tbl[i + 1]
+            if v0 <= V_mps <= v1:
+                a = (V_mps - v0) / (v1 - v0) if v1 > v0 else 0.0
+                return float(f0 + a * (f1 - f0))
+        return float(tbl[-1][1])
+
+    def _radiative_qdot_scalar(self, rho: float, V: float) -> float:
+        """Tauber-Sutton stagnation radiative flux (W/m^2) with Tauber-Wakefield
+        radiative-cooling coupling. Scalar; the interval version brackets it."""
+        rho = max(0.0, float(rho))
+        V = max(0.0, float(V))
+        if rho <= 0.0 or V <= 0.0:
+            return 0.0
+        # Uncoupled Tauber-Sutton (W/cm^2 -> W/m^2)
+        q_unc_wcm2 = (
+            TAUBER_SUTTON_C_EARTH
+            * (self.nose_radius ** TAUBER_SUTTON_A_EARTH)
+            * (rho ** TAUBER_SUTTON_B_EARTH)
+            * self._f_of_V(V)
+        )
+        q_unc = q_unc_wcm2 * TAUBER_SUTTON_WCM2_TO_WM2
+        if q_unc <= 0.0:
+            return 0.0
+        # Tauber-Wakefield coupling: radiation cools the shock layer, lowering
+        # the flux reaching the wall.
+        flux_scale = 0.5 * rho * V ** 3  # 0.5 rho V^3, the energy-flux scale
+        if flux_scale > 0.0:
+            denom = (1.0 + TAUBER_WAKEFIELD_GAMMA_EARTH * q_unc / flux_scale) ** 0.7
+            return float(q_unc / denom)
+        return float(q_unc)
+
+    def radiative_qdot(self, rho, V):
+        """Stagnation radiative heating as an interval (monotone in rho and V,
+        so the bounds map straight through the scalar correlation)."""
+        rho_iv = promote(rho)
+        V_iv = promote(V)
+        iv_type = type(rho_iv)
+        lo = self._radiative_qdot_scalar(rho_iv.lo, V_iv.lo)
+        hi = self._radiative_qdot_scalar(rho_iv.hi, V_iv.hi)
+        if hi < lo:
+            lo, hi = hi, lo
+        return iv_type(lo, hi)
+
+    def surface_temperature_K(self, qdot_net):
+        """Radiative-equilibrium wall temperature from net flux (interval):
+            T_w = (q_net / (eps * sigma))^0.25     [K]
+        Monotone in q_net, so bounds map through directly."""
+        q_iv = promote(qdot_net)
+        iv_type = type(q_iv)
+        denom = HEAT_SHIELD_EMISSIVITY * STEFAN_BOLTZMANN_W_M2_K4
+
+        def _Tw(q):
+            q = max(0.0, float(q))
+            return (q / denom) ** 0.25 if denom > 0.0 else 0.0
+
+        return iv_type(_Tw(q_iv.lo), _Tw(q_iv.hi))
 
     def radial_shape_factor(self, r: float) -> float:
         """
@@ -667,8 +794,19 @@ class HeatShield:
         if dt <= 0.0:
             raise ValueError("dt must be positive")
 
-        # First compute the stagnation heating envelope for the current state.
-        qdot_stag = self.stagnation_qdot(rho, V)
+        # Stagnation heating = convective (Sutton-Graves) + radiative
+        # (Tauber-Sutton). At lunar-return speeds (>9 km/s) the radiative
+        # term becomes a significant fraction of the total.
+        qdot_conv_stag = self.stagnation_qdot(rho, V)
+        qdot_rad_stag = self.radiative_qdot(rho, V)
+        qdot_stag = qdot_conv_stag + qdot_rad_stag
+
+        # Record stagnation-level components + radiative-equilibrium wall
+        # temperature so the heating envelope can surface them for logging.
+        self.qdot_conv_stag = qdot_conv_stag
+        self.qdot_rad_stag = qdot_rad_stag
+        self.qdot_total_stag = qdot_stag
+        self.T_wall_stag_K = self.surface_temperature_K(qdot_stag)
 
         # Then distribute that heating across every ring sector cell.
         for cell_idx in range(len(self.qdot)):

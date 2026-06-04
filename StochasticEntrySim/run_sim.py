@@ -14,6 +14,7 @@ import ReactionControl
 import cpas
 import plotting
 import mission_config
+import telemetry
 
 from pathlib import Path
 
@@ -955,6 +956,9 @@ params["cpas_drag_cdA_extra_m2"] = 0.0
 params["cpas_lift_scale"] = 1.0
 _R_EARTH = float(constants.RADIUS_EARTH)
 
+# Cumulative RCS propellant burned (kg), integrated over the whole run.
+rcs_fuel_used_kg_total = 0.0
+
 for k in range(num_steps):
     t_s = k * dt_s
 
@@ -1134,6 +1138,35 @@ for k in range(num_steps):
     active_names = roll_step.fire_cmd.active_names()
     obs = ctrl_out.obs
 
+    # --- Derived physics telemetry (g-load, energy, Mach, FMV) ---
+    derived = telemetry.compute_derived_metrics(
+        r_m=float(x_nom[0]),
+        V_mps=float(x_nom[3]),
+        altitude_m=float(atm_nom["alt_m"]),
+        T_K=atm_nom.get("T_K", None),
+        rho_kgm3=float(atm_nom["rho_kgm3"]),
+        drag_mag_N=float(nominal_step_aero["drag_mag_N"]),
+        lift_mag_N=float(nominal_step_aero["lift_mag_N"]),
+        mass_kg=float(params["mass_kg"]),
+        fmv=float(nominal_step_aero.get("FMV", float("nan"))),
+    )
+
+    # --- RCS propellant model ---
+    # thruster-seconds this step = (active thrusters) * (fired on-time)
+    fired_on_time_s = float(roll_step.num_fired_internal_steps) * float(constants.RCS_INTERNAL_DT_S)
+    fired_thruster_seconds = float(len(active_names)) * fired_on_time_s
+    rcs_fuel_rate_kg_s = telemetry.rcs_propellant_kg(fired_thruster_seconds) / float(dt_s) if dt_s > 0 else 0.0
+    rcs_fuel_step_kg = telemetry.rcs_propellant_kg(fired_thruster_seconds)
+    rcs_fuel_used_kg_total += rcs_fuel_step_kg
+
+    # --- RL reward ingredients + composite default ---
+    reward = telemetry.composite_reward(
+        range_to_go_m=float(obs.get("range_to_go_m", np.nan)),
+        qdot_w_m2=float(nominal_heat_qdot_max_interval.hi),
+        load_factor_g=float(derived["load_factor_g"]),
+        rcs_fuel_rate_kg_s=float(rcs_fuel_rate_kg_s),
+    )
+
     candidate_sigma_deg_json = json.dumps([
         float(v.get("sigma_cmd_deg", np.nan))
         for v in candidate_dicts
@@ -1310,6 +1343,28 @@ for k in range(num_steps):
         "CL": float(nominal_step_aero["CL"]),
         "LD": float(nominal_step_aero["LD"]),
         "gravity_mps2": float(gravity_mps2),
+        # --- Derived physics telemetry (shared telemetry.py) ---
+        "mach": float(derived["mach"]),
+        "speed_of_sound_mps": float(derived["speed_of_sound_mps"]),
+        "fmv": float(derived["fmv"]),
+        "specific_kinetic_e_j_kg": float(derived["specific_kinetic_e_j_kg"]),
+        "specific_potential_e_j_kg": float(derived["specific_potential_e_j_kg"]),
+        "specific_energy_j_kg": float(derived["specific_energy_j_kg"]),
+        "energy_height_m": float(derived["energy_height_m"]),
+        "aero_force_N": float(derived["aero_force_N"]),
+        "aero_decel_mps2": float(derived["aero_decel_mps2"]),
+        "drag_decel_mps2": float(derived["drag_decel_mps2"]),
+        "load_factor_g": float(derived["load_factor_g"]),
+        # --- RCS propellant ---
+        "rcs_fuel_step_kg": float(rcs_fuel_step_kg),
+        "rcs_fuel_rate_kg_s": float(rcs_fuel_rate_kg_s),
+        "rcs_fuel_used_kg": float(rcs_fuel_used_kg_total),
+        # --- RL reward ingredients + composite default ---
+        "rew_range_term": float(reward["rew_range_term"]),
+        "rew_heat_term": float(reward["rew_heat_term"]),
+        "rew_gload_term": float(reward["rew_gload_term"]),
+        "rew_fuel_term": float(reward["rew_fuel_term"]),
+        "reward_default": float(reward["reward_default"]),
 
         "range_to_go_m": float(obs.get("range_to_go_m", np.nan)),
         "great_circle_range_m": float(obs.get("great_circle_range_m", np.nan)),
@@ -1377,6 +1432,12 @@ for k in range(num_steps):
         "nominal_heat_Q_max_hi": float(nominal_heat_Q_max_interval.hi),
         "nominal_heat_violation": int(bool(nominal_heat_violation)),
         "nominal_heat_violation_reason": str(nominal_heat_violation_reason),
+        # Stagnation heating component breakdown (convective vs radiative)
+        # + radiative-equilibrium wall temperature.
+        "qdot_conv_stag_hi": float(nominal_heat_info["qdot_conv_stag"].hi),
+        "qdot_rad_stag_hi": float(nominal_heat_info["qdot_rad_stag"].hi),
+        "qdot_total_stag_hi": float(nominal_heat_info["qdot_total_stag"].hi),
+        "T_wall_stag_K_hi": float(nominal_heat_info["T_wall_stag_K"].hi),
 
         "guidance_selected_candidate_index": int(selected_candidate_index),
         "guidance_any_feasible_candidate": int(bool(guidance_debug.get("any_feasible_candidate", True))),

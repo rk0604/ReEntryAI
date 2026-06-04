@@ -7,8 +7,8 @@
   "initial_state": {
     "altitude_m":   300000.0,
     "velocity_mps": 10500.0,
-    "gamma_deg":    -15.0,
-    "chi_deg":      90.0,
+    "gamma_deg":    -12.0,
+    "chi_deg":      45.99,
     "phi_deg":      0.0,
     "lambda_deg":   0.0
   },
@@ -66,6 +66,6 @@
   "mission": {
     "target_phi_deg":             15.0,
     "target_lambda_deg":          15.0,
-    "cos_gamma_termination_gate": 0.2
+    "cos_gamma_termination_gate": 0.05
   }
 }

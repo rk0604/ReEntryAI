@@ -323,11 +323,28 @@ def plot_cpas_speed_dragarea(df, save_fig, **_):
 
     fig, ax1 = plt.subplots(figsize=(11, 4.5))
     deployed_mask = df["cpas_phase"].astype(str) != "stowed"
-    if deployed_mask.any():
-        t_first_deploy = float(df.loc[deployed_mask, "t_s"].min())
-        t_zoom_start = max(0.0, t_first_deploy - 20.0)
-    else:
-        t_zoom_start = 0.0
+    if not deployed_mask.any():
+        # No chute ever deployed (e.g. the trajectory terminated above
+        # drogue-deploy altitude). Don't draw a misleading "terminal
+        # descent" of the whole entry — say so explicitly.
+        ax1.plot(df["t_s"], df["V_mps"], color="black", lw=1.4, label="Speed")
+        ax1.set_xlabel("Time s"); ax1.set_ylabel("Speed m/s")
+        final_alt = float(df["alt_m"].iloc[-1]) if "alt_m" in df.columns else float("nan")
+        ax1.set_title("CPAS never deployed — no terminal-descent phase")
+        ax1.text(0.5, 0.5,
+                 f"Chutes did NOT deploy.\nTrajectory ended at {final_alt/1000:.2f} km "
+                 f"(drogue deploys at 7.6 km).\nLikely terminated by the cos(gamma) "
+                 f"safety gate before reaching drogue altitude.",
+                 transform=ax1.transAxes, ha="center", va="center",
+                 color="#ff4d4d", fontsize=11,
+                 bbox=dict(boxstyle="round", fc="#11161d", ec="#ff4d4d"))
+        ax1.grid(True, alpha=0.4); ax1.legend(loc="upper right")
+        save_fig("06a3_cpas_speed_dragarea")
+        plt.show()
+        return
+
+    t_first_deploy = float(df.loc[deployed_mask, "t_s"].min())
+    t_zoom_start = max(0.0, t_first_deploy - 20.0)
     mask_zoom = df["t_s"] >= t_zoom_start
 
     ax1.plot(df.loc[mask_zoom, "t_s"], df.loc[mask_zoom, "V_mps"],
@@ -644,6 +661,34 @@ def plot_density_q(df, save_fig, **_):
 
 
 @_in_category('heating')
+def plot_heating_components(df, save_fig, **_):
+    """Convective vs radiative stagnation heating split + wall temperature.
+
+    The radiative term (Tauber-Sutton) switches on above ~9 km/s and is a
+    major fraction of the total at lunar-return speeds — the physics the
+    old convective-only model was missing.
+    """
+    need = {"qdot_conv_stag_hi", "qdot_rad_stag_hi", "qdot_total_stag_hi", "T_wall_stag_K_hi"}
+    if not need.issubset(df.columns):
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+    axes[0].plot(df["t_s"], df["qdot_conv_stag_hi"] / 1e6, color="#5ddbe0", lw=1.6, label="Convective (Sutton-Graves)")
+    axes[0].plot(df["t_s"], df["qdot_rad_stag_hi"] / 1e6, color="#f6c043", lw=1.6, label="Radiative (Tauber-Sutton)")
+    axes[0].plot(df["t_s"], df["qdot_total_stag_hi"] / 1e6, color="#ff4d4d", lw=2.0, label="Total")
+    axes[0].set_xlabel("Time s"); axes[0].set_ylabel("Stagnation qdot MW/m^2")
+    axes[0].set_title("Convective vs radiative stagnation heating")
+    axes[0].grid(True, alpha=0.4); axes[0].legend()
+
+    axes[1].plot(df["t_s"], df["T_wall_stag_K_hi"], color="#d365e8", lw=1.8, label="Wall temp (rad. equilibrium)")
+    axes[1].axhline(2473.0, color="red", ls=":", lw=1.0, label="Avcoat ablation ~2200 C")
+    axes[1].set_xlabel("Time s"); axes[1].set_ylabel("T_wall K")
+    axes[1].set_title("Radiative-equilibrium wall temperature")
+    axes[1].grid(True, alpha=0.4); axes[1].legend()
+    save_fig("08c_heating_components")
+    plt.show()
+
+
+@_in_category('heating')
 def plot_heating_envelope(df, save_fig, **_):
     fig, axes = plt.subplots(1, 2, figsize=(14, 4))
     axes[0].plot(df["t_s"], df["nominal_heat_qdot_max_hi"] / 1e6, color="C0", lw=2, label="Nominal qdot hi")
@@ -844,6 +889,7 @@ ALL_PLOTS = [
     plot_state_widths,
     plot_density_q,
     plot_heating_envelope,
+    plot_heating_components,
     plot_heat_shield_map,
     plot_guidance,
     plot_candidate_distribution,
