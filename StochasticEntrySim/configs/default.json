@@ -13,6 +13,16 @@
     "lambda_deg":   0.0
   },
 
+  "dispersion": {
+    "enabled":      false,
+    "altitude_m":   { "delta": 1000.0 },
+    "velocity_mps": { "delta": 100.0 },
+    "gamma_deg":    { "delta": 0.4 },
+    "chi_deg":      { "delta": 3.0 },
+    "phi_deg":      { "delta": 0.3 },
+    "lambda_deg":   { "delta": 0.3 }
+  },
+
   "aerodynamics": {
     "model":    "orion_cm_trim",
     "cd_const": 1.15,

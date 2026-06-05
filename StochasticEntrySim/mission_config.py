@@ -172,6 +172,93 @@ def initial_state_vector(cfg: MissionConfig, radius_earth_m: float = None) -> Li
     ]
 
 
+# =============================================================================
+# Initial-condition dispersion (Phase 2)
+# =============================================================================
+# The six entry-interface variables that may be dispersed for RL training and
+# for building the frozen held-out test set. Values are sampled in *config
+# units* (m, m/s, deg) around the nominal `initial_state`.
+_DISPERSION_VARS = (
+    "altitude_m", "velocity_mps", "gamma_deg", "chi_deg", "phi_deg", "lambda_deg",
+)
+
+_IC_DEFAULTS = {
+    "altitude_m": 115_000.0, "velocity_mps": 10_500.0, "gamma_deg": -5.5,
+    "chi_deg": 90.0, "phi_deg": 0.0, "lambda_deg": 0.0,
+}
+
+
+def dispersion_enabled(cfg: MissionConfig) -> bool:
+    """Whether the config's dispersion block is turned on."""
+    return bool(cfg.raw.get("dispersion", {}).get("enabled", False))
+
+
+def dispersion_spec(cfg: MissionConfig) -> Dict[str, dict]:
+    """Per-variable dispersion ranges from the config's `dispersion` block.
+
+    Each variable maps to one of:
+      * {"delta": d}          -> uniform on [nominal - d, nominal + d]
+      * {"low": a, "high": b} -> uniform on [a, b] (absolute)
+      * {"sigma": s, "trunc": k} -> Gaussian(nominal, s), truncated at +/- k*s
+    """
+    d = dict(cfg.raw.get("dispersion", {}))
+    d.pop("enabled", None)
+    return {k: v for k, v in d.items() if k in _DISPERSION_VARS and isinstance(v, dict)}
+
+
+def _sample_one(rng, nominal: float, spec: dict) -> float:
+    if "low" in spec or "high" in spec:
+        lo = float(spec.get("low", nominal))
+        hi = float(spec.get("high", nominal))
+        return float(rng.uniform(lo, hi))
+    if "sigma" in spec:
+        s = float(spec["sigma"])
+        k = float(spec.get("trunc", 3.0))
+        z = float(rng.normal(0.0, 1.0))
+        z = max(-k, min(k, z))
+        return float(nominal + s * z)
+    delta = float(spec.get("delta", 0.0))
+    return float(rng.uniform(nominal - delta, nominal + delta))
+
+
+def nominal_initial_conditions(cfg: MissionConfig) -> Dict[str, float]:
+    """Return the nominal six IC values in config units (m, m/s, deg)."""
+    ic = dict(cfg.raw.get("initial_state", {}))
+    return {k: float(ic.get(k, _IC_DEFAULTS[k])) for k in _DISPERSION_VARS}
+
+
+def initial_state_vector_from_ic(ic: Dict[str, float],
+                                 radius_earth_m: float = None) -> List[float]:
+    """Build the [r, phi, lam, V, gamma, chi] vector from a dict of IC values
+    (config units). Used for both the nominal and any dispersed/override IC."""
+    if radius_earth_m is None:
+        import constants
+        radius_earth_m = float(constants.RADIUS_EARTH)
+    g = lambda k: float(ic.get(k, _IC_DEFAULTS[k]))
+    return [
+        float(radius_earth_m + g("altitude_m")),
+        math.radians(g("phi_deg")),
+        math.radians(g("lambda_deg")),
+        g("velocity_mps"),
+        math.radians(g("gamma_deg")),
+        math.radians(g("chi_deg")),
+    ]
+
+
+def sample_dispersed_ic(cfg: MissionConfig, rng) -> Dict[str, float]:
+    """Draw one dispersed IC (config units) per the config's dispersion spec.
+
+    Variables without a spec entry keep their nominal value. Returns the drawn
+    dict so the exact conditions can be logged / frozen into a test set.
+    """
+    nominal = nominal_initial_conditions(cfg)
+    spec = dispersion_spec(cfg)
+    return {
+        k: (_sample_one(rng, v, spec[k]) if k in spec else v)
+        for k, v in nominal.items()
+    }
+
+
 def apply_aero_to_params(cfg: MissionConfig, params: Dict[str, Any]) -> Dict[str, Any]:
     """Mutate and return the params dict with aero overrides applied."""
     aero = cfg.raw.get("aerodynamics", {})

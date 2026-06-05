@@ -137,6 +137,7 @@ class OrionEntryEnv(gym.Env):
         target_radius_km: float = 25.0,
         reward_weights: Optional[telemetry.RewardWeights] = None,
         fast_atmosphere: bool = True,
+        dispersion: Optional[bool] = None,
         seed: Optional[int] = None,
     ):
         super().__init__()
@@ -163,7 +164,14 @@ class OrionEntryEnv(gym.Env):
             "CD_const": 1.15, "CL_const": 0.28,
         }
         mission_config.apply_aero_to_params(self.cfg, self.params)
-        self._x0 = mission_config.initial_state_vector(self.cfg, float(constants.RADIUS_EARTH))
+        self._radius_earth = float(constants.RADIUS_EARTH)
+        # Nominal IC (config units) + entry-interface state vector.
+        self._ic_nominal = mission_config.nominal_initial_conditions(self.cfg)
+        self._x0 = mission_config.initial_state_vector(self.cfg, self._radius_earth)
+        # IC dispersion: explicit env flag overrides the config's `enabled`.
+        self.dispersion = (mission_config.dispersion_enabled(self.cfg)
+                           if dispersion is None else bool(dispersion))
+        self._ic_drawn = dict(self._ic_nominal)   # IC actually used this episode
         tgt = mission_config.mission_targets(self.cfg)
         self.target_phi_rad = float(tgt["target_phi_rad"])
         self.target_lam_rad = float(tgt["target_lam_rad"])
@@ -264,6 +272,22 @@ class OrionEntryEnv(gym.Env):
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
+        # Resolve the initial condition for this episode (config units), in
+        # priority order:
+        #   1. options["ic_override"] -> exact IC (frozen test-set replay)
+        #   2. dispersion on          -> sample around nominal via the RNG
+        #   3. otherwise              -> nominal IC
+        options = options or {}
+        use_dispersion = options.get("dispersion", self.dispersion)
+        if options.get("ic_override"):
+            self._ic_drawn = {**self._ic_nominal, **dict(options["ic_override"])}
+        elif use_dispersion:
+            self._ic_drawn = mission_config.sample_dispersed_ic(self.cfg, self._rng)
+        else:
+            self._ic_drawn = dict(self._ic_nominal)
+        self._x0 = mission_config.initial_state_vector_from_ic(
+            self._ic_drawn, self._radius_earth)
+
         self.control.reset()
         self.rcs.reset()
         self._reset_episode_state()
@@ -401,6 +425,8 @@ class OrionEntryEnv(gym.Env):
             "success": bool(terminal and outcome == "drogue" and
                             self._great_circle_miss_km() < self.target_radius_km),
             "controller_mode": self.controller_mode,
+            "dispersed": bool(self.dispersion),
+            "ic": dict(self._ic_drawn),
         }
 
 

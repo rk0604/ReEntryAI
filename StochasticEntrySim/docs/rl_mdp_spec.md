@@ -143,8 +143,11 @@ distributions (Phase 3).
 
 ## 5. Evaluation protocol (fairness rules)
 
-1. **Held-out test set** — a frozen set of ~1,000 dispersed seeds, never used in
-   training. Both controllers run on exactly these conditions.
+1. **Held-out test set** — a frozen set of 1,000 dispersed ICs
+   (`configs/heldout_testset.csv`, built by `make_test_set.py` from fixed seed
+   `20260604`), never used in training. The IC *values* are frozen (not just the
+   seed), and both controllers replay the exact same conditions via
+   `env.reset(options={"ic_override": row})`.
 2. **Same observations / same action authority / same physics / same metrics.**
 3. **Strong baseline** — the predictor-corrector must be the tuned, bank-reversal
    version (done), not a crippled one.
@@ -183,9 +186,9 @@ the baseline (Phase 3), which can be done locally and uploaded.
 | Phase | Deliverable | Status |
 |---|---|---|
 | **0** | This MDP spec | ✅ done |
-| 1 | `rl_env.py` — `OrionEntryEnv(gymnasium.Env)`; validate by running the existing predictor-corrector through it | ⬜ next |
-| 2 | IC dispersion in `mission_config` + frozen held-out test set | ⬜ |
-| 3 | Baseline characterization (predictor-corrector on test set) | ⬜ |
+| 1 | `rl_env.py` — `OrionEntryEnv(gymnasium.Env)`; validate by running the existing predictor-corrector through it | ✅ done |
+| 2 | IC dispersion in `mission_config` + frozen held-out test set (`make_test_set.py`, `configs/heldout_testset.csv`) | ✅ done |
+| 3 | Baseline characterization (predictor-corrector on test set) | ⬜ next |
 | 4 | RL training (PPO/SAC, Colab, W&B) | ⬜ |
 | 5 | Fair evaluation + Pareto comparison | ⬜ |
 
