@@ -32,6 +32,64 @@ def mach_from_V_T(V_mps, T_K, gamma=SPEED_OF_SOUND_GAMMA, R=R_AIR_DRY_J_KG_K):
     return float(V_mps) / math.sqrt(gamma * R * float(T_K))
 
 
+def _pymsis_state(h_m, lat_deg, lon_deg, date, f107, f107a, ap):
+    """Raw PyMSIS query -> (rho_kgm3, T_K). Index 0 = density, 10 = temperature."""
+    if date is None:
+        date = datetime.datetime(2026, 1, 1, 0, 0, 0)
+    h_m = max(0.0, float(h_m))
+    h_km = h_m / 1000.0
+    if h_km > 1000.0:
+        return 0.0, float("nan")
+    if _PYMSIS_BACKEND == "calculate":
+        out = _np.squeeze(_pymsis_calculate(
+            date, lon_deg, lat_deg, h_km, f107, f107a, [[ap] * 7], version=0))
+        return float(out[0]), float(out[10])
+    if _PYMSIS_BACKEND == "msis":
+        out = _np.squeeze(_pymsis_msis.run(
+            date, lon_deg, lat_deg, h_km, f107, f107a, ap, version=0))
+        return float(out[0]), float(out[10])
+    raise RuntimeError("PyMSIS is missing. Please install it with: pip install pymsis")
+
+
+# --- Fast tabulated atmosphere -----------------------------------------------
+# PyMSIS is the per-step bottleneck (~7 ms/query, called ~12-20x per guidance
+# step). For RL training we precompute density + temperature on a fine altitude
+# grid ONCE and interpolate (log-density vs altitude, accurate for the ~12
+# orders-of-magnitude density span). This is ~100-1000x faster. The table is at
+# a single nominal lat/lon/date, so it drops lat/lon atmospheric variation --
+# acceptable for training; use full PyMSIS (table disabled) for final eval.
+_ATM_TABLE = None  # dict: alt_grid_m, log_rho, T_K, alt_max_m
+
+
+def build_atmosphere_table(alt_max_m=160_000.0, dz_m=100.0,
+                           lat_deg=0.0, lon_deg=0.0, date=None,
+                           f107=150.0, f107a=150.0, ap=7.0):
+    """Precompute the (rho, T) altitude table and switch lookups to it.
+    Returns the number of PyMSIS samples taken."""
+    global _ATM_TABLE
+    alts = _np.arange(0.0, float(alt_max_m) + float(dz_m), float(dz_m))
+    rho = _np.empty_like(alts)
+    T = _np.empty_like(alts)
+    for i, a in enumerate(alts):
+        r, t = _pymsis_state(float(a), lat_deg, lon_deg, date, f107, f107a, ap)
+        rho[i] = max(float(r), 1.0e-30)
+        T[i] = float(t) if t == t else 0.0  # NaN guard
+    _ATM_TABLE = {
+        "alt": alts, "log_rho": _np.log(rho), "T": T, "alt_max": float(alts[-1]),
+    }
+    return int(len(alts))
+
+
+def disable_atmosphere_table():
+    """Revert to full PyMSIS queries (high-fidelity, slow)."""
+    global _ATM_TABLE
+    _ATM_TABLE = None
+
+
+def atmosphere_table_active() -> bool:
+    return _ATM_TABLE is not None
+
+
 def get_atmosphere_state(
     h_m,
     lat_deg=0.0,
@@ -44,32 +102,20 @@ def get_atmosphere_state(
     """
     Return (rho_kgm3, T_K) at the given geodetic altitude.
 
-    PyMSIS gives 11 outputs per query — index 0 is total mass density and
-    index 10 is temperature in K. We grab both in one call rather than
-    paying the PyMSIS round-trip twice when both are needed.
-
-    Above 1000 km the model is out of validity, so we return vacuum
-    (rho = 0, T = nan).
+    If a precomputed table is active (build_atmosphere_table), interpolate it
+    (log-density vs altitude) -- ~100-1000x faster than PyMSIS. Otherwise query
+    PyMSIS directly. Above 1000 km: vacuum (rho=0, T=nan).
     """
-    if date is None:
-        date = datetime.datetime(2026, 1, 1, 0, 0, 0)
-
     h_m = max(0.0, float(h_m))
-    h_km = h_m / 1000.0
-
-    if h_km > 1000.0:
-        return 0.0, float("nan")
-
-    if _PYMSIS_BACKEND == "calculate":
-        out = _np.squeeze(_pymsis_calculate(
-            date, lon_deg, lat_deg, h_km, f107, f107a,
-            [[ap] * 7], version=0))
-        return float(out[0]), float(out[10])
-    if _PYMSIS_BACKEND == "msis":
-        out = _np.squeeze(_pymsis_msis.run(
-            date, lon_deg, lat_deg, h_km, f107, f107a, ap, version=0))
-        return float(out[0]), float(out[10])
-    raise RuntimeError("PyMSIS is missing. Please install it with: pip install pymsis")
+    if _ATM_TABLE is not None:
+        if h_m / 1000.0 > 1000.0:
+            return 0.0, float("nan")
+        tbl = _ATM_TABLE
+        h = min(h_m, tbl["alt_max"])
+        rho = math.exp(float(_np.interp(h, tbl["alt"], tbl["log_rho"])))
+        T = float(_np.interp(h, tbl["alt"], tbl["T"]))
+        return rho, (T if T > 0.0 else float("nan"))
+    return _pymsis_state(h_m, lat_deg, lon_deg, date, f107, f107a, ap)
 
 
 def get_atmosphere_density(

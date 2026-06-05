@@ -93,8 +93,17 @@ class RCSThruster:
         return self.direction_b_unit * (self.max_thrust_N * duty)
 
     def body_torque(self, duty: float) -> np.ndarray:
-        # Torque equals position cross force in body coordinates
-        return np.cross(self.position_b_m, self.body_force(duty))
+        # Torque = position x force in body coordinates. We compute the 3-vector
+        # cross product by hand: np.cross() carries huge per-call overhead
+        # (moveaxis / normalize_axis_tuple) and, called ~1e6x per episode, was
+        # ~75% of total runtime. The explicit form is ~100x faster here.
+        r = self.position_b_m
+        f = self.body_force(duty)
+        return np.array([
+            r[1] * f[2] - r[2] * f[1],
+            r[2] * f[0] - r[0] * f[2],
+            r[0] * f[1] - r[1] * f[0],
+        ])
 
 
 @dataclass

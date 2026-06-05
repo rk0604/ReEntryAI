@@ -2,3 +2,7 @@ re_entry_ai_research/
 research/
 StochasticEntrySim/data_intv
 StochasticEntrySim/data
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
