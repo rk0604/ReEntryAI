@@ -1,0 +1,64 @@
+{
+  "run_id": "scenario_a_lunar",
+  "run_name": "Scenario A: lunar return 10.5 km/s steep entry (30 g)",
+  "output_dir": "runs/scenario_a_lunar",
+  "seed": 42,
+  "initial_state": {
+    "altitude_m": 300000.0,
+    "velocity_mps": 10500.0,
+    "gamma_deg": -12.0,
+    "chi_deg": 45.99,
+    "phi_deg": 0.0,
+    "lambda_deg": 0.0
+  },
+  "aerodynamics": {
+    "model": "orion_cm_trim",
+    "cd_const": 1.15,
+    "cl_const": 0.28
+  },
+  "cpas": {
+    "enable_stochastic_failure": true,
+    "main_failure_probability_per_chute": 0.00241,
+    "num_mains_operational": 3,
+    "fbc_jettison_alt_m": 8500.0,
+    "fbc_mass_shed_kg": 150.0,
+    "drogue_deploy_alt_m": 7600.0,
+    "drogue_deploy_max_speed_mps": 250.0,
+    "drogue_cd": 0.5,
+    "drogue_ref_area_m2": 76.0,
+    "pilot_deploy_alt_m": 2900.0,
+    "pilot_cd": 0.6,
+    "pilot_ref_area_m2": 26.0,
+    "main_deploy_alt_m": 2400.0,
+    "main_cd": 0.85,
+    "main_ref_area_m2": 2950.0,
+    "wind_east_mps": 5.0,
+    "wind_north_mps": 2.0,
+    "pendulum_target_amplitude_deg": 25.0,
+    "pendulum_period_s": 8.0,
+    "pendulum_limit_cycle_strength": 0.3,
+    "squid_probability_per_second": 0.005,
+    "squid_duration_s": 1.5,
+    "squid_area_fraction": 0.2
+  },
+  "guidance": {
+    "gamma_safety_threshold_deg": 30.0,
+    "candidate_bank_magnitudes_deg": [
+      0,
+      25,
+      45,
+      70,
+      90
+    ]
+  },
+  "interval_supervisor": {
+    "heat_rate_limit_w_per_m2": 15000000.0,
+    "heat_load_limit_j_per_m2": 2500000000.0,
+    "cos_gamma_safety": 0.2
+  },
+  "mission": {
+    "target_phi_deg": 15.0,
+    "target_lambda_deg": 15.0,
+    "cos_gamma_termination_gate": 0.05
+  }
+}

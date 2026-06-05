@@ -1,13 +1,13 @@
 {
   "run_id":     "default",
-  "run_name":   "Baseline Orion CM entry (matches in-code defaults)",
+  "run_name":   "Scenario B: orbital LEO-return entry (7.8 km/s, survivable g)",
   "output_dir": "revision_v1",
   "seed":       42,
 
   "initial_state": {
-    "altitude_m":   300000.0,
-    "velocity_mps": 10500.0,
-    "gamma_deg":    -12.0,
+    "altitude_m":   120000.0,
+    "velocity_mps": 7800.0,
+    "gamma_deg":    -2.5,
     "chi_deg":      45.99,
     "phi_deg":      0.0,
     "lambda_deg":   0.0
