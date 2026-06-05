@@ -97,8 +97,9 @@ print("observation features:", rl_env.OBS_NAMES)
 """)
 
 code(r"""
-# (Optional) Mount Google Drive for persistent checkpoints + logs.
-# Skip this cell if you don't want Drive; artifacts then live in the Colab VM.
+# Persist everything we generate to Google Drive under MyDrive/ReEntryAI so it
+# survives Colab disconnects (and so the cache/resume cells below can reuse it).
+# Set USE_DRIVE = False to keep artifacts only in the ephemeral Colab VM.
 USE_DRIVE = True
 if USE_DRIVE:
     from google.colab import drive
@@ -106,8 +107,16 @@ if USE_DRIVE:
     ARTIFACT_DIR = "/content/drive/MyDrive/ReEntryAI"
 else:
     ARTIFACT_DIR = "/content/ReEntryAI_artifacts"
-os.makedirs(ARTIFACT_DIR, exist_ok=True)
+
+# Subfolders for the different artifact kinds.
+DATA_DIR  = f"{ARTIFACT_DIR}/data"          # metrics CSVs (baseline, policy)
+CKPT_DIR  = f"{ARTIFACT_DIR}/checkpoints"   # periodic SB3 checkpoints (resume)
+MODEL_DIR = f"{ARTIFACT_DIR}/models"        # final saved models
+TB_DIR    = f"{ARTIFACT_DIR}/tb"            # tensorboard logs
+for d in (ARTIFACT_DIR, DATA_DIR, CKPT_DIR, MODEL_DIR, TB_DIR):
+    os.makedirs(d, exist_ok=True)
 print("artifacts ->", ARTIFACT_DIR)
+!ls -la "{ARTIFACT_DIR}"
 """)
 
 # ---------------------------------------------------------------------------
@@ -149,18 +158,23 @@ Start with a subset (`LIMIT`) to estimate wall-time, then run the full set.
 """)
 
 code(r"""
-import run_baseline, multiprocessing, shutil
+import run_baseline, multiprocessing
 from pathlib import Path
 
-LIMIT   = 50                       # set to None for the full 1,000-case set
-WORKERS = multiprocessing.cpu_count()
-BASE_OUT = Path(ARTIFACT_DIR) / "baseline_metrics.csv"
+LIMIT         = 50                 # set to None for the full 1,000-case set
+WORKERS       = multiprocessing.cpu_count()
+FORCE_BASELINE = False             # True = recompute even if the cache exists
+BASE_OUT = Path(DATA_DIR) / "baseline_metrics.csv"
 
-rows = run_baseline.run_batch(
-    config_path="configs/default.json",
-    test_set_path="configs/heldout_testset.csv",
-    out_path=BASE_OUT, limit=LIMIT, workers=WORKERS, fast_atmosphere=True)
-print("baseline metrics ->", BASE_OUT)
+# Cache: skip the (slow) baseline if it's already on Drive.
+if BASE_OUT.exists() and not FORCE_BASELINE:
+    print(f"[cache] baseline already exists -> {BASE_OUT} (set FORCE_BASELINE=True to redo)")
+else:
+    run_baseline.run_batch(
+        config_path="configs/default.json",
+        test_set_path="configs/heldout_testset.csv",
+        out_path=BASE_OUT, limit=LIMIT, workers=WORKERS, fast_atmosphere=True)
+    print("baseline metrics ->", BASE_OUT)
 """)
 
 code(r"""
@@ -238,26 +252,51 @@ class MissionMetrics(BaseCallback):
 """)
 
 code(r"""
-run = wandb.init(project="ReEntryAI", name=RUN_NAME, sync_tensorboard=True,
+import glob, re
+
+# Resume from W&B (same run id) so curves continue across Colab disconnects.
+run = wandb.init(project="ReEntryAI", id=RUN_NAME, name=RUN_NAME, resume="allow",
+                 sync_tensorboard=True,
                  config={"total_steps": TOTAL_STEPS, "n_envs": N_ENVS,
                          "algo": "PPO", "w_range": 1.0e-3})
 
 vec = SubprocVecEnv([make_env(i) for i in range(N_ENVS)])
 
-model = PPO("MlpPolicy", vec, verbose=1, device="auto",
-            n_steps=1024, batch_size=4096, gamma=0.999, gae_lambda=0.95,
-            ent_coef=0.0, learning_rate=3e-4,
-            tensorboard_log=f"{ARTIFACT_DIR}/tb/{run.id}")
+# Cache/resume: pick up the latest checkpoint on Drive if one exists.
+def _latest_checkpoint(d):
+    cks = glob.glob(f"{d}/ppo_*_steps.zip")
+    if not cks:
+        return None, 0
+    def steps(p):
+        m = re.search(r"ppo_(\d+)_steps", p); return int(m.group(1)) if m else 0
+    latest = max(cks, key=steps)
+    return latest, steps(latest)
+
+ckpt_run_dir = f"{CKPT_DIR}/{RUN_NAME}"
+os.makedirs(ckpt_run_dir, exist_ok=True)
+resume_path, done_steps = _latest_checkpoint(ckpt_run_dir)
+
+if resume_path:
+    print(f"[resume] loading checkpoint {resume_path} ({done_steps} steps done)")
+    model = PPO.load(resume_path, env=vec, device="auto",
+                     tensorboard_log=f"{TB_DIR}/{RUN_NAME}")
+else:
+    print("[fresh] no checkpoint found; starting a new run")
+    model = PPO("MlpPolicy", vec, verbose=1, device="auto",
+                n_steps=1024, batch_size=4096, gamma=0.999, gae_lambda=0.95,
+                ent_coef=0.0, learning_rate=3e-4,
+                tensorboard_log=f"{TB_DIR}/{RUN_NAME}")
 
 ckpt = CheckpointCallback(save_freq=max(1, 50_000 // N_ENVS),
-                          save_path=f"{ARTIFACT_DIR}/checkpoints/{run.id}",
-                          name_prefix="ppo")
+                          save_path=ckpt_run_dir, name_prefix="ppo")
 cbs = [WandbCallback(gradient_save_freq=0, verbose=1), MissionMetrics(), ckpt]
 
-model.learn(total_timesteps=TOTAL_STEPS, callback=cbs, progress_bar=True)
-model.save(f"{ARTIFACT_DIR}/{RUN_NAME}_final")
+remaining = max(0, TOTAL_STEPS - done_steps)
+model.learn(total_timesteps=remaining, callback=cbs, progress_bar=True,
+            reset_num_timesteps=(resume_path is None))
+model.save(f"{MODEL_DIR}/{RUN_NAME}_final")
 vec.close()
-print("training done ->", f"{ARTIFACT_DIR}/{RUN_NAME}_final.zip")
+print("training done ->", f"{MODEL_DIR}/{RUN_NAME}_final.zip")
 """)
 
 # ---------------------------------------------------------------------------
@@ -274,7 +313,7 @@ from stable_baselines3 import PPO
 import pandas as pd
 
 EVAL_LIMIT = None                      # None = all 1,000 held-out cases
-model = PPO.load(f"{ARTIFACT_DIR}/{RUN_NAME}_final")
+model = PPO.load(f"{MODEL_DIR}/{RUN_NAME}_final")
 
 # Single deterministic env (no dispersion sampling; ICs come from the test set).
 eval_env = rl_env.OrionEntryEnv(controller_mode="policy", dispersion=False)
@@ -297,15 +336,16 @@ for i, ic in enumerate(cases):
         print(f"  [{i+1}/{len(cases)}]")
 
 policy_df = pd.DataFrame(rows)
-policy_df.to_csv(f"{ARTIFACT_DIR}/policy_metrics.csv", index=False)
+policy_df.to_csv(f"{DATA_DIR}/policy_metrics.csv", index=False)
+print("policy metrics -> %s/policy_metrics.csv" % DATA_DIR)
 print("policy success rate: %.1f%%" % (100.0 * policy_df["success"].mean()))
 """)
 
 code(r"""
 # Head-to-head comparison (RL vs classical) on identical conditions
 import pandas as pd
-base_df   = pd.read_csv(f"{ARTIFACT_DIR}/baseline_metrics.csv")
-policy_df = pd.read_csv(f"{ARTIFACT_DIR}/policy_metrics.csv")
+base_df   = pd.read_csv(f"{DATA_DIR}/baseline_metrics.csv")
+policy_df = pd.read_csv(f"{DATA_DIR}/policy_metrics.csv")
 
 def summary(df):
     return pd.Series({

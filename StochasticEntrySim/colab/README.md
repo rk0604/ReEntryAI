@@ -24,3 +24,23 @@ here, not on the local machine.
 
 Set `Runtime → GPU`. Throughput is CPU-bound (the env step), so more vCPUs help
 training more than the GPU does.
+
+### Persistence & caching (survives Colab disconnects)
+Everything is written to **`MyDrive/ReEntryAI/`** on Google Drive:
+
+```
+MyDrive/ReEntryAI/
+  data/         baseline_metrics.csv, policy_metrics.csv
+  checkpoints/  periodic PPO checkpoints  (training auto-resumes from the latest)
+  models/       final saved models
+  tb/           tensorboard logs
+```
+
+Caching means heavy compute isn't repeated:
+- **Baseline** — skipped if `data/baseline_metrics.csv` already exists
+  (`FORCE_BASELINE=True` to recompute).
+- **Training** — auto-resumes from the newest checkpoint in `checkpoints/`, and
+  the W&B run (`resume="allow"`) continues the same curves.
+- **In-sim** — each worker builds the atmosphere lookup table once and reuses it
+  (the optimization that made runs fast in the first place).
+
