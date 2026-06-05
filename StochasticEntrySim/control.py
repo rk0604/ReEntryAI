@@ -421,6 +421,16 @@ class SimpleBankGuidance:
     # Golden-section iterations (≈ this many + 2 rollout evals per cycle).
     sigma_search_iters: int = 16
 
+    # --- Bank-reversal logic (Apollo / Lu 2014) ---
+    # The bank MAGNITUDE comes from the predictor; the SIGN is set by a
+    # reversal logic with a velocity-dependent deadband. The sign is HELD
+    # until the heading error crosses the deadband on the opposite side,
+    # then reversed -- hysteresis that prevents the sign chatter a naive
+    # sign(heading_error) rule produces. Without this the bank sign flips at
+    # every zero-crossing, slewing the actuator through large reversals and
+    # bleeding range erratically. Set False to fall back to the naive rule.
+    use_bank_reversal: bool = True
+
     # Candidate bank grid in degrees.
     candidate_bank_deg: List[float] = field(
         default_factory=lambda: list(constants.PREDICTOR_CANDIDATE_BANK_DEG)
@@ -455,6 +465,8 @@ class SimpleBankGuidance:
         init=False,
         repr=False,
     )
+    # Held bank sign for the reversal logic (0 = not yet set).
+    _current_bank_sign: float = field(default=0.0, init=False, repr=False)
 
     def reset(self) -> None:
         """
@@ -462,6 +474,7 @@ class SimpleBankGuidance:
         """
         self._prediction_context = GuidancePredictionContext()
         self._last_debug = {}
+        self._current_bank_sign = 0.0
 
     def set_prediction_context(
         self,
@@ -592,6 +605,45 @@ class SimpleBankGuidance:
 
         # If both are exactly zero, return zero so a zero bank candidate can win.
         return float(bank_sign)
+
+    def _bank_sign_with_reversal(
+        self,
+        heading_offset_psi_rad: float,
+        heading_error_rad: float,
+        V_mps: float,
+    ) -> float:
+        """
+        Apollo / Lu 2014 bank-reversal logic with a velocity-dependent deadband.
+
+        The bank SIGN steers crossrange. Rather than recompute the sign from
+        the instantaneous heading error every cycle (which flips at every
+        zero-crossing -> chatter -> large actuator reversals -> erratic range
+        bleed), we HOLD the current sign and only reverse when the heading
+        error crosses the deadband on the opposite side. The deadband is wide
+        at high speed (few reversals) and narrows near the end (tight
+        tracking), reusing the existing velocity schedule.
+
+            heading_offset_psi >  +deadband  -> target decisively left  -> s = -1
+            heading_offset_psi <  -deadband  -> target decisively right -> s = +1
+            |heading_offset_psi| <= deadband -> HOLD current sign (hysteresis)
+        """
+        deadband = self.heading_deadband_rad(float(V_mps))
+        psi = float(heading_offset_psi_rad)
+
+        if psi > deadband:
+            self._current_bank_sign = -1.0
+        elif psi < -deadband:
+            self._current_bank_sign = +1.0
+        # else: inside the deadband -> hold the current sign (no reversal)
+
+        # First cycle (or if we start inside the deadband): seed from the
+        # instantaneous best sign so we don't sit at zero bank.
+        if self._current_bank_sign == 0.0:
+            self._current_bank_sign = self._bank_sign_from_heading_offset(
+                heading_error_rad=heading_error_rad,
+                heading_offset_psi_rad=psi,
+            )
+        return float(self._current_bank_sign)
 
     def _candidate_magnitude_list_deg(self, heading_error_rad: float, deadband_rad: float) -> List[float]:
         """
@@ -938,11 +990,22 @@ class SimpleBankGuidance:
             self._last_debug["chosen_sigma_mag_deg"] = 0.0
             return 0.0
 
-        # Determine commanded bank sign from the heading offset logic.
-        bank_sign = self._bank_sign_from_heading_offset(
-            heading_error_rad=heading_error_rad,
-            heading_offset_psi_rad=heading_offset_psi_rad,
-        )
+        # Determine commanded bank sign. With bank reversal enabled the sign
+        # is held through a velocity-dependent deadband and only reversed when
+        # the heading error decisively crosses it (Apollo / Lu 2014); this is
+        # what makes the classical baseline competent. Otherwise fall back to
+        # the naive instantaneous-sign rule.
+        if self.use_bank_reversal:
+            bank_sign = self._bank_sign_with_reversal(
+                heading_offset_psi_rad=heading_offset_psi_rad,
+                heading_error_rad=heading_error_rad,
+                V_mps=float(state.V_mps),
+            )
+        else:
+            bank_sign = self._bank_sign_from_heading_offset(
+                heading_error_rad=heading_error_rad,
+                heading_offset_psi_rad=heading_offset_psi_rad,
+            )
 
         # Continuous predictor-corrector path (Lu 2014, Fixes 1 + 2): solve
         # the bank magnitude that minimizes predicted terminal miss distance.

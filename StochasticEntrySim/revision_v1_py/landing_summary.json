@@ -1,14 +1,14 @@
 {
   "termination_reason": "nominal_ground_reached",
-  "final_t_s": 800.5,
-  "final_alt_km": 0.0016482603782787919,
-  "final_V_mps": 7.432997087222658,
-  "final_gamma_deg": -90.00000001035691,
-  "final_chi_deg": 44.74040507888907,
-  "final_phi_deg": 13.01186393123882,
-  "final_lam_deg": 12.872984713494414,
-  "cpas_drogue_deploy_t_s": 452.0,
-  "cpas_pilot_deploy_t_s": 517.0,
-  "cpas_main_deploy_t_s": 524.5,
-  "cpas_landed_t_s": 800.75
+  "final_t_s": 849.75,
+  "final_alt_km": 0.00045751247834414243,
+  "final_V_mps": 7.420129377661095,
+  "final_gamma_deg": -90.00000000788994,
+  "final_chi_deg": 13.474028588009286,
+  "final_phi_deg": 15.058889027948014,
+  "final_lam_deg": 14.983847012725665,
+  "cpas_drogue_deploy_t_s": 500.25,
+  "cpas_pilot_deploy_t_s": 565.5,
+  "cpas_main_deploy_t_s": 573.0,
+  "cpas_landed_t_s": 850.0
 }
