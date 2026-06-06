@@ -197,9 +197,15 @@ md(r"""
 already normalized in the env, so no `VecNormalize` is needed. We run several
 envs in parallel (`SubprocVecEnv`) because the bottleneck is CPU-side physics.
 
-**Reward note:** the env's default `w_range` (1e-5 / m) makes the terminal miss
-penalty small next to the +50 on-target bonus. We pass a stronger `w_range`
-here for a denser gradient toward the target — tune this.
+**Reward:** the env now uses **dense progress shaping** (`w_progress_per_km`,
+default 0.05) — reward per km of range-to-target closed each step — so the
+agent gets a continuous "warmer/colder" signal instead of a single terminal
+miss. We also pass a stronger `w_range` (terminal miss penalty) than the env
+default. Watch `ep/miss_km`; if it stalls, raise `w_progress_per_km`.
+
+> ⚠️ **Changing the reward invalidates old checkpoints.** Use a NEW `RUN_NAME`
+> whenever you change reward/hyperparameters, or the resume logic will reload
+> the old policy and skip training. (That's why this notebook ships `..._v2`.)
 """)
 
 code(r"""
@@ -216,7 +222,9 @@ from wandb.integration.sb3 import WandbCallback
 
 N_ENVS   = max(1, multiprocessing.cpu_count())
 TOTAL_STEPS = 1_000_000
-RUN_NAME = "ppo_orion_entry"
+# Bump this whenever you change the reward/hyperparameters -> fresh checkpoints
+# + a clean W&B curve (otherwise resume reloads the old policy and skips).
+RUN_NAME = "ppo_orion_entry_v2"
 
 # Stronger miss penalty than the env default for a trainable gradient.
 REWARD_WEIGHTS = telemetry.RewardWeights(w_range=1.0e-3)
@@ -249,7 +257,8 @@ class MissionMetrics(BaseCallback):
                     "ep/success":        float(info.get("success", False)),
                     "ep/return":         info["episode"]["r"],
                     "ep/length":         info["episode"]["l"],
-                }, step=self.num_timesteps)
+                    "global_step":       self.num_timesteps,
+                })   # no explicit step= : tensorboard syncing owns the step
         return True
 """)
 
