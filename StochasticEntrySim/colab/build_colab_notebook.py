@@ -65,13 +65,15 @@ print("CPUs:", multiprocessing.cpu_count())
 """)
 
 code(
-    "# Clone the repo (re-clone fresh each session)\n"
+    "# Clone the repo, or pull the latest if it's already here (so code fixes\n"
+    "# pushed to main show up without deleting the runtime).\n"
     "import os\n"
     f'REPO_URL = "{REPO_URL}"\n'
     'if not os.path.isdir("ReEntryAI"):\n'
     "    !git clone --depth 1 {REPO_URL}\n"
     "else:\n"
-    '    print("repo already cloned")'
+    "    !git -C ReEntryAI pull --ff-only\n"
+    '    print("pulled latest")'
 )
 
 code(r"""

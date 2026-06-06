@@ -138,11 +138,17 @@ class OrionEntryEnv(gym.Env):
         reward_weights: Optional[telemetry.RewardWeights] = None,
         fast_atmosphere: bool = True,
         dispersion: Optional[bool] = None,
+        w_progress_per_km: float = 0.05,
         seed: Optional[int] = None,
     ):
         super().__init__()
         if controller_mode not in ("policy", "baseline"):
             raise ValueError("controller_mode must be 'policy' or 'baseline'")
+        # Dense progress shaping: reward per km of range-to-target closed each
+        # step. Turns the otherwise-sparse (terminal-only) reward into a dense
+        # "warmer/colder" signal -- without it PPO can't credit-assign a single
+        # end-of-episode miss across the ~540 bank decisions in an episode.
+        self.w_progress_per_km = float(w_progress_per_km)
 
         # Fast tabulated atmosphere for RL throughput (~100x fewer PyMSIS
         # calls). Built once, module-global, shared across all env instances.
@@ -267,6 +273,8 @@ class OrionEntryEnv(gym.Env):
         self.peak_qdot = 0.0
         self._last_qdot = 0.0
         self._last_g = 0.0
+        # Range-to-target at the start of the episode, for progress shaping.
+        self._prev_range_km = self._great_circle_miss_km()
 
     # ------------------------------------------------------------------
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -397,14 +405,22 @@ class OrionEntryEnv(gym.Env):
         return float(2 * R * math.asin(min(1.0, math.sqrt(a))))
 
     def _reward(self, terminated: bool, outcome: str) -> Tuple[float, float]:
-        # Dense per-step shaping (heat / g / fuel).
+        miss_km = self._great_circle_miss_km()
+
+        # Dense per-step shaping (heat / g penalties -- only bite near limits).
         ing = telemetry.composite_reward(
-            range_to_go_m=self._great_circle_miss_km() * 1000.0,
+            range_to_go_m=miss_km * 1000.0,
             qdot_w_m2=self._last_qdot, load_factor_g=self._last_g,
             rcs_fuel_rate_kg_s=0.0, weights=self.reward_weights)
         r = ing["rew_heat_term"] + ing["rew_gload_term"]
 
-        miss_km = self._great_circle_miss_km()
+        # Dense progress shaping: reward range-to-target closed since last step
+        # (positive when getting closer, negative when drifting away). This is
+        # the signal that actually drives targeting; without it the reward is
+        # effectively terminal-only and PPO stalls at a large miss.
+        r += self.w_progress_per_km * (self._prev_range_km - miss_km)
+        self._prev_range_km = miss_km
+
         if terminated and outcome == "drogue":
             w = self.reward_weights
             r += -w.w_range * (miss_km * 1000.0)              # terminal miss
