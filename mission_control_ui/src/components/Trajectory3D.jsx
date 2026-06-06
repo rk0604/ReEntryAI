@@ -116,9 +116,9 @@ function EventMarkers({ events, points, times }) {
 function Capsule({ position, velocityDir, scale = 1 }) {
   const groupRef = useRef();
 
-  // coneGeometry's natural axis is +Y (apex at +Y, base at -Y).
-  // For heat-shield-forward flight, the BASE leads (faces +velocity)
-  // and the APEX trails. So +Y of the cone should point opposite to V.
+  // The capsule is a surface of revolution about +Y. Heat shield is at -Y
+  // (leading face), the conical afterbody runs up to +Y (trailing). For
+  // heat-shield-forward flight, +Y must point opposite the velocity vector.
   useFrame(() => {
     if (!groupRef.current || !velocityDir) return;
     const apex = velocityDir.clone().negate().normalize();
@@ -129,27 +129,63 @@ function Capsule({ position, velocityDir, scale = 1 }) {
     groupRef.current.quaternion.copy(q);
   });
 
-  // Squat Orion-ish proportions: ~5 m wide base, ~3 m tall
-  // (cone radius 80, height 60 in scene units works visually)
+  // Orion CM profile (radius, height) revolved into a lathe. Proportions
+  // follow the real vehicle: ~5 m heat-shield diameter, spherical-section
+  // shield, ~32.5deg conical afterbody to a rounded apex.
+  const { shieldPts, bodyPts } = useMemo(() => {
+    const Rs = 150;                       // heat-shield spherical radius
+    const Rmax = 90;                      // shoulder (rim) radius
+    const tMax = Math.asin(Rmax / Rs);    // rim half-angle
+    const yc = Rs * Math.cos(tMax);       // sphere centre so the rim sits at y=0
+    const yShift = -16;                   // roughly centre the body on the origin
+
+    const shield = [];
+    const N = 14;
+    for (let i = 0; i <= N; i++) {
+      const t = (i / N) * tMax;
+      shield.push(new THREE.Vector2(Rs * Math.sin(t), (yc - Rs * Math.cos(t)) + yShift));
+    }
+    // afterbody: shoulder round -> cone -> rounded top dome
+    const body = [
+      new THREE.Vector2(Rmax, 0 + yShift),
+      new THREE.Vector2(Rmax * 0.97, 5 + yShift),
+      new THREE.Vector2(Rmax * 0.86, 14 + yShift),
+      new THREE.Vector2(40, 48 + yShift),
+      new THREE.Vector2(30, 56 + yShift),
+      new THREE.Vector2(16, 62 + yShift),
+      new THREE.Vector2(0, 65 + yShift),
+    ];
+    return { shieldPts: shield, bodyPts: body };
+  }, []);
+
   return (
-    <group ref={groupRef} position={position}>
+    <group ref={groupRef} position={position} scale={scale}>
+      {/* conical afterbody — light metallic shell */}
       <mesh>
-        <coneGeometry args={[80 * scale, 60 * scale, 16]} />
+        <latheGeometry args={[bodyPts, 48]} />
         <meshStandardMaterial
-          color="#ff4d4d"
-          emissive="#ff4d4d"
-          emissiveIntensity={0.55}
-          roughness={0.4}
+          color="#d7dce2"
+          metalness={0.55}
+          roughness={0.45}
+          side={THREE.DoubleSide}
         />
       </mesh>
-      {/* glowing heat-shield disk at the base (anti-apex end) */}
-      <mesh position={[0, -30 * scale, 0]} rotation={[Math.PI / 2, 0, 0]}>
-        <ringGeometry args={[60 * scale, 90 * scale, 24]} />
-        <meshBasicMaterial color="#f6c043" transparent opacity={0.7} side={THREE.DoubleSide} />
-      </mesh>
+      {/* heat shield — dark ablator, glowing warm from entry heating */}
       <mesh>
-        <sphereGeometry args={[120 * scale, 16, 16]} />
-        <meshBasicMaterial color="#ff4d4d" transparent opacity={0.10} />
+        <latheGeometry args={[shieldPts, 48]} />
+        <meshStandardMaterial
+          color="#2e231d"
+          emissive="#ff5a1e"
+          emissiveIntensity={0.45}
+          metalness={0.1}
+          roughness={0.85}
+          side={THREE.DoubleSide}
+        />
+      </mesh>
+      {/* faint heat halo */}
+      <mesh>
+        <sphereGeometry args={[125, 16, 16]} />
+        <meshBasicMaterial color="#ff7a33" transparent opacity={0.06} />
       </mesh>
     </group>
   );

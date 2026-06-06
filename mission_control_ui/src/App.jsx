@@ -41,17 +41,20 @@ function downsample(trajectory, channelExtractor, maxPoints = 500) {
 function App() {
   const data = useMissionData();
 
-  // Pre-compute event markers shared by the plots
+  // Pre-compute event markers shared by the plots. Only the main parachute
+  // milestones -- reefing/disreef sub-stages cluster together and clutter the
+  // chart. Map raw event names to short, readable labels.
   const eventMarkers = useMemo(() => {
     if (data.status !== "ready") return [];
-    const majors = new Set([
-      "fbc_jettison", "drogue_deploy", "drogue_disreef",
-      "pilot_deploy", "main_deploy", "main_disreef_1", "main_disreef_2",
-      "landed",
-    ]);
+    const majorLabels = {
+      drogue_deploy: "Drogue",
+      pilot_deploy: "Pilot",
+      main_deploy: "Main",
+      landed: "Landed",
+    };
     return data.cpasEvents
-      .filter((e) => majors.has(e.event))
-      .map((e) => ({ t: e.t_s, label: e.event }));
+      .filter((e) => e.event in majorLabels)
+      .map((e) => ({ t: e.t_s, label: majorLabels[e.event] }));
   }, [data]);
 
   const altSeries  = useMemo(() => data.trajectory ? downsample(data.trajectory, r => (r.alt_m ?? 0) / 1000) : [], [data]);

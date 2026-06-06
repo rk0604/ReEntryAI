@@ -45,6 +45,21 @@ export default function TelemetryPlot({
     .map((d, i) => `${i === 0 ? "M" : "L"}${sx(d.x).toFixed(1)},${sy(d.y).toFixed(1)}`)
     .join(" ");
 
+  // Lay out event labels so close-together markers stack into separate rows
+  // instead of overlapping. Greedily place each label on the lowest row whose
+  // previous label has cleared LABEL_W pixels.
+  const LABEL_W = 46;
+  const rowLastX = [];
+  const eventRows = [...events]
+    .sort((a, b) => a.t - b.t)
+    .map((e) => {
+      const x = sx(e.t);
+      let row = rowLastX.findIndex((lx) => x - lx > LABEL_W);
+      if (row === -1) row = rowLastX.length;
+      rowLastX[row] = x;
+      return { ...e, x, row };
+    });
+
   // 5 y-axis tick marks
   const yTicks = Array.from({ length: 5 }, (_, i) =>
     yMin + (i / 4) * (yMax - yMin)
@@ -102,23 +117,29 @@ export default function TelemetryPlot({
           </text>
         ))}
 
-        {/* events */}
-        {events.map((e, i) => (
-          <g key={`ev-${i}`}>
-            <line
-              className="event-line"
-              x1={sx(e.t)} x2={sx(e.t)}
-              y1={padT} y2={H - padB}
-            />
-            <text
-              className="event-label"
-              x={sx(e.t) + 2}
-              y={padT + 8 + (i % 3) * 9}
-            >
-              {e.label}
-            </text>
-          </g>
-        ))}
+        {/* events (rows assigned to avoid label overlap) */}
+        {eventRows.map((e, i) => {
+          // Flip labels near the right edge so they sit left of the line
+          // instead of overflowing/clipping off the plot.
+          const flip = e.x > W - padR - LABEL_W;
+          return (
+            <g key={`ev-${i}`}>
+              <line
+                className="event-line"
+                x1={e.x} x2={e.x}
+                y1={padT} y2={H - padB}
+              />
+              <text
+                className="event-label"
+                x={flip ? e.x - 3 : e.x + 2}
+                y={padT + 8 + e.row * 10}
+                textAnchor={flip ? "end" : "start"}
+              >
+                {e.label}
+              </text>
+            </g>
+          );
+        })}
 
         {/* y axis label */}
         <text
