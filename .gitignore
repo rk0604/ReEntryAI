@@ -6,3 +6,5 @@ __pycache__/
 *.pyc
 *.pyo
 .ipynb_checkpoints/
+
+StochasticEntrySim/docs/_figs/
