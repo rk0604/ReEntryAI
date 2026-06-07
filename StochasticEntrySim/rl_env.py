@@ -46,7 +46,12 @@ from control import (
     ReentryState,
 )
 from ReactionControl import build_orion_cm_rcs_12
-from math_3d import nominal_aero_forces_from_state, nominal_heating_envelope_from_state
+from math_3d import (
+    nominal_aero_forces_from_state,
+    nominal_heating_envelope_from_state,
+    IntervalSupervisorConfig,
+    annotate_nominal_state_with_interval_supervisor,
+)
 from point_math_3d import make_initial_capsule_attitude, step_closed_loop_milestone1, aero_forces
 
 
@@ -85,6 +90,15 @@ OBS_NAMES = (
     "altitude_norm", "velocity_norm", "gamma_norm", "sin_chi", "cos_chi",
     "range_to_go_norm", "heading_error_norm", "cross_track_norm",
     "specific_energy_norm", "sigma_norm", "heat_margin", "g_margin", "hdot_norm",
+)
+
+# Extra interval (worst-case) features appended when interval_obs is enabled.
+# These come from the interval supervisor's guaranteed bounds, so the policy
+# can see how much uncertainty / worst-case margin it is carrying.
+INTERVAL_OBS_NAMES = (
+    "heat_margin_hi",   # (q_lim - qdot_hi) / q_lim  -- worst-case heat margin
+    "g_margin_hi",      # (n_lim - n_hi)   / n_lim   -- worst-case g margin
+    "box_width_norm",   # scalar summary of the state-box uncertainty
 )
 
 # Normalization scales (denominators).
@@ -139,11 +153,25 @@ class OrionEntryEnv(gym.Env):
         fast_atmosphere: bool = True,
         dispersion: Optional[bool] = None,
         w_progress_per_km: float = 0.05,
+        interval_obs: bool = False,
+        interval_reward: bool = False,
+        interval_shield: bool = False,
+        shield_horizon: int = 1,
         seed: Optional[int] = None,
     ):
         super().__init__()
         if controller_mode not in ("policy", "baseline"):
             raise ValueError("controller_mode must be 'policy' or 'baseline'")
+        # --- interval-arithmetic integration (3 independent, ablatable knobs) ---
+        #   interval_obs    : append worst-case interval features to the obs
+        #   interval_reward : penalize the interval UPPER BOUND on heat / g
+        #   interval_shield : veto unsafe bank commands via 1-step reachability
+        # Any of them turns on the per-step interval propagation (use_intervals).
+        self.interval_obs = bool(interval_obs)
+        self.interval_reward = bool(interval_reward)
+        self.interval_shield = bool(interval_shield)
+        self.shield_horizon = max(1, int(shield_horizon))
+        self.use_intervals = self.interval_obs or self.interval_reward or self.interval_shield
         # Dense progress shaping: reward per km of range-to-target closed each
         # step. Turns the otherwise-sparse (terminal-only) reward into a dense
         # "warmer/colder" signal -- without it PPO can't credit-assign a single
@@ -190,9 +218,19 @@ class OrionEntryEnv(gym.Env):
         self.drogue_alt_m = float(mission_config.build_cpas_config(self.cfg).drogue_deploy_alt_m)
         self.heat_rate_limit = float(constants.HEAT_RATE_LIMIT_DEFAULT)
 
-        # --- spaces ---
+        # Interval supervisor config (only used when use_intervals). Mirrors the
+        # one run_sim.py builds so the RL interval bounds match the classical
+        # controller's. Candidate bank set the shield can fall back to.
+        self.supervisor_cfg = self._build_supervisor_cfg() if self.use_intervals else None
+        self._shield_candidates_rad = sorted(
+            {math.radians(d) for d in (0.0, 25.0, 45.0, 70.0, 90.0)}
+            | {-math.radians(d) for d in (25.0, 45.0, 70.0, 90.0)})
+
+        # --- spaces (obs grows when interval features are appended) ---
+        self.obs_names = OBS_NAMES + (INTERVAL_OBS_NAMES if self.interval_obs else ())
         self.action_space = spaces.Box(-1.0, 1.0, shape=(1,), dtype=np.float32)
-        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(len(OBS_NAMES),), dtype=np.float32)
+        self.observation_space = spaces.Box(
+            -np.inf, np.inf, shape=(len(self.obs_names),), dtype=np.float32)
 
         # --- build the control stack (guidance depends on mode) ---
         self._build_control_stack()
@@ -273,6 +311,19 @@ class OrionEntryEnv(gym.Env):
         self.peak_qdot = 0.0
         self._last_qdot = 0.0
         self._last_g = 0.0
+        self._q_nom = 0.0           # nominal dynamic pressure (for the g bound)
+        # --- interval state (worst-case tube), maintained when use_intervals ---
+        self.x_interval = None              # current state box (None -> inflate)
+        self.interval_heat_shield = None    # interval heat-shield accumulator
+        self.interval_active = self.use_intervals
+        self._qdot_hi = 0.0         # worst-case heat rate this step (W/m^2)
+        self._g_hi = 0.0            # worst-case load factor this step (g)
+        self._box_width = 0.0       # scalar uncertainty summary
+        self.peak_qdot_hi = 0.0
+        self.peak_g_hi = 0.0
+        self.interval_violations = 0   # steps whose worst-case breached a limit
+        self.shield_interventions = 0  # steps where the shield overrode the policy
+        self.shield_steps = 0          # shield decision points evaluated
         # Range-to-target at the start of the episode, for progress shaping.
         self._prev_range_km = self._great_circle_miss_km()
 
@@ -314,14 +365,129 @@ class OrionEntryEnv(gym.Env):
         self._last_qdot = float(heat["qdot_total_stag"].hi)
         aero = nominal_aero_forces_from_state(
             x=self.x, sigma_rad=float(self.att.sigma_rel_rad), params=self.params)
+        rho = float(aero["rho_kgm3"])
+        V = float(self.x[3])
+        self._q_nom = 0.5 * rho * V * V        # nominal dynamic pressure (Pa)
         d = telemetry.compute_derived_metrics(
-            r_m=float(self.x[0]), V_mps=float(self.x[3]), altitude_m=self._alt(),
-            T_K=None, rho_kgm3=float(aero["rho_kgm3"]),
+            r_m=float(self.x[0]), V_mps=V, altitude_m=self._alt(),
+            T_K=None, rho_kgm3=rho,
             drag_mag_N=float(aero["drag_mag_N"]), lift_mag_N=float(aero["lift_mag_N"]),
             mass_kg=float(self.params["mass_kg"]))
         self._last_g = float(d["load_factor_g"])
         self.peak_g = max(self.peak_g, self._last_g)
         self.peak_qdot = max(self.peak_qdot, self._last_qdot)
+
+    # ================= interval-arithmetic integration ===================
+    def _build_supervisor_cfg(self) -> IntervalSupervisorConfig:
+        """Interval supervisor config, mirroring run_sim.py so the RL worst-case
+        bounds are computed exactly like the classical controller's."""
+        return IntervalSupervisorConfig(
+            r_half_width_m=10.0,
+            phi_half_width_rad=math.radians(0.01),
+            lam_half_width_rad=math.radians(0.01),
+            V_half_width_mps=20.0,
+            gamma_half_width_rad=math.radians(0.15),
+            chi_half_width_rad=math.radians(0.20),
+            min_altitude_m=0.0,
+            max_altitude_m=130_000.0,
+            max_speed_mps=80_000.0,
+            max_dynamic_pressure_pa=5.0e7,
+            include_heating=True,
+            heat_rate_limit=float(constants.HEAT_RATE_LIMIT_DEFAULT),
+            heat_load_limit=float(constants.HEAT_LOAD_LIMIT_DEFAULT),
+            interval_recenter_enabled=bool(constants.INTERVAL_RECENTER_ENABLED),
+            interval_recenter_cadence_s=float(constants.INTERVAL_RECENTER_CADENCE_S),
+            interval_recenter_width_thresholds=dict(constants.INTERVAL_RECENTER_WIDTH_THRESHOLDS),
+            interval_box_split_enabled=bool(constants.INTERVAL_BOX_SPLIT_ENABLED),
+            interval_box_split_max_depth=int(constants.INTERVAL_BOX_SPLIT_MAX_DEPTH),
+            interval_box_split_width_thresholds=dict(constants.INTERVAL_BOX_SPLIT_WIDTH_THRESHOLDS),
+            interval_denominator_safety_V_mps=float(constants.INTERVAL_DENOMINATOR_SAFETY_V_MPS),
+            interval_denominator_safety_cos_gamma=float(constants.INTERVAL_DENOMINATOR_SAFETY_COS_GAMMA),
+            interval_denominator_safety_cos_phi=float(constants.INTERVAL_DENOMINATOR_SAFETY_COS_PHI),
+        )
+
+    def _annotate(self, x_nominal, sigma_rad, x_interval, heat_shield):
+        """One interval-propagation step. Returns the IntervalAnnotationResult."""
+        return annotate_nominal_state_with_interval_supervisor(
+            x_nominal_old=list(x_nominal), params=self.params,
+            sigma_actual_after_rad=float(sigma_rad), x_interval_old=x_interval,
+            supervisor_cfg=self.supervisor_cfg, dt_s=float(self.dt_s),
+            heat_shield=heat_shield, t_s=float(self.t_s))
+
+    def _metrics_from_annotation(self, ann) -> Tuple[float, float, float]:
+        """Worst-case (qdot_hi [W/m^2], g_hi [g], box_width_scalar) from one
+        annotation. The heat bound is rigorous (supervisor); the g bound scales
+        the nominal load factor by the dynamic-pressure upper bound, assuming the
+        aero coefficient is ~constant over the (small) state box."""
+        qdot_hi = (float(ann.heating_qdot_max_interval.hi)
+                   if ann.heating_qdot_max_interval is not None else self._last_qdot)
+        q_hi = float(ann.q_interval.hi) if ann.q_interval is not None else self._q_nom
+        if self._q_nom > 1e-9 and self._last_g > 0.0:
+            g_hi = self._last_g * (q_hi / self._q_nom)
+        else:
+            g_hi = self._last_g
+        w = ann.state_widths_new or {}
+        # Scalar uncertainty summary: velocity + altitude box widths, normalized.
+        box_width = float(w.get("V", 0.0)) / 200.0 + float(w.get("r", 0.0)) / 2000.0
+        return qdot_hi, max(g_hi, self._last_g), box_width
+
+    def _interval_propagate(self, x_nominal_old, sigma_rad) -> None:
+        """Advance the interval tube one substep alongside the nominal state and
+        refresh the worst-case metrics. Deactivates intervals on failure."""
+        if not self.use_intervals or not self.interval_active:
+            return
+        ann = self._annotate(x_nominal_old, sigma_rad, self.x_interval,
+                             self.interval_heat_shield)
+        # Only a numerical failure kills the tube. A heat/g violation is a real
+        # worst-case signal we want to keep feeding to the obs / reward / shield.
+        if (not ann.interval_valid) or getattr(ann, "interval_numerical_failure", False):
+            self.interval_active = False
+            return
+        self.x_interval = [type(iv)(iv.lo, iv.hi) for iv in ann.x_interval_new]
+        self.interval_heat_shield = getattr(ann, "heat_shield", self.interval_heat_shield)
+        self._qdot_hi, self._g_hi, self._box_width = self._metrics_from_annotation(ann)
+        self.peak_qdot_hi = max(self.peak_qdot_hi, self._qdot_hi)
+        self.peak_g_hi = max(self.peak_g_hi, self._g_hi)
+        if self._qdot_hi > self.heat_rate_limit or self._g_hi > self.gload_limit_g:
+            self.interval_violations += 1
+
+    def _bank_is_safe(self, sigma_rad) -> bool:
+        """1-step reachability check: would commanding this bank keep the
+        worst-case heat rate and g within limits over the next substep?"""
+        if not self.interval_active:
+            return True   # no valid tube -> cannot veto
+        ann = self._annotate(self.x, sigma_rad, self.x_interval,
+                             self.interval_heat_shield)
+        if not ann.interval_valid:
+            return False
+        qdot_hi, g_hi, _ = self._metrics_from_annotation(ann)
+        return qdot_hi <= self.heat_rate_limit and g_hi <= self.gload_limit_g
+
+    def _shield(self, sigma_cmd_rad: float) -> Tuple[float, bool]:
+        """Interval safety shield. If the policy's bank passes the 1-step
+        reachability check, use it. Otherwise project to the nearest candidate
+        bank that is safe; if none is safe, pick the candidate with the lowest
+        worst-case heat (most conservative). Returns (bank, intervened)."""
+        self.shield_steps += 1
+        if self._bank_is_safe(sigma_cmd_rad):
+            return sigma_cmd_rad, False
+        # Search candidates ordered by closeness to the policy's command.
+        cands = sorted(self._shield_candidates_rad, key=lambda c: abs(c - sigma_cmd_rad))
+        for c in cands:
+            if self._bank_is_safe(c):
+                self.shield_interventions += 1
+                return c, True
+        # Nothing certified safe -> minimize worst-case heat as a fallback.
+        best_c, best_q = sigma_cmd_rad, float("inf")
+        for c in cands:
+            if not self.interval_active:
+                break
+            ann = self._annotate(self.x, c, self.x_interval, self.interval_heat_shield)
+            q_hi, _, _ = self._metrics_from_annotation(ann)
+            if q_hi < best_q:
+                best_q, best_c = q_hi, c
+        self.shield_interventions += 1
+        return best_c, True
 
     def _build_obs(self) -> np.ndarray:
         r, phi, lam, V, gamma, chi = [float(v) for v in self.x]
@@ -347,14 +513,26 @@ class OrionEntryEnv(gym.Env):
             (self.gload_limit_g - self._last_g) / self.gload_limit_g,
             hdot / _NORM["hdot"],
         ], dtype=np.float32)
+        if self.interval_obs:
+            interval_feats = np.array([
+                (self.heat_rate_limit - self._qdot_hi) / self.heat_rate_limit,
+                (self.gload_limit_g - self._g_hi) / self.gload_limit_g,
+                min(self._box_width, 5.0),   # clipped scalar uncertainty
+            ], dtype=np.float32)
+            feats = np.concatenate([feats, interval_feats])
         return feats
 
     # ------------------------------------------------------------------
     def step(self, action):
+        self._intervened_this_step = False
         if self.controller_mode == "policy":
             a = float(np.asarray(action).reshape(-1)[0])
             a = max(-1.0, min(1.0, a))
-            self.guidance.set_action(a * (math.pi / 2.0))
+            sigma_cmd = a * (math.pi / 2.0)
+            # Interval safety shield: veto/clip an unsafe bank before it flies.
+            if self.interval_shield:
+                sigma_cmd, self._intervened_this_step = self._shield(sigma_cmd)
+            self.guidance.set_action(sigma_cmd)
         # baseline mode: action ignored; the predictor computes sigma.
 
         terminated = False
@@ -363,6 +541,7 @@ class OrionEntryEnv(gym.Env):
         range_to_go_m = 0.0
 
         for _ in range(self.n_substeps):
+            x_old = list(self.x)
             sr = step_closed_loop_milestone1(
                 t_s=float(self.t_s), x_trans=list(self.x), att=self.att,
                 params=self.params, control_step_fn=self._control_step_fn,
@@ -378,6 +557,8 @@ class OrionEntryEnv(gym.Env):
             self.rcs_fuel_kg += telemetry.rcs_propellant_kg(tsec)
 
             self._update_aux_metrics()
+            # Advance the interval tube alongside the nominal state.
+            self._interval_propagate(x_old, float(sr.sigma_actual_after_rad))
 
             alt = self._alt()
             if alt <= self.drogue_alt_m:
@@ -408,9 +589,13 @@ class OrionEntryEnv(gym.Env):
         miss_km = self._great_circle_miss_km()
 
         # Dense per-step shaping (heat / g penalties -- only bite near limits).
+        # interval_reward penalizes the worst-case (interval upper bound) instead
+        # of the nominal point, so robustness to bounded uncertainty is learned.
+        qdot_pen = self._qdot_hi if (self.interval_reward and self.use_intervals) else self._last_qdot
+        g_pen = self._g_hi if (self.interval_reward and self.use_intervals) else self._last_g
         ing = telemetry.composite_reward(
             range_to_go_m=miss_km * 1000.0,
-            qdot_w_m2=self._last_qdot, load_factor_g=self._last_g,
+            qdot_w_m2=qdot_pen, load_factor_g=g_pen,
             rcs_fuel_rate_kg_s=0.0, weights=self.reward_weights)
         r = ing["rew_heat_term"] + ing["rew_gload_term"]
 
@@ -443,6 +628,16 @@ class OrionEntryEnv(gym.Env):
             "controller_mode": self.controller_mode,
             "dispersed": bool(self.dispersion),
             "ic": dict(self._ic_drawn),
+            # --- interval diagnostics (meaningful only when use_intervals) ---
+            "use_intervals": bool(self.use_intervals),
+            "interval_active": bool(self.interval_active),
+            "peak_qdot_hi_MWm2": float(self.peak_qdot_hi) / 1e6,
+            "peak_g_hi": float(self.peak_g_hi),
+            "interval_violations": int(self.interval_violations),
+            "shield_interventions": int(self.shield_interventions),
+            "shield_steps": int(self.shield_steps),
+            "shield_intervention_rate": (float(self.shield_interventions) / self.shield_steps
+                                         if self.shield_steps > 0 else 0.0),
         }
 
 

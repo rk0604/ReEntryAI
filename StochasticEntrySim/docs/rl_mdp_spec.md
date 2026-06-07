@@ -204,3 +204,50 @@ the baseline (Phase 3), which can be done locally and uploaded.
 - Load-factor limit `n_lim` (crewed: ~4 g nominal, ~8–10 g abort)
 - Dispersion ranges: γ, V, χ, lat/lon, wind, chute-failure (Phase 2)
 - Guidance cadence for the policy (start 1 Hz, matching the classical controller)
+
+---
+
+## 9. Interval-arithmetic integration (safety + performance)
+
+The simulator already carries an **interval supervisor** that propagates a
+guaranteed box of the state forward and bounds the worst-case heat rate, g, and
+corridor. Originally only the *classical* predictor-corrector used it; the RL
+policy was interval-blind. We now feed intervals into RL three independent,
+ablatable ways (all in `OrionEntryEnv`):
+
+1. **Interval observation** (`interval_obs`) — append worst-case features
+   (`heat_margin_hi`, `g_margin_hi`, `box_width_norm`) so the policy is
+   *uncertainty-aware*.
+2. **Interval reward** (`interval_reward`) — penalize the interval **upper
+   bound** on heat/g instead of the nominal point, so robustness to bounded
+   uncertainty is learned into the weights.
+3. **Interval safety shield** (`interval_shield`) — before a bank flies, a
+   **1-step interval reachability check** vetoes it if the worst-case breaches a
+   limit, projecting to the nearest safe candidate bank. The learned policy
+   proposes, the sound supervisor disposes.
+
+New `info` diagnostics: `peak_g_hi`, `interval_violations` (steps whose
+worst-case breached a limit), `shield_intervention_rate`.
+
+**Honest limits.** Interval bounds blow up over long horizons (wrapping), so the
+shield is a *short-horizon* (default 1-step) filter, rigorous for the
+*instantaneous* heat-rate and g limits, not a full-trajectory guarantee. The g
+bound scales the nominal load factor by the dynamic-pressure upper bound
+(assumes ~constant aero coefficient over the small box). Guarantees are
+conditional on the disturbance model (the supervisor half-widths).
+
+### Reframing the thesis
+From a bake-off ("can RL match the predictor-corrector?") to **safety +
+performance**: a *provably-safe RL surrogate* where the learned policy supplies
+adaptivity under dispersion/failures and interval reachability supplies
+**certified constraint satisfaction**. The contribution is the **hybrid**, which
+directly answers the main barrier to learned controllers in crewed aerospace
+GNC ("you can't certify a neural net"). Working title:
+*Interval-Shielded Reinforcement Learning for Safe Atmospheric Entry Guidance.*
+
+New evaluation axes beyond miss/g/heat/fuel: **constraint-violation rate**
+(certified-zero for the shielded policy) and **shield-intervention rate**
+(falls over training as the policy learns the safe envelope). Headline Pareto:
+performance vs interventions vs violations, with shielded RL ideally achieving
+classical-level safety and better adaptivity. The unshielded RL becomes the
+ablation that shows why the shield is needed.

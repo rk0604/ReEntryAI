@@ -206,6 +206,20 @@ default. Watch `ep/miss_km`; if it stalls, raise `w_progress_per_km`.
 > ⚠️ **Changing the reward invalidates old checkpoints.** Use a NEW `RUN_NAME`
 > whenever you change reward/hyperparameters, or the resume logic will reload
 > the old policy and skip training. (That's why this notebook ships `..._v2`.)
+
+**Interval ablation ladder.** The env exposes three independent interval knobs
+(`INTERVAL_OBS`, `INTERVAL_REWARD`, `INTERVAL_SHIELD`, set in the cell below).
+Run them as an ablation, each with its own `RUN_NAME`:
+1. all off — plain RL baseline
+2. `INTERVAL_OBS` — uncertainty-aware policy
+3. `+ INTERVAL_REWARD` — penalize the worst-case heat/g
+4. `+ INTERVAL_SHIELD` — provably-safe RL (1-step reachability veto)
+
+Watch `ep/interval_violations` (should fall toward zero) and
+`ep/shield_intervention_rate` (the policy learning the safe envelope). The
+shield makes constraint satisfaction certified rather than hoped-for, which is
+the core safety contribution. Note the shield is ~10x slower per step, so use it
+once the reward is tuned.
 """)
 
 code(r"""
@@ -229,13 +243,24 @@ RUN_NAME = "ppo_orion_entry_v2"
 # Stronger miss penalty than the env default for a trainable gradient.
 REWARD_WEIGHTS = telemetry.RewardWeights(w_range=1.0e-3)
 
+# --- Interval-arithmetic ablation switches (the 3 ways intervals enter RL) ---
+# Flip these to run the ablation ladder. Use a DISTINCT RUN_NAME per setting.
+#   INTERVAL_OBS    : append worst-case interval features to the observation
+#   INTERVAL_REWARD : penalize the interval upper bound on heat / g
+#   INTERVAL_SHIELD : veto unsafe banks via 1-step interval reachability
+INTERVAL_OBS    = False
+INTERVAL_REWARD = False
+INTERVAL_SHIELD = False
+
 def make_env(rank: int, seed: int = 0):
     def _init():
         import rl_env, telemetry
         e = rl_env.OrionEntryEnv(
             controller_mode="policy", dispersion=True,
             max_episode_steps=1400,
-            reward_weights=telemetry.RewardWeights(w_range=1.0e-3))
+            reward_weights=telemetry.RewardWeights(w_range=1.0e-3),
+            interval_obs=INTERVAL_OBS, interval_reward=INTERVAL_REWARD,
+            interval_shield=INTERVAL_SHIELD)
         e = Monitor(e)
         e.reset(seed=seed + rank)
         return e
@@ -257,6 +282,10 @@ class MissionMetrics(BaseCallback):
                     "ep/success":        float(info.get("success", False)),
                     "ep/return":         info["episode"]["r"],
                     "ep/length":         info["episode"]["l"],
+                    # interval diagnostics (zero unless an interval mode is on)
+                    "ep/peak_g_hi":            info.get("peak_g_hi", float("nan")),
+                    "ep/interval_violations":  info.get("interval_violations", 0),
+                    "ep/shield_intervention_rate": info.get("shield_intervention_rate", 0.0),
                     "global_step":       self.num_timesteps,
                 })   # no explicit step= : tensorboard syncing owns the step
         return True
@@ -326,8 +355,12 @@ import pandas as pd
 EVAL_LIMIT = None                      # None = all 1,000 held-out cases
 model = PPO.load(f"{MODEL_DIR}/{RUN_NAME}_final")
 
-# Single deterministic env (no dispersion sampling; ICs come from the test set).
-eval_env = rl_env.OrionEntryEnv(controller_mode="policy", dispersion=False)
+# Deterministic env (ICs come from the test set). MUST use the SAME interval
+# flags as training so the obs dimension matches and the shield is applied.
+eval_env = rl_env.OrionEntryEnv(
+    controller_mode="policy", dispersion=False,
+    interval_obs=INTERVAL_OBS, interval_reward=INTERVAL_REWARD,
+    interval_shield=INTERVAL_SHIELD)
 cases = load_test_set("configs/heldout_testset.csv")
 if EVAL_LIMIT:
     cases = cases[:EVAL_LIMIT]
@@ -342,7 +375,9 @@ for i, ic in enumerate(cases):
         done = term or trunc
     rows.append({"idx": i, "outcome": info["outcome"], "miss_km": info["miss_km"],
                  "peak_g": info["peak_g"], "peak_qdot_MWm2": info["peak_qdot_MWm2"],
-                 "rcs_fuel_kg": info["rcs_fuel_kg"], "success": int(info["success"])})
+                 "rcs_fuel_kg": info["rcs_fuel_kg"], "success": int(info["success"]),
+                 "interval_violations": info.get("interval_violations", 0),
+                 "shield_intervention_rate": info.get("shield_intervention_rate", 0.0)})
     if (i + 1) % 50 == 0:
         print(f"  [{i+1}/{len(cases)}]")
 
