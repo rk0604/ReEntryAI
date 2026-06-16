@@ -350,6 +350,7 @@ class OrionEntryEnv(gym.Env):
         self.control.reset()
         self.rcs.reset()
         self._reset_episode_state()
+        self._fuel_rate_kg_s = 0.0
         # Prime heat/g from the initial state so the first obs has margins.
         self._update_aux_metrics()
         return self._build_obs(), self._info(terminal=False)
@@ -539,8 +540,11 @@ class OrionEntryEnv(gym.Env):
         truncated = False
         outcome = "running"
         range_to_go_m = 0.0
+        fuel_at_start = self.rcs_fuel_kg
+        n_sub = 0
 
         for _ in range(self.n_substeps):
+            n_sub += 1
             x_old = list(self.x)
             sr = step_closed_loop_milestone1(
                 t_s=float(self.t_s), x_trans=list(self.x), att=self.att,
@@ -567,6 +571,10 @@ class OrionEntryEnv(gym.Env):
                 terminated = True; outcome = "cos_gamma_fail"; break
             if (not all(math.isfinite(v) for v in self.x)) or self.peak_g > 50.0:
                 terminated = True; outcome = "diverged"; break
+
+        # Per-step RCS propellant flow (kg/s) over this guidance step -- now an
+        # active reward term (previously hardcoded to 0, so fuel was ignored).
+        self._fuel_rate_kg_s = (self.rcs_fuel_kg - fuel_at_start) / max(n_sub * self.dt_s, 1e-9)
 
         self.step_count += 1
         if not terminated and self.step_count >= self.max_episode_steps:
@@ -596,8 +604,9 @@ class OrionEntryEnv(gym.Env):
         ing = telemetry.composite_reward(
             range_to_go_m=miss_km * 1000.0,
             qdot_w_m2=qdot_pen, load_factor_g=g_pen,
-            rcs_fuel_rate_kg_s=0.0, weights=self.reward_weights)
-        r = ing["rew_heat_term"] + ing["rew_gload_term"]
+            rcs_fuel_rate_kg_s=float(getattr(self, "_fuel_rate_kg_s", 0.0)),
+            weights=self.reward_weights)
+        r = ing["rew_heat_term"] + ing["rew_gload_term"] + ing["rew_fuel_term"]
 
         # Dense progress shaping: reward range-to-target closed since last step
         # (positive when getting closer, negative when drifting away). This is

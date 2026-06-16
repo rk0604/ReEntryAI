@@ -197,11 +197,14 @@ md(r"""
 already normalized in the env, so no `VecNormalize` is needed. We run several
 envs in parallel (`SubprocVecEnv`) because the bottleneck is CPU-side physics.
 
-**Reward:** the env now uses **dense progress shaping** (`w_progress_per_km`,
+**Reward:** the env uses **dense progress shaping** (`w_progress_per_km`,
 default 0.05) — reward per km of range-to-target closed each step — so the
 agent gets a continuous "warmer/colder" signal instead of a single terminal
-miss. We also pass a stronger `w_range` (terminal miss penalty) than the env
-default. Watch `ep/miss_km`; if it stalls, raise `w_progress_per_km`.
+miss. We pass a stronger `w_range` (terminal miss penalty) than the env default,
+and a **now-active fuel penalty** (`w_fuel=0.05`; the env previously hardcoded
+the fuel rate to zero, so RCS use was free). Watch `ep/miss_km`; if it stalls,
+raise `w_progress_per_km`. Watch `ep/rcs_fuel_kg`; if the policy thrashes the
+thrusters, raise `w_fuel`.
 
 > ⚠️ **Changing the reward invalidates old checkpoints.** Use a NEW `RUN_NAME`
 > whenever you change reward/hyperparameters, or the resume logic will reload
@@ -238,10 +241,16 @@ N_ENVS   = max(1, multiprocessing.cpu_count())
 TOTAL_STEPS = 1_000_000
 # Bump this whenever you change the reward/hyperparameters -> fresh checkpoints
 # + a clean W&B curve (otherwise resume reloads the old policy and skips).
-RUN_NAME = "ppo_orion_entry_v2"
+# v3: fuel penalty is now active in the env (was ignored before), so this is a
+# new reward -> new run name.
+RUN_NAME = "ppo_orion_entry_v3"
 
-# Stronger miss penalty than the env default for a trainable gradient.
-REWARD_WEIGHTS = telemetry.RewardWeights(w_range=1.0e-3)
+# Stronger miss penalty than the env default for a trainable gradient, plus a
+# gentle (now-active) fuel penalty. w_fuel=0.05 keeps the cumulative fuel cost
+# ~ -5 over an episode (~95 kg of RCS), small next to the +50 on-target bonus,
+# so the policy learns to TARGET first and treats fuel as a secondary nudge.
+# Raise w_fuel once miss-distance has converged if you want a leaner policy.
+REWARD_WEIGHTS = telemetry.RewardWeights(w_range=1.0e-3, w_fuel=0.05)
 
 # --- Interval-arithmetic ablation switches (the 3 ways intervals enter RL) ---
 # Flip these to run the ablation ladder. Use a DISTINCT RUN_NAME per setting.
@@ -258,7 +267,7 @@ def make_env(rank: int, seed: int = 0):
         e = rl_env.OrionEntryEnv(
             controller_mode="policy", dispersion=True,
             max_episode_steps=1400,
-            reward_weights=telemetry.RewardWeights(w_range=1.0e-3),
+            reward_weights=telemetry.RewardWeights(w_range=1.0e-3, w_fuel=0.05),
             interval_obs=INTERVAL_OBS, interval_reward=INTERVAL_REWARD,
             interval_shield=INTERVAL_SHIELD)
         e = Monitor(e)
@@ -298,7 +307,7 @@ import glob, re
 run = wandb.init(project="ReEntryAI", id=RUN_NAME, name=RUN_NAME, resume="allow",
                  sync_tensorboard=True,
                  config={"total_steps": TOTAL_STEPS, "n_envs": N_ENVS,
-                         "algo": "PPO", "w_range": 1.0e-3})
+                         "algo": "PPO", "w_range": 1.0e-3, "w_fuel": 0.05})
 
 vec = SubprocVecEnv([make_env(i) for i in range(N_ENVS)])
 
@@ -322,9 +331,14 @@ if resume_path:
                      tensorboard_log=f"{TB_DIR}/{RUN_NAME}")
 else:
     print("[fresh] no checkpoint found; starting a new run")
+    # batch_size divides the rollout buffer (n_steps * N_ENVS) for any vCPU
+    # count, so SB3 never silently clamps it; net_arch [128,128] gives the
+    # 13-16 dim obs a bit more capacity than the [64,64] default.
     model = PPO("MlpPolicy", vec, verbose=1, device="auto",
-                n_steps=1024, batch_size=4096, gamma=0.999, gae_lambda=0.95,
+                n_steps=1024, batch_size=1024, n_epochs=10,
+                gamma=0.999, gae_lambda=0.95, clip_range=0.2,
                 ent_coef=0.0, learning_rate=3e-4,
+                policy_kwargs=dict(net_arch=[128, 128]),
                 tensorboard_log=f"{TB_DIR}/{RUN_NAME}")
 
 ckpt = CheckpointCallback(save_freq=max(1, 50_000 // N_ENVS),
