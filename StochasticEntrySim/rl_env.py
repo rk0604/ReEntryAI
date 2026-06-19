@@ -153,6 +153,7 @@ class OrionEntryEnv(gym.Env):
         fast_atmosphere: bool = True,
         dispersion: Optional[bool] = None,
         w_progress_per_km: float = 0.05,
+        w_heading_per_rad: float = 0.0,
         interval_obs: bool = False,
         interval_reward: bool = False,
         interval_shield: bool = False,
@@ -177,6 +178,10 @@ class OrionEntryEnv(gym.Env):
         # "warmer/colder" signal -- without it PPO can't credit-assign a single
         # end-of-episode miss across the ~540 bank decisions in an episode.
         self.w_progress_per_km = float(w_progress_per_km)
+        # Dense heading shaping: reward per radian of heading-to-target error
+        # removed each step. Gives an early "aim at the target" signal when the
+        # range barely changes yet (far + fast). Off (0.0) preserves old reward.
+        self.w_heading_per_rad = float(w_heading_per_rad)
 
         # Fast tabulated atmosphere for RL throughput (~100x fewer PyMSIS
         # calls). Built once, module-global, shared across all env instances.
@@ -326,6 +331,7 @@ class OrionEntryEnv(gym.Env):
         self.shield_steps = 0          # shield decision points evaluated
         # Range-to-target at the start of the episode, for progress shaping.
         self._prev_range_km = self._great_circle_miss_km()
+        self._prev_head_err = 0.0   # |heading error| last step (heading shaping)
 
     # ------------------------------------------------------------------
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -353,6 +359,7 @@ class OrionEntryEnv(gym.Env):
         self._fuel_rate_kg_s = 0.0
         # Prime heat/g from the initial state so the first obs has margins.
         self._update_aux_metrics()
+        self._prev_head_err = abs(self._heading_err_rad())
         return self._build_obs(), self._info(terminal=False)
 
     def _alt(self) -> float:
@@ -593,6 +600,17 @@ class OrionEntryEnv(gym.Env):
         a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
         return float(2 * R * math.asin(min(1.0, math.sqrt(a))))
 
+    def _heading_err_rad(self) -> float:
+        """Heading-to-target error (rad), via the same obs provider path as the
+        observation, so the convention matches the rest of the stack."""
+        r, phi, lam, V, gamma, chi = [float(v) for v in self.x]
+        obs_d = self.obs_provider.observe(
+            ReentryState(r_m=r, phi_rad=phi, lam_rad=lam, V_mps=V, gamma_rad=gamma,
+                         chi_rad=chi, sigma_actual_rad=float(self.att.sigma_rel_rad),
+                         roll_rate_rad_s=float(self.att.omega_b_rad_s[2]),
+                         sigma_cmd_rad=0.0, sigma_target_rad=0.0), self.t_s)
+        return float(obs_d.get("heading_error_rad", 0.0))
+
     def _reward(self, terminated: bool, outcome: str) -> Tuple[float, float]:
         miss_km = self._great_circle_miss_km()
 
@@ -614,6 +632,15 @@ class OrionEntryEnv(gym.Env):
         # effectively terminal-only and PPO stalls at a large miss.
         r += self.w_progress_per_km * (self._prev_range_km - miss_km)
         self._prev_range_km = miss_km
+
+        # Dense heading shaping: reward reducing |heading-to-target error|. This
+        # gives an early "point at the target" signal even while range-to-go is
+        # still nearly flat (far + fast), which the weak progress-only reward
+        # lacked. Off when w_heading_per_rad == 0.
+        if self.w_heading_per_rad:
+            head_err = abs(self._heading_err_rad())
+            r += self.w_heading_per_rad * (self._prev_head_err - head_err)
+            self._prev_head_err = head_err
 
         if terminated and outcome == "drogue":
             w = self.reward_weights

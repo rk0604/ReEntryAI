@@ -197,18 +197,27 @@ md(r"""
 already normalized in the env, so no `VecNormalize` is needed. We run several
 envs in parallel (`SubprocVecEnv`) because the bottleneck is CPU-side physics.
 
-**Reward:** the env uses **dense progress shaping** (`w_progress_per_km`,
-default 0.05) — reward per km of range-to-target closed each step — so the
-agent gets a continuous "warmer/colder" signal instead of a single terminal
-miss. We pass a stronger `w_range` (terminal miss penalty) than the env default,
-and a **now-active fuel penalty** (`w_fuel=0.05`; the env previously hardcoded
-the fuel rate to zero, so RCS use was free). Watch `ep/miss_km`; if it stalls,
-raise `w_progress_per_km`. Watch `ep/rcs_fuel_kg`; if the policy thrashes the
-thrusters, raise `w_fuel`.
+**Reward (rebuilt).** The previous run's steering signal was ~20x too weak, so
+PPO collapsed into a lazy ~200 km-miss policy that barely used the thrusters
+(only ~1% success, barely better than a random policy). This version makes
+steering the dominant signal:
+- a strong **dense progress reward** (`W_PROGRESS_PER_KM`, per km of
+  range-to-target closed each step),
+- a **heading-shaping** term (`W_HEADING_PER_RAD`, reward for aiming at the
+  target even while range-to-go is still flat),
+- a small **entropy bonus** (`ENT_COEF`) so the policy actually explores banking,
+- and a **curriculum**: train with `DISPERSION=False` first so it can master one
+  trajectory before facing scattered entry conditions.
 
-> ⚠️ **Changing the reward invalidates old checkpoints.** Use a NEW `RUN_NAME`
-> whenever you change reward/hyperparameters, or the resume logic will reload
-> the old policy and skip training. (That's why this notebook ships `..._v2`.)
+**Run it in two stages:**
+1. **Diagnostic** (the defaults below): `TOTAL_STEPS=150_000`, `DISPERSION=False`.
+   Watch `ep/miss_km` in W&B — it must fall well below 100 km within ~150k steps
+   (~12 min). If it does, the reward works; go to stage 2.
+2. **Full run:** set `TOTAL_STEPS=1_000_000`, `DISPERSION=True`, and rename
+   `RUN_NAME` to `..._v5_full` (new name = fresh checkpoints + curve).
+
+> ⚠️ **A new reward needs a new `RUN_NAME`**, or the resume logic reloads the old
+> policy and skips training.
 
 **Interval ablation ladder.** The env exposes three independent interval knobs
 (`INTERVAL_OBS`, `INTERVAL_REWARD`, `INTERVAL_SHIELD`, set in the cell below).
@@ -238,19 +247,26 @@ from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from wandb.integration.sb3 import WandbCallback
 
 N_ENVS   = max(1, multiprocessing.cpu_count())
-TOTAL_STEPS = 1_000_000
-# Bump this whenever you change the reward/hyperparameters -> fresh checkpoints
-# + a clean W&B curve (otherwise resume reloads the old policy and skips).
-# v3: fuel penalty is now active in the env (was ignored before), so this is a
-# new reward -> new run name.
-RUN_NAME = "ppo_orion_entry_v3"
 
-# Stronger miss penalty than the env default for a trainable gradient, plus a
-# gentle (now-active) fuel penalty. w_fuel=0.05 keeps the cumulative fuel cost
-# ~ -5 over an episode (~95 kg of RCS), small next to the +50 on-target bonus,
-# so the policy learns to TARGET first and treats fuel as a secondary nudge.
-# Raise w_fuel once miss-distance has converged if you want a leaner policy.
+# === run knobs ============================================================
+# STAGE 1 (diagnostic, the defaults here): short run, NO dispersion (curriculum),
+# strong steering reward, exploration on. Watch ep/miss_km -- it should drop well
+# below 100 km within ~150k steps (~12 min). If it does, the reward works.
+# STAGE 2 (full run): set TOTAL_STEPS=1_000_000, DISPERSION=True, and bump
+# RUN_NAME to ..._v5_full (a new name = fresh curve + checkpoints).
+TOTAL_STEPS = 150_000
+DISPERSION  = False
+RUN_NAME    = "ppo_orion_entry_v4_diag"
+
+# Reward shaping (the real fix). The v3 run's steering reward was ~20x too weak,
+# so PPO sat in a lazy ~200 km-miss local optimum (barely better than random).
+# Make steering the dominant signal, add a heading "aim at the target" term, and
+# turn on exploration so the policy actually tries banking.
+W_PROGRESS_PER_KM = 1.0      # was 0.05 -- reward per km of range-to-target closed/step
+W_HEADING_PER_RAD = 10.0     # reward per rad of heading-to-target error removed/step
+ENT_COEF          = 0.01     # was 0.0 -- entropy bonus so PPO explores banking
 REWARD_WEIGHTS = telemetry.RewardWeights(w_range=1.0e-3, w_fuel=0.05)
+# ==========================================================================
 
 # --- Interval-arithmetic ablation switches (the 3 ways intervals enter RL) ---
 # Flip these to run the ablation ladder. Use a DISTINCT RUN_NAME per setting.
@@ -265,9 +281,10 @@ def make_env(rank: int, seed: int = 0):
     def _init():
         import rl_env, telemetry
         e = rl_env.OrionEntryEnv(
-            controller_mode="policy", dispersion=True,
+            controller_mode="policy", dispersion=DISPERSION,
             max_episode_steps=1400,
             reward_weights=telemetry.RewardWeights(w_range=1.0e-3, w_fuel=0.05),
+            w_progress_per_km=W_PROGRESS_PER_KM, w_heading_per_rad=W_HEADING_PER_RAD,
             interval_obs=INTERVAL_OBS, interval_reward=INTERVAL_REWARD,
             interval_shield=INTERVAL_SHIELD)
         e = Monitor(e)
@@ -307,7 +324,9 @@ import glob, re
 run = wandb.init(project="ReEntryAI", id=RUN_NAME, name=RUN_NAME, resume="allow",
                  sync_tensorboard=True,
                  config={"total_steps": TOTAL_STEPS, "n_envs": N_ENVS,
-                         "algo": "PPO", "w_range": 1.0e-3, "w_fuel": 0.05})
+                         "algo": "PPO", "w_range": 1.0e-3, "w_fuel": 0.05,
+                         "w_progress": W_PROGRESS_PER_KM, "w_heading": W_HEADING_PER_RAD,
+                         "dispersion": DISPERSION, "ent_coef": ENT_COEF})
 
 vec = SubprocVecEnv([make_env(i) for i in range(N_ENVS)])
 
@@ -337,7 +356,7 @@ else:
     model = PPO("MlpPolicy", vec, verbose=1, device="auto",
                 n_steps=1024, batch_size=1024, n_epochs=10,
                 gamma=0.999, gae_lambda=0.95, clip_range=0.2,
-                ent_coef=0.0, learning_rate=3e-4,
+                ent_coef=ENT_COEF, learning_rate=3e-4,
                 policy_kwargs=dict(net_arch=[128, 128]),
                 tensorboard_log=f"{TB_DIR}/{RUN_NAME}")
 
