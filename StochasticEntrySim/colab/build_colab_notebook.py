@@ -465,6 +465,176 @@ md(r"""
 """)
 
 # ---------------------------------------------------------------------------
+md(r"""
+## 6 · Imitation warmstart (RECOMMENDED — do this instead of from-scratch PPO)
+
+From-scratch PPO kept failing: it either sat lazy (v3) or flailed with too much
+exploration (v4) and never learned to steer. So instead we **clone the classical
+predictor-corrector** (which already lands ~2 km), which gives the policy a
+working steering skill *without* exploration, then optionally RL-fine-tune.
+
+**You only need Section 0 for this** — skip the Phase 4 from-scratch cells.
+Pipeline:
+1. **Collect** `(observation -> classical bank command)` pairs from baseline runs.
+2. **Behavior-clone** the policy network to imitate them (supervised).
+3. **Evaluate** the clone on the frozen test set — it should land near the
+   classical ~2 km. **That's the win condition.**
+4. (optional) **RL fine-tune** the clone to push past the baseline.
+""")
+
+code(r"""
+# 1) Collect / cache the behavior-cloning dataset (baseline = classical control).
+import bc_dataset, multiprocessing, numpy as np
+from pathlib import Path
+
+BC_EPISODES   = 60                 # dispersed baseline trajectories to imitate
+BC_WORKERS    = max(1, multiprocessing.cpu_count())
+FORCE_BC_DATA = False              # True = recollect even if cached on Drive
+BC_DATA = Path(DATA_DIR) / "bc_dataset.npz"
+
+if BC_DATA.exists() and not FORCE_BC_DATA:
+    d = np.load(BC_DATA); O, A = d["obs"], d["act"]
+    print(f"[cache] BC dataset {O.shape} <- {BC_DATA}")
+else:
+    O, A = bc_dataset.collect_bc_dataset(
+        config_path="configs/default.json", n_episodes=BC_EPISODES,
+        dispersion=True, workers=BC_WORKERS, out_path=str(BC_DATA))
+print("obs", O.shape, "| action range", float(A.min()), float(A.max()))
+""")
+
+code(r"""
+# 2) Behavior-clone: supervised-train the policy mean to match the expert action.
+import torch as th, numpy as np
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+BC_RUN_NAME = "bc_orion_entry_v1"
+BC_EPOCHS, BC_BATCH = 40, 512
+# Reward knobs only matter for the optional fine-tune below; set them here so the
+# model is built with the same hyperparameters fine-tuning will continue with.
+W_PROGRESS_PER_KM, W_HEADING_PER_RAD = 1.0, 10.0
+
+def _mk_policy_env():
+    import rl_env, telemetry
+    return rl_env.OrionEntryEnv(
+        controller_mode="policy", dispersion=False,
+        reward_weights=telemetry.RewardWeights(w_range=1.0e-3, w_fuel=0.05),
+        w_progress_per_km=W_PROGRESS_PER_KM, w_heading_per_rad=W_HEADING_PER_RAD)
+
+bc_vec = DummyVecEnv([_mk_policy_env])
+model = PPO("MlpPolicy", bc_vec, device="auto", verbose=0,
+            n_steps=1024, batch_size=1024, n_epochs=10,
+            gamma=0.999, gae_lambda=0.95, clip_range=0.2,
+            ent_coef=0.0, learning_rate=3e-4,
+            policy_kwargs=dict(net_arch=[128, 128]),
+            tensorboard_log=f"{TB_DIR}/{BC_RUN_NAME}")
+
+dev = model.device
+obs_t = th.as_tensor(O, dtype=th.float32, device=dev)
+act_t = th.as_tensor(A, dtype=th.float32, device=dev)
+opt = th.optim.Adam(model.policy.parameters(), lr=1e-3)
+n = obs_t.shape[0]
+for epoch in range(BC_EPOCHS):
+    perm = th.randperm(n, device=dev); tot = 0.0
+    for i in range(0, n, BC_BATCH):
+        idx = perm[i:i + BC_BATCH]
+        dist = model.policy.get_distribution(obs_t[idx])
+        mean = dist.distribution.mean            # policy's deterministic action
+        loss = ((mean - act_t[idx]) ** 2).mean() # regress it to the expert bank
+        opt.zero_grad(); loss.backward(); opt.step()
+        tot += loss.item() * idx.shape[0]
+    if (epoch + 1) % 5 == 0:
+        print(f"  bc epoch {epoch + 1:2d}/{BC_EPOCHS}  mse={tot / n:.5f}")
+model.save(f"{MODEL_DIR}/{BC_RUN_NAME}")
+print("BC policy saved ->", f"{MODEL_DIR}/{BC_RUN_NAME}.zip")
+""")
+
+code(r"""
+# 3) Evaluate the cloned policy on the frozen test set vs the classical baseline.
+import pandas as pd
+from make_test_set import load_test_set
+
+eval_env = rl_env.OrionEntryEnv(controller_mode="policy", dispersion=False)
+cases = load_test_set("configs/heldout_testset.csv")
+rows = []
+for i, ic in enumerate(cases):
+    obs, info = eval_env.reset(options={"ic_override": ic})
+    done = False
+    while not done:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, r, term, trunc, info = eval_env.step(action)
+        done = term or trunc
+    rows.append({"miss_km": info["miss_km"], "peak_g": info["peak_g"],
+                 "rcs_fuel_kg": info["rcs_fuel_kg"], "success": int(info["success"])})
+    if (i + 1) % 100 == 0:
+        print(f"  [{i + 1}/{len(cases)}]")
+bc_df = pd.DataFrame(rows)
+bc_df.to_csv(f"{DATA_DIR}/bc_policy_metrics.csv", index=False)
+
+base_df = pd.read_csv(f"{DATA_DIR}/baseline_metrics.csv")
+print("\n=== cloned policy vs classical (frozen test set) ===")
+print("clone     : success %.1f%% | miss median %.2f km | p90 %.2f km"
+      % (100 * bc_df.success.mean(), bc_df.miss_km.median(), bc_df.miss_km.quantile(.9)))
+print("classical : success %.1f%% | miss median %.2f km"
+      % (100 * base_df.success.mean(), base_df.miss_km.median()))
+print("\nWIN CONDITION: clone miss median within a few km of classical.")
+""")
+
+md(r"""
+**Reading it:** if the clone lands within a few km of the classical baseline,
+the policy network can represent a working entry controller and the whole RL
+pipeline is sound — the earlier failures were exploration, not capacity. From
+here, the optional fine-tune below starts from this competent policy and tries to
+beat the baseline (and later, to satisfy the interval safety shield).
+""")
+
+code(r"""
+# 4) (optional) RL fine-tune FROM the clone. Low exploration so it doesn't unlearn.
+from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import BaseCallback
+from wandb.integration.sb3 import WandbCallback
+import wandb, multiprocessing
+
+FT_RUN_NAME = "ppo_ft_from_bc_v1"
+FT_STEPS    = 500_000
+N_ENVS      = max(1, multiprocessing.cpu_count())
+
+def _mk(rank, seed=0):
+    def _init():
+        import rl_env, telemetry
+        e = rl_env.OrionEntryEnv(
+            controller_mode="policy", dispersion=True,
+            reward_weights=telemetry.RewardWeights(w_range=1.0e-3, w_fuel=0.05),
+            w_progress_per_km=W_PROGRESS_PER_KM, w_heading_per_rad=W_HEADING_PER_RAD)
+        e = Monitor(e); e.reset(seed=seed + rank); return e
+    return _init
+
+class MissionMetrics(BaseCallback):
+    def _on_step(self):
+        for info in self.locals.get("infos", []):
+            if "episode" in info:
+                wandb.log({"ep/miss_km": info.get("miss_km"),
+                           "ep/success": float(info.get("success", False)),
+                           "ep/peak_g": info.get("peak_g"),
+                           "ep/rcs_fuel_kg": info.get("rcs_fuel_kg"),
+                           "ep/return": info["episode"]["r"],
+                           "global_step": self.num_timesteps})
+        return True
+
+wandb.init(project="ReEntryAI", id=FT_RUN_NAME, name=FT_RUN_NAME, resume="allow",
+           sync_tensorboard=True)
+ftvec = SubprocVecEnv([_mk(i) for i in range(N_ENVS)])
+model.set_env(ftvec)
+model.learn(total_timesteps=FT_STEPS,
+            callback=[WandbCallback(verbose=0), MissionMetrics()],
+            reset_num_timesteps=True, progress_bar=True)
+model.save(f"{MODEL_DIR}/{FT_RUN_NAME}_final")
+ftvec.close()
+print("fine-tuned policy ->", f"{MODEL_DIR}/{FT_RUN_NAME}_final.zip")
+""")
+
+# ---------------------------------------------------------------------------
 nb = {
     "cells": [
         {"cell_type": k, "metadata": {},
