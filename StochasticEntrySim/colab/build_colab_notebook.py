@@ -590,6 +590,7 @@ beat the baseline (and later, to satisfy the interval safety shield).
 
 code(r"""
 # 4) (optional) RL fine-tune FROM the clone. Low exploration so it doesn't unlearn.
+from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback
@@ -625,7 +626,9 @@ class MissionMetrics(BaseCallback):
 wandb.init(project="ReEntryAI", id=FT_RUN_NAME, name=FT_RUN_NAME, resume="allow",
            sync_tensorboard=True)
 ftvec = SubprocVecEnv([_mk(i) for i in range(N_ENVS)])
-model.set_env(ftvec)
+# The BC model was built with 1 env; SB3 forbids changing the env count via
+# set_env, so reload the saved BC weights bound to the multi-env vec instead.
+model = PPO.load(f"{MODEL_DIR}/{BC_RUN_NAME}", env=ftvec, device="auto")
 model.learn(total_timesteps=FT_STEPS,
             callback=[WandbCallback(verbose=0), MissionMetrics()],
             reset_num_timesteps=True, progress_bar=True)
