@@ -8,3 +8,18 @@ __pycache__/
 .ipynb_checkpoints/
 
 StochasticEntrySim/docs/_figs/
+
+# Local-only scratch and deprecated tools (never pushed)
+/deprecated/
+
+# Local-only run outputs and scratch artifacts (kept locally, not pushed)
+StochasticEntrySim/trajectory_success.csv
+StochasticEntrySim/trajectory_failed_heat_steps.csv
+StochasticEntrySim/trajectory_failed_heat_episodes.csv
+StochasticEntrySim/conditional_uncertainty_propagation_log.csv
+StochasticEntrySim/density_comparison.png
+StochasticEntrySim/start.png
+StochasticEntrySim/_p*.png
+StochasticEntrySim/helpers/_plot_cells_dump.json
+StochasticEntrySim/old_code/constants (1).py
+RL_Model/main_2d_broken.ipynb
