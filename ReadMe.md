@@ -1,271 +1,322 @@
-ReEntryAI Interval ReEntry Notebook Usage Guide
+# ReEntryAI
 
-Project overview
+A high-fidelity **3-DOF atmospheric entry simulator** for the Orion Crew Module,
+built to test a research question: *can a reinforcement-learning controller match
+or beat a classical predictor-corrector for entry guidance, while a provable
+interval-arithmetic safety layer guarantees heat-rate and g-load limits are never
+violated?*
 
-This codebase models a milestone 1 atmospheric reentry simulation with three tightly connected layers.
+The **simulator, classical guidance, parachute model, uncertainty (interval)
+layer, mission-control dashboard, and RL training pipeline are all built and
+working.** The **RL-beats-classical result does not yet exist** — see
+[Where the RL stands](#where-the-rl-stands) for an honest account.
 
-1. A nominal translational path that advances the main vehicle state.
-2. A physical bank control chain that turns guidance decisions into bank motion through actuator shaping, roll torque control, and RCS firing.
-3. An interval annotation layer that propagates uncertainty, tracks conservative heating bounds, and helps the predictor corrector guidance reject bad candidates.
+---
 
-The main notebook is interval_ReEntry3.ipynb. It ties the modules together, runs the simulation loop, logs every step into tables, saves csv outputs, and creates the diagnostic plots.
+## Table of contents
+- [What's in the box](#whats-in-the-box)
+- [Repository layout](#repository-layout)
+- [Quick start](#quick-start)
+  - [1. Run the classical simulator](#1-run-the-classical-simulator)
+  - [2. Train / evaluate the RL policy (Colab)](#2-train--evaluate-the-rl-policy-colab)
+  - [3. Launch the mission-control dashboard](#3-launch-the-mission-control-dashboard)
+- [The simulator in detail](#the-simulator-in-detail)
+- [Mission configs](#mission-configs)
+- [Outputs](#outputs)
+- [The RL pipeline](#the-rl-pipeline)
+- [Where the RL stands](#where-the-rl-stands)
+- [Known limitations](#known-limitations)
+- [Requirements](#requirements)
 
-Codebase map
+---
 
-1. AtmosphereModel.py
-   1. Implements the 1976 US Standard Atmosphere model for the float path up to 86 km.
-   2. Provides the interval atmosphere functions used by the uncertainty layer when altitude bounds cross one or more atmospheric layers.
-   3. Converts geometric altitude into geopotential altitude so the atmosphere calculations stay consistent with the layer definitions.
-   4. Returns temperature, pressure, density, and layer index information that is used by both nominal and interval dynamics.
-   5. This file is the main place to edit atmosphere behavior, density bounds, or layer handling.
+## What's in the box
 
-2. constants.py
-   1. Stores the shared simulation constants so the notebook and modules all use the same Earth model, timing values, vehicle properties, control limits, and heat limits.
-   2. Defines the Earth radius, gravity constants, atmosphere layer tables, capsule mass, aerodynamic reference area, RCS geometry, roll controller gains, and predictor corrector tuning.
-   3. Contains the HeatShield class, which tracks interval heat rate and accumulated heat load over shield cells.
-   4. Defines the default output csv names used by the notebook save cells.
-   5. This file is the main place to change global tuning values without rewriting module logic.
+| Capability | Status | Where |
+|---|---|---|
+| 3-DOF entry dynamics (explicit Euler, 0.25 s) | ✅ | `math_3d.py`, `point_math_3d.py` |
+| NRLMSISE atmosphere (+ fast lookup table) | ✅ | `AtmosphereModel.py` |
+| Reduced-order Orion aero (FMV-scheduled CD / L·D) | ✅ | `math_3d.py` |
+| Convective + radiative heating, wall temperature | ✅ | `constants.py` (`HeatShield`) |
+| Classical predictor-corrector guidance + bank reversals | ✅ | `control.py` |
+| 12-jet RCS + bank actuator + roll control | ✅ | `ReactionControl.py`, `control.py` |
+| CPAS parachutes (reefing, squidding, pendulum, failures) | ✅ | `cpas.py` |
+| Interval-arithmetic uncertainty supervisor | ✅ | `interval_math.py`, `math_3d.py` |
+| Gymnasium RL environment | ✅ | `rl_env.py` |
+| IC dispersion + frozen held-out test set | ✅ | `mission_config.py`, `make_test_set.py` |
+| Classical baseline characterization (parallel) | ✅ | `run_baseline.py` |
+| Behavior-cloning warmstart pipeline | ✅ | `bc_dataset.py`, Colab |
+| React mission-control dashboard | ✅ | `mission_control_ui/` |
+| **A trained RL policy that beats / matches classical** | ❌ **open** | see below |
 
-3. interval_math.py
-   1. Provides the Interval class and the basic interval arithmetic used across the uncertainty propagation path.
-   2. Includes interval versions of log, sqrt, exp, sin, cos, integer powers, and safe division logic.
-   3. Supplies box helpers for interval state vectors, including box addition, scalar multiplication, midpoints, widths, and interval Euler stepping.
-   4. Makes it possible for the rest of the code to reuse the same formulas with conservative bounds rather than only point values.
-   5. This file is the first place to inspect when an interval propagation failure comes from division, trigonometric overestimation, or a state width blow up.
+---
 
-4. math_3d.py
-   1. Implements the nominal and interval translational reentry dynamics for the state vector [r, phi, lam, V, gamma, chi].
-   2. Contains the corrected spherical Earth equations of motion used by the notebook.
-   3. Builds interval annotations for each nominal step, including state width summaries, density bounds, dynamic pressure bounds, altitude bounds, and heating summaries.
-   4. Provides the short horizon rollout utility used by the predictor corrector guidance to test candidate bank commands.
-   5. This file is the main physics bridge between the notebook, the guidance layer, and the heat supervisor layer.
+## Repository layout
 
-5. control.py
-   1. Holds the high level control stack for the capsule.
-   2. Defines the control facing state object, the observation provider, the guidance scheduler, the heat aware predictor corrector guidance law, the bank actuator, the roll controller, and the full capsule control stack.
-   3. Converts raw vehicle state into guidance features such as range to go, heading error, target azimuth, and cross track error.
-   4. Evaluates multiple bank magnitude candidates, rolls each one forward through the corrected dynamics and interval heating model, scores them, and selects sigma_cmd.
-   5. This file is the main place to modify target logic, candidate search behavior, bank schedules, or control shaping.
+```
+ReEntryAI/
+├── ReadMe.md                     ← you are here
+├── StochasticEntrySim/           ← the simulator + RL (the heart of the project)
+│   ├── run_sim.py                ← canonical CLI driver (config-driven)
+│   ├── run_baseline.py           ← parallel classical-baseline runner over a test set
+│   ├── make_test_set.py          ← generates the frozen 1,000-case held-out set
+│   ├── rl_env.py                 ← OrionEntryEnv: the Gymnasium RL environment
+│   ├── bc_dataset.py             ← collects (obs → classical bank) pairs for imitation
+│   │
+│   ├── point_math_3d.py          ← nominal closed-loop translational step (the physics core)
+│   ├── math_3d.py                ← 3-DOF EOM, aero schedule, heating envelope, interval supervisor
+│   ├── interval_math.py          ← Interval class + interval arithmetic / box helpers
+│   ├── control.py                ← guidance stack (predictor-corrector + policy), actuator, roll ctrl
+│   ├── ReactionControl.py        ← 12-thruster RCS model
+│   ├── cpas.py                   ← parachute assembly (drogue/pilot/main, reefing, squid, pendulum)
+│   ├── constants.py              ← physical constants, HeatShield (Sutton-Graves / Tauber-Sutton)
+│   ├── AtmosphereModel.py        ← NRLMSISE atmosphere + tabulation + interval atmosphere
+│   ├── telemetry.py              ← derived metrics, RCS propellant, RL reward weights/terms
+│   ├── mission_config.py         ← JSON config loader, IC dispersion, targets, aero application
+│   ├── plotting.py               ← shared plotting + plot-category filtering
+│   │
+│   ├── configs/                  ← mission definitions (JSON) + the frozen test set (CSV)
+│   ├── colab/                    ← the RL training notebook (run heavy compute here)
+│   ├── docs/                     ← technical overview PDF, RL MDP spec
+│   ├── revision_v1/  revision_v1_py/   ← example outputs (notebook vs run_sim.py) + figures
+│   ├── runs/                     ← example CPAS failure-mode run
+│   ├── data/  data_intv/         ← sample logged data
+│   ├── helpers/                  ← one-off notebook-surgery scripts (dev tooling, not runtime)
+│   ├── old_code/                 ← archived earlier versions
+│   ├── heat.py, math_2d.py, RL_ready_sim/  ← legacy / superseded modules
+│
+├── mission_control_ui/           ← React + Vite "mission control" dashboard
+│   └── src/components/            ← telemetry plots, 3D trajectory, ground track, CPAS panels
+│
+├── RL_Model/                     ← early 2-D RL prototype notebooks (historical)
+└── testSim/                      ← early simulator prototype (historical)
+```
 
-6. ReactionControl.py
-   1. Implements the body frame RCS model for milestone 1.
-   2. Defines fixed thrusters on the capsule, computes body force and body torque for each thruster, and allocates roll channel firings from commanded roll torque.
-   3. Uses a fixed step pulse model so each selected jet is either on for the whole simulation step or off for the whole step.
-   4. Supports duty accumulation across steps so small continuous roll demands can still produce realistic discrete firings.
-   5. This file is the main place to adjust thruster layout, pulse logic, thrust capacity, or future pitch and yaw allocation.
+> **Note on `_py` folders.** `run_sim.py` writes to `<output_dir>_py/` so its
+> outputs never clobber the notebook's `<output_dir>/`. That's why you see paired
+> folders like `revision_v1/` (notebook) and `revision_v1_py/` (`run_sim.py`).
 
-7. Pasted code.py
-   1. Contains the milestone1_nominal.py style module that owns the nominal milestone 1 simulation path in a standalone module form.
-   2. Includes float translational dynamics, quaternion and frame helpers, attitude state objects, aerodynamic force evaluation, and the closed loop nominal step.
-   3. Organizes the nominal path cleanly so math_3d.py can stay focused on interval propagation and predictor support.
-   4. Serves as a reusable module level version of logic that the notebook currently wires together cell by cell.
-   5. A cleaner future project layout would rename this file to milestone1_nominal.py and import it directly.
+---
 
-8. interval_ReEntry3.ipynb
-   1. This is the main driver notebook for the full simulation and analysis workflow.
-   2. Imports the shared modules, sets up the vehicle and controller, initializes the nominal and interval states, runs the closed loop physical simulation, logs every step, exports csv files, and creates plots.
-   3. Also includes RCS diagnostics, interval width plots, heating plots, heat shield maps, landing error summaries, and final compact tables.
-   4. This is the first file to run when checking whether the full system still works after code changes.
-   5. Most debugging and visual analysis currently happens here rather than in a separate application entry point.
+## Quick start
 
-How the main notebook is organized
+```bash
+git clone https://github.com/rk0604/ReEntryAI.git
+cd ReEntryAI/StochasticEntrySim
+pip install numpy pandas matplotlib pymsis
+```
 
-1. Import and helper setup
-   The early cells import numpy, pandas, matplotlib, the project modules, and helper plotting functions.
+### 1. Run the classical simulator
 
-2. Vehicle and controller setup
-   The setup cells build the params dictionary, the guidance stack, the bank actuator, the roll controller, and the physical RCS system.
+`run_sim.py` flies one mission end-to-end (entry → parachutes → splashdown),
+writing a per-step trajectory CSV, a summary JSON, and a folder of diagnostic
+figures. It is driven by a JSON config selected with the `SIM_CONFIG` env var:
 
-3. Initial conditions
-   The notebook defines the initial translational state, the initial bank and roll rate, the target latitude and longitude, and the interval supervisor widths.
+```bash
+# default mission
+python run_sim.py
 
-4. Closed loop simulation loop
-   The main loop synchronizes the control state, asks guidance for sigma_cmd, runs the RCS allocator, updates actual bank motion, advances the nominal state, annotates the same step with interval propagation, and writes one log row into the dataframe.
+# a specific scenario
+SIM_CONFIG=configs/scenario_artemis_skip.json python run_sim.py
+```
 
-5. Analysis and export
-   The later cells inspect the dataframe, build trajectory plots, show uncertainty growth, save csv files, and analyze the RCS firing history.
+Sanity-check the RL environment's physics against the classical controller:
 
-How to run interval_ReEntry3.ipynb
+```bash
+python rl_env.py configs/default.json     # runs OrionEntryEnv in baseline mode
+```
 
-1. Place the following files in the same working folder.
-   interval_ReEntry3.ipynb
-   AtmosphereModel.py
-   constants.py
-   control.py
-   interval_math.py
-   math_3d.py
-   ReactionControl.py
-   Pasted code.py if the milestone1_nominal module version is being kept alongside the notebook
+### 2. Train / evaluate the RL policy (Colab)
 
-2. Open the folder in Jupyter Notebook, JupyterLab, or Visual Studio Code with a Python notebook kernel.
+All heavy RL compute runs on **Google Colab**, not locally (the env needs
+`gymnasium` + `stable-baselines3`, and training wants a GPU/many CPUs).
 
-3. Make sure the Python environment has numpy, pandas, matplotlib, and jupyter available.
+1. Open `StochasticEntrySim/colab/ReEntryAI_RL_Colab.ipynb` in Colab
+   (File → Open notebook → GitHub → `rk0604/ReEntryAI`).
+2. Run **Section 0** (clones the repo, installs deps, mounts Drive).
+3. Then either:
+   - **Section 6 — Imitation warmstart (recommended):** clone the classical
+     controller, evaluate it, optionally RL-fine-tune. *(This is the current
+     frontier — see status below.)*
+   - **Sections 2–5 — from-scratch baseline + PPO:** the original path (the
+     from-scratch PPO does **not** converge; kept for reference).
 
-4. Start the notebook kernel from the same folder that contains the project files. The notebook imports the modules by filename, so the working directory matters.
+The notebook is generated from `colab/build_colab_notebook.py` — **edit the
+builder and re-run it**, don't hand-edit the `.ipynb`.
 
-5. Run the notebook from top to bottom in order.
+### 3. Launch the mission-control dashboard
 
-6. Watch the early setup cells for any import failure. If one module fails to import, the later control and simulation cells will not run correctly.
+```bash
+cd mission_control_ui
+npm install
+npm run dev          # opens a Vite dev server; serves trajectory data live
+```
 
-7. After the setup cells, run the main simulation loop cell. This is the core cell that creates df, failed_heat_steps_df, and failed_episode_summary_df.
+The dashboard renders a flown trajectory (3-D path, ground track, telemetry,
+CPAS sequencing, RCS activity). Data is read from the simulator's output folder
+(`revision_v1/`); static copies live in `public/data/` for production builds.
 
-8. Run the later plotting and export cells only after df exists and contains rows.
+---
 
-Important notebook run order
+## The simulator in detail
 
-1. Run the import cell first.
-2. Run the helper cell that defines plotting and conversion utilities.
-3. Run the setup cell that builds params, guidance, actuator, controller, and RCS objects.
-4. Run the initial condition cell that builds x_nominal and state_ctrl.
-5. Run the supervisor config cell that defines the uncertainty widths.
-6. Run the wrapper cell that defines nominal_step_closed_loop.
-7. Run the heat shield activation and short diagnostic cells if needed.
-8. Run the main conditional uncertainty propagation loop.
-9. Run the dataframe summary and plotting cells.
-10. Run the csv save cell near the end if exported logs are needed.
+The state vector is `[r, φ, λ, V, γ, χ]` (radius, latitude, longitude, speed,
+flight-path angle, heading). One guidance decision is made each second; the
+physics integrates at `dt = 0.25 s` with explicit forward Euler.
 
-What the main simulation loop does
+| Module | Responsibility |
+|---|---|
+| **`point_math_3d.py`** | The nominal closed-loop step: synchronize control state, run guidance → bank actuator → roll torque → RCS firing → realized bank, then advance the translational state. The physics core both `run_sim.py` and `rl_env.py` call. |
+| **`math_3d.py`** | The equations of motion; the FMV-scheduled Orion-like aero (CD and L/D vs a blended Mach/velocity parameter, per Bibb et al.); the interval **heating envelope**; and the **interval supervisor** that propagates a guaranteed state box and bounds heat/g. Also the predictor-corrector rollout used to score candidate banks. |
+| **`control.py`** | `SimpleBankGuidance` (the classical predictor-corrector: golden-section bank-magnitude solver + long rollout + Apollo/Lu-style bank reversals), `PolicyGuidance` (lets an RL policy supply the bank), the observation provider (range-to-go, heading & cross-track error), the bank actuator (rate/accel limited), and the roll controller. |
+| **`ReactionControl.py`** | 12-jet body-frame RCS, bang-bang firing, propellant accounting. |
+| **`constants.py`** | The `HeatShield` class — Sutton-Graves convective + Tauber-Sutton radiative + Tauber-Wakefield coupling + radiative-equilibrium wall temperature on a discretized shield grid — plus all physical constants and interval-supervisor defaults. |
+| **`AtmosphereModel.py`** | NRLMSISE (via `pymsis`), an optional baked log-density lookup table for RL throughput, and the interval-atmosphere hull used by the uncertainty layer. |
+| **`cpas.py`** | The Capsule Parachute Assembly: drogue/pilot/main sequencing, staged reefing, squidding (stochastic partial collapse), pendulum limit-cycle (on 2-of-3 main failure), forward-bay-cover jettison, and stochastic chute failure. |
+| **`interval_math.py`** | The `Interval` dataclass and conservative interval arithmetic (sin/cos/sqrt/exp/pow, division guards) plus box/vector helpers — the basis of the guaranteed-bounds layer. |
+| **`telemetry.py`** | Derived physics (load factor, specific energy, etc.), the RCS propellant model, and the RL reward (`RewardWeights`, `composite_reward`). |
+| **`mission_config.py`** | Loads a JSON mission, applies aero, builds the entry-interface state, samples **IC dispersions**, and resolves mission targets. |
 
-1. Copies the latest nominal state into the control facing ReentryState object.
-2. Applies pre step guards to avoid singular regions such as cos gamma near zero, speed near zero, or invalid interval denominators.
-3. Computes nominal aerodynamic telemetry from the current flown bank.
-4. Passes live interval and heat shield context into the guidance layer.
-5. Lets guidance evaluate short horizon bank candidates.
-6. Converts the chosen sigma_cmd into sigma_target through the bank actuator.
-7. Converts sigma tracking error into roll torque through the roll controller.
-8. Allocates real RCS firings for that torque demand.
-9. Updates actual bank angle and roll rate from the realized RCS torque.
-10. Advances the nominal translational state using the actual flown bank angle.
-11. Builds interval annotations for the same step, including density bounds, dynamic pressure bounds, altitude bounds, state widths, and heating bounds.
-12. Logs all nominal, control, RCS, interval, and guidance debug values into one dataframe row.
+---
 
-Expected notebook outputs
+## Mission configs
 
-1. df
-   This is the main step by step trajectory log.
+`configs/*.json` define a mission (entry state, aero, CPAS, guidance, interval
+limits, target, and an optional `dispersion` block). Pick one with `SIM_CONFIG`.
 
-2. failed_heat_steps_df
-   This stores guidance cycles where the selected candidate was heat infeasible or interval invalid. It is useful for later RL style labeling.
+| Config | What it is |
+|---|---|
+| `default.json` | Nominal orbital entry from ~120 km. The reference mission. |
+| `scenario_a_lunar.json` | Faster lunar-return entry. |
+| `scenario_artemis_skip.json` | Artemis-style lunar **skip** entry (dip → skip-out → land). Generates the dashboard's data. |
+| `example_dispersed_entry.json` | Entry with IC dispersion enabled. |
+| `example_failure_2of3.json` | Forces a 2-of-3 main-chute failure (triggers the pendulum). |
+| `heldout_testset.csv` | The **frozen 1,000-case** dispersed test set (seed-locked) used for every RL-vs-classical comparison. Built by `make_test_set.py`. |
 
-3. failed_episode_summary_df
-   This gives a compact episode level summary for the current run.
+The `dispersion` block scatters the six entry-interface variables around nominal
+(e.g. ±1 km altitude, ±100 m/s speed, ±0.4° flight-path angle, ±3° heading,
+±0.3° lat/lon) — realistic delivery-error Monte-Carlo scatter around one planned
+entry.
 
-4. Saved csv files
-   trajectory_success.csv
-   trajectory_failed_heat_steps.csv
-   trajectory_failed_heat_episodes.csv
-   conditional_uncertainty_propagation_log.csv
+---
 
-5. Diagnostic plots
-   Ground track plots.
-   Three dimensional trajectory views.
-   Density and dynamic pressure envelopes.
-   Heating envelopes.
-   Heat shield face maps.
-   State width growth plots.
-   RCS requested duty and firing plots.
-   Thruster event plots.
+## Outputs
 
-Useful columns in df
+Each run produces, in `<output_dir>[_py]/`:
 
-1. Control path columns
-   sigma_cmd_rad
-   sigma_target_rad
-   sigma_actual_rad
-   roll_rate_rad_s
-   tau_roll_cmd_Nm
-   requested_duty
-   fired_this_step
-   active_thrusters
-   torque_z_from_rcs
+- **`trajectory_success.csv`** — ~190 columns of per-step state, control, RCS,
+  interval bounds, heating, and guidance diagnostics.
+- **`trajectory_failed_heat_steps.csv`** — guidance cycles flagged heat-infeasible.
+- **`run_summary.json` / `landing_summary.json`** — episode-level summary
+  (miss distance, peak g, peak heat rate, RCS fuel, outcome).
+- **`figures/`** — ground track, 3-D trajectory, density/dynamic-pressure
+  envelopes, heating, heat-shield maps, interval-width growth, RCS activity,
+  and CPAS diagnostics. Filter with `PLOT_CATEGORIES`.
 
-2. Nominal flight columns
-   r_m
-   phi_rad
-   lam_rad
-   V_mps
-   gamma_rad
-   chi_rad
-   alt_m
-   rho_kgm3
-   q_pa
+---
 
-3. Interval supervisor columns
-   interval_rho_lo
-   interval_rho_hi
-   interval_q_lo
-   interval_q_hi
-   interval_alt_lo
-   interval_alt_hi
-   width_r_m
-   width_V_mps
-   width_gamma_rad
-   width_chi_rad
-   safety_status
+## The RL pipeline
 
-4. Heating columns
-   heating_qdot_max_lo
-   heating_qdot_max_hi
-   heating_qdot_mean_lo
-   heating_qdot_mean_hi
-   heating_Q_max_lo
-   heating_Q_max_hi
+The reinforcement-learning layer wraps the simulator as a standard Gym task.
 
-5. Guidance predictor columns
-   guidance_selected_candidate_index
-   guidance_any_feasible_candidate
-   guidance_selected_candidate_heat_feasible
-   guidance_chosen_sigma_cmd_deg
-   guidance_selected_total_cost
-   guidance_selected_failure_reason
-   guidance_selected_violation_amount
-   guidance_candidate_sigma_deg_json
-   guidance_candidate_cost_json
-   guidance_candidate_heat_flag_json
-   guidance_candidate_failure_reason_json
+- **`rl_env.py` — `OrionEntryEnv`:** observation = 13 normalized features
+  (+3 optional interval features); action = 1-D continuous bank angle (±90°);
+  episode runs from entry interface to drogue deploy. Reward = dense progress
+  shaping (range-to-target closed) + optional heading shaping + hinge penalties
+  on heat/g + an active RCS-fuel penalty + terminal miss/on-target/survivability
+  bonuses. Three **interval-RL** modes can be toggled independently:
+  - `interval_obs` — append worst-case heat/g headroom to the observation,
+  - `interval_reward` — penalize the *guaranteed worst-case* heat/g, not nominal,
+  - `interval_shield` — veto a bank whose 1-step interval reachability breaches a
+    limit (a hard safety constraint, not a soft penalty).
+- **`make_test_set.py`** — generates the seed-locked dispersed test set.
+- **`run_baseline.py`** — runs the classical predictor-corrector over that test
+  set in parallel to produce the distribution RL must beat.
+- **`bc_dataset.py`** — runs the env in baseline mode and records
+  `(observation → classical bank command)` pairs for behavior cloning.
+- **`colab/ReEntryAI_RL_Colab.ipynb`** — the end-to-end training/eval notebook
+  (baseline characterization, PPO training, imitation warmstart, head-to-head
+  evaluation, W&B logging).
 
-Common stopping conditions in the notebook
+The intended paper contribution is the **interval-shielded RL** angle: a learned
+controller made *provably safe* by the interval reachability shield.
 
-1. The notebook may stop the main loop when nominal cos gamma becomes too small.
-   This is a guard against heading propagation singular behavior.
+---
 
-2. The notebook may stop when speed becomes too low for the simplified regime.
-   This is an intentional modeling boundary rather than a crash.
+## Where the RL stands
 
-3. The notebook may stop when altitude reaches the low altitude regime.
-   This is a practical stop point for the current milestone 1 scope.
+**Honest status: the RL does not yet match the classical controller. The
+infrastructure is complete; the headline result is not.**
 
-4. The notebook may stop when the interval state becomes clearly invalid.
-   Examples include radius bounds becoming nonphysical or interval denominators crossing zero.
+The classical predictor-corrector lands a **median 2.05 km** from target with
+**99.9% success** across the 1,000-case test set. That is the bar. Every RL
+attempt so far falls well short:
 
-5. These stop conditions usually indicate the current model boundary or a numeric guard, not a notebook bug by themselves.
+| Approach | Success | Median miss | Verdict |
+|---|---|---|---|
+| Classical predictor-corrector (the bar) | 99.9 % | **2.05 km** | — |
+| PPO from scratch, v3 (weak reward) | 1.3 % | ~198 km | lazy local optimum |
+| PPO from scratch, v4 (strong reward + exploration) | ~1 % | ~91–198 km | flails, never converges |
+| **Behavior clone of the classical controller** | 14.8 % | **91 km** | best learned policy so far |
+| Clone → PPO fine-tune | 0 % | 438 km | **regressed** (cold-critic collapse) |
 
-Practical debugging order
+**What we learned:**
+- **From-scratch PPO cannot crack this problem** — the success region (a precise
+  bank schedule with reversals) is too hard to discover by exploration, so the
+  policy collapses to either doing nothing (v3) or flailing (v4).
+- **Behavior cloning helps but isn't enough.** Cloning the classical controller
+  gets to 91 km, but suffers the classic imitation failure: *compounding errors*
+  (the policy drifts into states the expert never demonstrated) and the expert's
+  bang-bang bank reversals get "averaged out" by a smooth policy.
+- **Naive clone→RL fine-tuning makes it worse.** Behavior cloning trains only the
+  policy network, leaving the value (critic) network random. PPO then reinforces
+  actions using garbage value estimates and destroys the good clone before the
+  critic warms up — a well-known BC→RL failure mode. Result: 438 km.
 
-1. If the notebook fails before the main loop, check imports and module names first.
+**Where we're leaving off — open directions (none yet chosen):**
+1. **DAgger** — iteratively query the classical controller on the *states the
+   clone actually visits* and retrain. Directly attacks the 91 km compounding-
+   error problem, with no RL instability. Most promising for a strong learned
+   controller.
+2. **Proper clone→RL handoff** — warm up the critic on frozen-clone rollouts,
+   fine-tune with a tiny learning rate and a KL leash to the clone. Salvages the
+   "RL beats classical" framing, more engineering, uncertain payoff.
+3. **Reframe around safety** — lead the paper with the simulator + interval
+   propagation + the provable safety shield, using the cloned controller as the
+   learned policy the shield protects, and drop the "beats classical accuracy"
+   claim. Most defensible given current results.
 
-2. If the notebook fails inside interval propagation, inspect interval_math.py and math_3d.py together. Most interval failures come from denominator crossings, interval overestimation, or invalid atmosphere inputs.
+Best artifact today: the behavior clone (`bc_orion_entry_v1`, ~91 km). All runs,
+models, and metric CSVs are logged to Weights & Biases and Google Drive.
 
-3. If guidance seems inactive, inspect control.py and then the notebook guidance diagnostic cells.
+---
 
-4. If sigma_cmd changes but sigma_actual does not, inspect ReactionControl.py, requested_duty, fired_this_step, active_thrusters, and torque_z_from_rcs.
+## Known limitations
 
-5. If the trajectory shape looks wrong even when control is active, inspect nominal_eom_step in math_3d.py and the observation geometry in control.py.
+These are deliberate scope choices / unvalidated assumptions, stated plainly:
 
-6. If heating looks symmetric when directional structure is expected, inspect the HeatShield update path and the hot_theta_rad handling in constants.py.
+- **First-order integration.** Explicit forward Euler at 0.25 s — no RK4, no
+  convergence study.
+- **Non-rotating Earth.** No Coriolis / Earth-rotation terms.
+- **Reduced-order aero.** A scheduled Orion-*like* CD/L·D model, **not** the
+  official Orion aerodatabase.
+- **Calibrated, not validated, radiative heating.** The Tauber-Sutton velocity
+  function is anchored to an Apollo-4-style calibration, not validated against a
+  reference trajectory. Heating magnitudes are plausible but unverified.
+- **Approximate interval g-bound.** The live shield's g bound scales nominal load
+  factor by the dynamic-pressure ratio (a rigorous interval-g variant exists as a
+  local experiment but is not in the training loop).
+- **No automated test suite.**
+- **RL training is Colab-only** (gym/SB3 are not installed for local runs).
 
-Good workflow for code changes
+---
 
-1. Change one module at a time.
-2. Restart the notebook kernel after editing shared modules.
-3. Re run the notebook from the import cell downward.
-4. Confirm that df is populated before trusting any later plots.
-5. Check the final compact summary table and the RCS diagnostic plots after each major change.
-6. Save csv outputs after a stable run so later comparisons stay easy.
+## Requirements
 
-Suggested future cleanup
+- **Simulator:** Python 3.10+, `numpy`, `pandas`, `matplotlib`, `pymsis`.
+- **RL (Colab):** `gymnasium`, `stable-baselines3>=2.3`, `wandb`, `torch`
+  (installed by the notebook).
+- **Dashboard:** Node 18+, `npm` (React + Vite; see `mission_control_ui/`).
 
-1. Rename Pasted code.py to milestone1_nominal.py.
-2. Move notebook helper functions into a dedicated utilities module.
-3. Add one small runner script that mirrors the notebook simulation loop for batch runs.
-4. Keep the notebook for diagnostics and plotting while the runner script handles repeatable experiments.
+See `StochasticEntrySim/docs/ReEntryAI_Technical_Overview.pdf` and
+`docs/rl_mdp_spec.md` for deeper technical write-ups.
