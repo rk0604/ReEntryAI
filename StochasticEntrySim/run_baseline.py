@@ -1,25 +1,25 @@
 """
-Phase 3 -- baseline characterization.
+Phase 3 baseline characterization.
 
-Run the classical predictor-corrector (OrionEntryEnv in "baseline" mode) over
-the frozen held-out test set and record per-case metrics. This produces the
-metric *distributions* the RL policy must beat (Phase 5). The baseline is
-deterministic for a given IC (the controlled segment ends at drogue deploy,
-before any stochastic CPAS effects), so results are reproducible.
+This runs the classical predictor corrector (OrionEntryEnv in baseline mode)
+over the frozen held out test set and records per case metrics. The result is
+the metric distribution the RL policy must beat. The baseline is deterministic
+for a given initial condition, because the controlled segment ends at drogue
+deploy, before any stochastic parachute effects, so results are reproducible.
 
-The predictor is the slow path (~minutes/run: it does many long nominal
-rollouts per guidance cycle), so cases are run in parallel across CPU cores.
-Each worker process builds one env (and one atmosphere table) and reuses it for
-all the cases it's handed.
+The predictor is the slow path, on the order of minutes per run, since it does
+many long nominal rollouts per guidance cycle. Cases are therefore run in
+parallel across CPU cores. Each worker process builds one environment, and one
+atmosphere table, then reuses it for every case it is handed.
 
 Usage:
-    python run_baseline.py                       # full test set, all cores
-    python run_baseline.py --limit 24            # quick subset first
+    python run_baseline.py                       full test set, all cores
+    python run_baseline.py --limit 24            quick subset first
     python run_baseline.py --workers 8 --out runs/baseline_metrics.csv
-    python run_baseline.py --hifi-atmosphere     # disable the fast table
+    python run_baseline.py --hifi-atmosphere     disable the fast table
 
-Output: a CSV of per-case metrics (one row per IC) + a printed distribution
-summary. Read it later with pandas for the Pareto comparison.
+Output: a CSV of per case metrics, one row per initial condition, plus a printed
+distribution summary. Read it later with pandas for the comparison.
 """
 
 from __future__ import annotations
@@ -34,20 +34,31 @@ from typing import Dict, List, Optional
 THIS_DIR = Path(__file__).resolve().parent
 DEFAULT_OUT = THIS_DIR / "runs" / "baseline_metrics.csv"
 
+# Column order for the output CSV. One row holds the case index, its six
+# initial condition values, and the resulting flight metrics.
 METRIC_COLUMNS = (
     "idx", "alt0_m", "V0_mps", "gamma0_deg", "chi0_deg", "phi0_deg", "lam0_deg",
     "outcome", "miss_km", "peak_g", "peak_qdot_MWm2", "rcs_fuel_kg",
     "success", "t_s", "wall_s",
 )
 
-# --- per-worker globals (built once per process) -----------------------------
+# Per worker globals. These are built once per process and reused across cases.
 _ENV = None
 _CONFIG = None
 _FAST_ATM = True
 
 
 def _worker_init(config_path: str, fast_atmosphere: bool) -> None:
-    """Build the baseline env once in each worker process."""
+    """
+    Build the baseline environment once inside a worker process.
+
+    Parameters:
+        config_path:     mission config the baseline flies.
+        fast_atmosphere: use the fast tabulated atmosphere when True.
+
+    Stores the environment and its settings in module globals so _run_one can
+    reuse them for every case the worker handles.
+    """
     global _ENV, _CONFIG, _FAST_ATM
     import rl_env  # imported in the child so the atmosphere table builds here
     _CONFIG = config_path
@@ -58,7 +69,18 @@ def _worker_init(config_path: str, fast_atmosphere: bool) -> None:
 
 
 def _run_one(case: Dict) -> Dict:
-    """Run the predictor-corrector on one frozen IC; return its metric row."""
+    """
+    Run the predictor corrector on one frozen initial condition.
+
+    Parameters:
+        case: a dictionary with keys idx (case index) and ic (the initial
+              condition dictionary to replay).
+
+    Returns:
+        A metric row dictionary matching METRIC_COLUMNS, including the outcome,
+        miss distance, peak g, peak heat rate, fuel used, success flag, flight
+        time, and wall clock time for the run.
+    """
     global _ENV
     idx = int(case["idx"])
     ic = case["ic"]
@@ -66,7 +88,7 @@ def _run_one(case: Dict) -> Dict:
     _ENV.reset(options={"ic_override": ic})
     done = False
     info = {}
-    # action is ignored in baseline mode; sample() is just a placeholder.
+    # The action is ignored in baseline mode; sample() is only a placeholder.
     a = _ENV.action_space.sample()
     while not done:
         _, _, term, trunc, info = _ENV.step(a)
@@ -89,7 +111,18 @@ def _run_one(case: Dict) -> Dict:
 
 
 def _percentile(vals: List[float], q: float) -> float:
-    s = sorted(v for v in vals if v == v)  # drop NaN
+    """
+    Return the q percentile of a list, ignoring NaN values.
+
+    Parameters:
+        vals: list of numbers, possibly containing NaN.
+        q:    percentile in the range 0 to 100.
+
+    Returns:
+        The value at the requested percentile, or NaN when no finite values
+        are present. Uses nearest rank on the sorted finite values.
+    """
+    s = sorted(v for v in vals if v == v)  # the v == v test drops NaN
     if not s:
         return float("nan")
     i = min(len(s) - 1, max(0, int(round(q / 100.0 * (len(s) - 1)))))
@@ -97,10 +130,21 @@ def _percentile(vals: List[float], q: float) -> float:
 
 
 def _summarize(rows: List[Dict]) -> str:
+    """
+    Build a printable distribution summary across all metric rows.
+
+    Parameters:
+        rows: list of metric row dictionaries from _run_one.
+
+    Returns:
+        A multi line string with the case count, success rate, the count of
+        each outcome, and the median, p90, and max of the main metrics.
+    """
     n = len(rows)
     succ = sum(r["success"] for r in rows)
     lines = [f"  cases             : {n}",
              f"  success (<=target): {succ}/{n} ({100.0*succ/max(1,n):.1f}%)"]
+    # Tally how many runs ended in each outcome.
     outc: Dict[str, int] = {}
     for r in rows:
         outc[r["outcome"]] = outc.get(r["outcome"], 0) + 1
@@ -115,6 +159,21 @@ def _summarize(rows: List[Dict]) -> str:
 
 def run_batch(config_path: str, test_set_path: str, out_path: Path,
               limit: Optional[int], workers: int, fast_atmosphere: bool) -> List[Dict]:
+    """
+    Run the baseline over a test set and write the metric CSV.
+
+    Parameters:
+        config_path:     mission config the baseline flies.
+        test_set_path:   path to the frozen test set CSV.
+        out_path:        destination CSV for the metric rows.
+        limit:           when set, run only the first this many cases.
+        workers:         number of parallel worker processes. 1 runs serially.
+        fast_atmosphere: use the fast tabulated atmosphere when True.
+
+    Returns:
+        The list of metric rows, sorted by case index. Also writes the CSV and
+        prints a progress trace and a distribution summary.
+    """
     from make_test_set import load_test_set
     ics = load_test_set(test_set_path)
     if limit is not None:
@@ -129,11 +188,13 @@ def run_batch(config_path: str, test_set_path: str, out_path: Path,
     rows: List[Dict] = []
     t0 = time.time()
     if workers == 1:
+        # Serial path: build one environment here and run every case in order.
         _worker_init(config_path, fast_atmosphere)
         for k, c in enumerate(cases):
             rows.append(_run_one(c))
             _progress(k + 1, n, t0)
     else:
+        # Parallel path: a spawn pool, each worker builds its own environment.
         import multiprocessing as mp
         ctx = mp.get_context("spawn")
         with ctx.Pool(processes=workers, initializer=_worker_init,
@@ -142,6 +203,7 @@ def run_batch(config_path: str, test_set_path: str, out_path: Path,
                 rows.append(row)
                 _progress(k + 1, n, t0)
 
+    # Restore case order before writing, since the pool returns out of order.
     rows.sort(key=lambda r: r["idx"])
     with out_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=METRIC_COLUMNS)
@@ -154,6 +216,14 @@ def run_batch(config_path: str, test_set_path: str, out_path: Path,
 
 
 def _progress(done: int, total: int, t0: float) -> None:
+    """
+    Print a one line progress update with elapsed time and a rough estimate.
+
+    Parameters:
+        done:  number of cases finished so far.
+        total: total number of cases.
+        t0:    start time from time.time(), used to compute elapsed seconds.
+    """
     el = time.time() - t0
     rate = done / el if el > 0 else 0.0
     eta = (total - done) / rate if rate > 0 else float("inf")
@@ -161,6 +231,13 @@ def _progress(done: int, total: int, t0: float) -> None:
 
 
 def main() -> None:
+    """
+    Command line entry point. Parse arguments and run the baseline batch.
+
+    Flags select the config, the test set path, the output path, an optional
+    case limit, the worker count, and whether to use full fidelity atmosphere
+    in place of the fast table.
+    """
     ap = argparse.ArgumentParser(description="Characterize the classical baseline.")
     ap.add_argument("--config", default="configs/default.json")
     ap.add_argument("--test-set", default="configs/heldout_testset.csv")

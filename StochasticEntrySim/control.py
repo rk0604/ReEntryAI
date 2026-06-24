@@ -263,6 +263,7 @@ class ReentryState:
 
     @sigma_rad.setter
     def sigma_rad(self, value: float) -> None:
+        """Set the actual flown bank angle through the compatibility alias."""
         self.sigma_actual_rad = float(value)
 
     @property
@@ -274,6 +275,7 @@ class ReentryState:
 
     @sigma_dot_rps.setter
     def sigma_dot_rps(self, value: float) -> None:
+        """Set the actual roll rate through the compatibility alias."""
         self.roll_rate_rad_s = float(value)
 
 
@@ -313,6 +315,7 @@ class GuidanceLaw(Protocol):
     """
 
     def reset(self) -> None:
+        """Reset any internal guidance state. Part of the interface."""
         ...
 
     def compute_sigma_cmd(
@@ -321,6 +324,7 @@ class GuidanceLaw(Protocol):
         state: ReentryState,
         obs: Dict[str, float],
     ) -> float:
+        """Return the commanded bank angle in radians. Part of the interface."""
         ...
 
 
@@ -331,9 +335,11 @@ class ObservationProvider(Protocol):
     """
 
     def reset(self) -> None:
+        """Reset any internal observation state. Part of the interface."""
         ...
 
     def observe(self, state: ReentryState, t_s: float) -> Dict[str, float]:
+        """Return the guidance feature dictionary for a state. Part of the interface."""
         ...
 
 
@@ -786,6 +792,7 @@ class SimpleBankGuidance:
         eval_log: List[Dict[str, float]] = []
 
         def cost(mag_rad):
+            """Return the predicted terminal miss for a bank magnitude, and log it."""
             if mag_rad < 1.0e-9 or bank_sign == 0.0:
                 sigma = 0.0
             else:
@@ -1206,6 +1213,7 @@ class GuidanceScheduler:
     """
 
     def __init__(self, period_s: float):
+        """Build the scheduler with the guidance update period in seconds."""
         # Store the allowed guidance update period.
         self.period_s = float(period_s)
 
@@ -1277,6 +1285,14 @@ class BasicObservationProvider:
         target_lam_rad: float,
         params: Optional[dict] = None,
     ):
+        """
+        Build the observation provider.
+
+        Parameters:
+            target_phi_rad: target latitude in radians.
+            target_lam_rad: target longitude in radians.
+            params:         optional parameter dict shared with guidance.
+        """
         # Store the target location.
         self.target_phi = float(target_phi_rad)
         self.target_lam = float(target_lam_rad)
@@ -1396,6 +1412,7 @@ class BankActuator:
     """
 
     def __init__(self, limits: BankActuatorLimits):
+        """Build the actuator with its rate and acceleration limits."""
         # Store the command shaping limits.
         self.limits = limits
 
@@ -1593,6 +1610,17 @@ class CapsuleControlStack:
         bank_actuator: BankActuator,
         roll_controller: RollTorqueController,
     ):
+        """
+        Build the full control stack from its component objects.
+
+        Parameters:
+            cfg:             control stack configuration.
+            scheduler:       gates how often guidance updates.
+            guidance:        the guidance law that proposes the bank.
+            obs_provider:    builds guidance features from the state.
+            bank_actuator:   smooths the commanded bank into a target.
+            roll_controller: turns bank error into a roll torque command.
+        """
         # Store all stack components.
         self.cfg = cfg
         self.scheduler = scheduler

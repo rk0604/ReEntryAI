@@ -51,6 +51,7 @@ import constants
 def _in_category(*categories):
     """Decorator: tag a plot function with one or more category names."""
     def deco(fn):
+        """Attach the category tags to the plot function and return it."""
         fn._categories = tuple(categories)
         return fn
     return deco
@@ -84,6 +85,7 @@ MAJOR_CPAS_EVENTS = {
 
 
 def _is_major_event(event_str: str) -> bool:
+    """Return True when an event string names a major CPAS event worth labeling."""
     if not event_str:
         return False
     return any(tok.strip() in MAJOR_CPAS_EVENTS for tok in str(event_str).split(","))
@@ -200,6 +202,7 @@ def _lat_lon_to_local_enu(phi_rad, lam_rad, phi0_rad, lam0_rad,
 
 @_in_category('trajectory')
 def plot_ground_track(df, save_fig, target_phi_rad=0.0, target_lam_rad=0.0, **_):
+    """Plot the ground track in latitude and longitude with the target marked."""
     track = df.copy()
     track["phi_deg"] = np.degrees(track["phi_rad"])
     track["lam_deg"] = np.degrees(track["lam_rad"])
@@ -221,6 +224,7 @@ def plot_ground_track(df, save_fig, target_phi_rad=0.0, target_lam_rad=0.0, **_)
 
 @_in_category("trajectory")
 def plot_3d_descent_tube(df, save_fig, **_):
+    """Plot the descent path as a 3D tube in an east, north, up frame."""
     track = df.copy()
     phi0 = float(track["phi_rad"].iloc[0])
     lam0 = float(track["lam_rad"].iloc[0])
@@ -257,6 +261,7 @@ def plot_3d_descent_tube(df, save_fig, **_):
 
 @_in_category('state')
 def plot_altitude(df, save_fig, **_):
+    """Plot altitude versus time, with CPAS event markers."""
     fig, ax = plt.subplots(figsize=(11, 4))
     plot_with_band(ax, df["t_s"], df["alt_m"] / 1000.0,
                    df["interval_alt_lo"] / 1000.0, df["interval_alt_hi"] / 1000.0,
@@ -522,6 +527,7 @@ def plot_cpas_chute_descent_track(df, save_fig, **_):
 
 @_in_category('state')
 def plot_speed(df, save_fig, **_):
+    """Plot speed versus time."""
     fig, ax = plt.subplots(figsize=(11, 4))
     plot_with_band(ax, df["t_s"], df["V_mps"], df["V_lo"], df["V_hi"],
                    "Speed with interval band", "V m/s")
@@ -531,6 +537,7 @@ def plot_speed(df, save_fig, **_):
 
 @_in_category('state')
 def plot_gamma(df, save_fig, **_):
+    """Plot the flight path angle versus time."""
     fig, ax = plt.subplots(figsize=(11, 4))
     plot_with_band(ax, df["t_s"],
                    np.degrees(df["gamma_rad"]),
@@ -544,6 +551,7 @@ def plot_gamma(df, save_fig, **_):
 
 @_in_category('state')
 def plot_chi(df, save_fig, **_):
+    """Plot the heading angle versus time."""
     fig, ax = plt.subplots(figsize=(11, 4))
     plot_with_band(ax, df["t_s"],
                    np.degrees(df["chi_rad"]),
@@ -614,6 +622,7 @@ def plot_aero_coefficients(df, save_fig, **_):
 
 @_in_category('state')
 def plot_lat_lon(df, save_fig, **_):
+    """Plot latitude and longitude versus time side by side."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 4))
     plot_with_band(axes[0], df["t_s"], np.degrees(df["phi_rad"]),
                    np.degrees(df["phi_lo"]), np.degrees(df["phi_hi"]),
@@ -627,6 +636,7 @@ def plot_lat_lon(df, save_fig, **_):
 
 @_in_category('interval')
 def plot_state_widths(df, save_fig, **_):
+    """Plot the interval box width of each state versus time."""
     width_cols = [("r_width", "r_m"), ("V_width", "V_mps"),
                   ("gamma_width", "gamma_rad"), ("chi_width", "chi_rad")]
     fig, axes = plt.subplots(2, 2, figsize=(13, 7), sharex=True)
@@ -650,6 +660,7 @@ def plot_state_widths(df, save_fig, **_):
 
 @_in_category('interval')
 def plot_density_q(df, save_fig, **_):
+    """Plot atmospheric density and dynamic pressure versus time."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 4))
     plot_with_band(axes[0], df["t_s"], df["rho_kgm3"], df["interval_rho_lo"], df["interval_rho_hi"],
                    "Density with interval band", "rho kg/m^3")
@@ -690,6 +701,7 @@ def plot_heating_components(df, save_fig, **_):
 
 @_in_category('heating')
 def plot_heating_envelope(df, save_fig, **_):
+    """Plot the heat rate and accumulated heat load versus time."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 4))
     axes[0].plot(df["t_s"], df["nominal_heat_qdot_max_hi"] / 1e6, color="C0", lw=2, label="Nominal qdot hi")
     if "heating_qdot_max_hi" in df.columns and df["heating_qdot_max_hi"].notna().any():
@@ -710,6 +722,7 @@ def plot_heating_envelope(df, save_fig, **_):
 
 @_in_category('heating')
 def plot_heat_shield_map(df, save_fig, nominal_heat_shield=None, **_):
+    """Plot the ring and sector heat map of the heat shield."""
     if nominal_heat_shield is None:
         print("No nominal heat shield available")
         return
@@ -733,6 +746,7 @@ def plot_heat_shield_map(df, save_fig, nominal_heat_shield=None, **_):
 
 @_in_category('guidance')
 def plot_guidance(df, save_fig, **_):
+    """Plot the chosen bank and guidance diagnostics at each guidance update."""
     g = df[df["guidance_updated"] == 1].copy()
     print("Guidance updates:", len(g))
     fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
@@ -751,6 +765,7 @@ def plot_guidance(df, save_fig, **_):
 
 @_in_category('guidance')
 def plot_candidate_distribution(df, save_fig, **_):
+    """Plot the distribution of candidate banks the guidance evaluated."""
     g = df[df["guidance_updated"] == 1].copy()
     if not len(g):
         return
@@ -765,6 +780,7 @@ def plot_candidate_distribution(df, save_fig, **_):
 
 @_in_category('rcs')
 def plot_bank_error(df, save_fig, **_):
+    """Plot the bank tracking error, command minus actual, versus time."""
     err_deg = np.degrees(df["sigma_cmd_rad"] - df["sigma_actual_rad"])
     fig, ax = plt.subplots(figsize=(11, 4))
     ax.plot(df["t_s"], err_deg, color="C3", lw=1, label="sigma_cmd - sigma_actual")
@@ -778,6 +794,7 @@ def plot_bank_error(df, save_fig, **_):
 
 @_in_category('rcs')
 def plot_roll_rate_accel(df, save_fig, **_):
+    """Plot the roll rate and roll acceleration versus time."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 4))
     axes[0].plot(df["t_s"], np.degrees(df["roll_rate_rad_s"]), color="C0")
     axes[0].set_xlabel("Time s"); axes[0].set_ylabel("Roll rate deg/s"); axes[0].set_title("Roll rate")
@@ -789,6 +806,7 @@ def plot_roll_rate_accel(df, save_fig, **_):
 
 @_in_category('rcs')
 def plot_torque(df, save_fig, **_):
+    """Plot the commanded and delivered roll torque versus time."""
     fig, ax = plt.subplots(figsize=(12, 4))
     ax.plot(df["t_s"], df["tau_roll_cmd_Nm"], color="C0", lw=1.2, label="Commanded torque")
     ax.plot(df["t_s"], df["tau_roll_realized_Nm"], color="C1", lw=1.0, alpha=0.8, label="Realized RCS torque (Mz)")
@@ -803,6 +821,7 @@ def plot_torque(df, save_fig, **_):
 
 @_in_category('rcs')
 def plot_duty_vs_fired(df, save_fig, **_):
+    """Plot requested roll duty against actual firing events versus time."""
     fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
     axes[0].plot(df["t_s"], df["requested_duty"], color="C0", lw=1, label="Requested duty")
     axes[0].set_ylabel("Duty (0-1)"); axes[0].set_title("Requested RCS duty cycle")
@@ -819,6 +838,7 @@ def plot_duty_vs_fired(df, save_fig, **_):
 
 @_in_category('rcs')
 def plot_thruster_raster(df, save_fig, thruster_fires_df=None, rcs_system=None, **_):
+    """Plot a raster of which thrusters fired over time."""
     if thruster_fires_df is None or len(thruster_fires_df) == 0:
         print("No thruster firings recorded.")
         return
@@ -845,6 +865,7 @@ def plot_thruster_raster(df, save_fig, thruster_fires_df=None, rcs_system=None, 
 
 @_in_category('rcs')
 def plot_firing_rate(df, save_fig, dt_s=0.25, **_):
+    """Plot the RCS firing rate over a moving time window."""
     win = max(1, int(round(5.0 / float(dt_s))))
     fire_rate_hz = df["fired_this_step"].rolling(win, min_periods=1).mean() / float(dt_s)
     fig, ax = plt.subplots(figsize=(11, 4))
@@ -857,6 +878,7 @@ def plot_firing_rate(df, save_fig, dt_s=0.25, **_):
 
 @_in_category('rcs')
 def plot_backlog(df, save_fig, **_):
+    """Plot the roll channel backlog versus time."""
     fig, ax = plt.subplots(figsize=(12, 4))
     ax.plot(df["t_s"], df["roll_pos_backlog_s"], color="C0", label="+roll pod backlog s")
     ax.plot(df["t_s"], df["roll_neg_backlog_s"], color="C3", label="-roll pod backlog s")
@@ -925,6 +947,7 @@ def render_all_figures(df, save_fig, only=None, exclude=None, **ctx: Any) -> lis
 
     # Normalize only/exclude into sets
     def _to_set(x):
+        """Coerce None, a string, or an iterable into a set of category names."""
         if x is None:
             return None
         if isinstance(x, str):

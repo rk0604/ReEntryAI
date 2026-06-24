@@ -458,6 +458,20 @@ class HeatShield:
         radial_exp: float = HEAT_SHIELD_RADIAL_EXP,
         azimuthal_gain: float = HEAT_SHIELD_AZIMUTHAL_GAIN,
     ):
+        """
+        Build the ring and sector heat shield grid.
+
+        Parameters:
+            radius_m:       shield radius in meters. Must be positive.
+            nose_radius_m:  stagnation nose radius in meters. Must be positive.
+            num_rings:      number of concentric radial rings. Must be positive.
+            num_sectors:    number of equal angular sectors. Must be positive.
+            radial_exp:     exponent that shapes the radial heating falloff.
+            azimuthal_gain: directional heating contrast, between zero and one.
+
+        Validates the inputs, builds the per cell geometry (radii, angles, and
+        annular sector areas), and resets the thermal state to zero.
+        """
         # The heat shield radius must be positive because it defines the full
         # spatial extent of the discretized surface.
         if radius_m <= 0.0:
@@ -674,6 +688,7 @@ class HeatShield:
         denom = HEAT_SHIELD_EMISSIVITY * STEFAN_BOLTZMANN_W_M2_K4
 
         def _Tw(q):
+            """Return the wall temperature for one net flux value, clamped at zero."""
             q = max(0.0, float(q))
             return (q / denom) ** 0.25 if denom > 0.0 else 0.0
 

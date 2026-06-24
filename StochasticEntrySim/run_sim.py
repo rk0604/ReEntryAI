@@ -1,3 +1,21 @@
+"""
+run_sim.py: single trajectory driver for the entry simulator.
+
+This script flies one Orion entry from the entry interface to drogue deploy
+using the classical predictor corrector guidance, the interval supervisor, the
+timed RCS, and the parachute model, then writes the trajectory data and the full
+set of diagnostic figures. It is the script form of the canonical run, and it
+shares the plotting code in plotting.py with the companion notebook so both
+produce the same named figures.
+
+The mission is driven entirely by a JSON config loaded through mission_config.
+Override the config path with the SIM_CONFIG environment variable, for example:
+    SIM_CONFIG=configs/example_failure_2of3.json python run_sim.py
+
+This file began life as a Jupyter notebook, so a few cells still call display().
+A no op shim is provided below so the script runs headless.
+"""
+
 # Imports for the interval propagation and physical bank control notebook
 
 import json
@@ -34,6 +52,7 @@ try:
     from IPython.display import display  # type: ignore
 except Exception:  # noqa: BLE001
     def display(*args, **kwargs):  # type: ignore[no-redef]
+        """No op stand in for IPython display that simply prints its arguments."""
         for a in args:
             print(a)
 from math_3d import (
@@ -69,40 +88,58 @@ STATE_NAMES = ["r_m", "phi_rad", "lam_rad", "V_mps", "gamma_rad", "chi_rad"]
 
 
 def interval_mid(iv):
+    """Return the midpoint of an interval."""
     # Returns the midpoint of an interval
     return 0.5 * (iv.lo + iv.hi)
 
 
 def interval_width(iv):
+    """Return the width of an interval, hi minus lo."""
     # returns the width of an interval
     return iv.hi - iv.lo
 
 
 def box_mid(box):
+    """Return the midpoint of every interval in a box."""
     # Return midpoints for every interval in the box
     return [interval_mid(iv) for iv in box]
 
 
 def box_widths(box):
+    """Return the width of every interval in a box."""
     # Return the widths for every interval in the box
     return [interval_width(iv) for iv in box]
 
 
 def deg(x_rad):
+    """Convert an angle from radians to degrees."""
     # Convert from radians to degrees
     return math.degrees(x_rad)
 
 
 def alt_from_r(r_m):
+    """Convert a radius from Earth center into geometric altitude in meters."""
     # Convert radius from Earth center into geometric altitude
     return r_m - constants.RADIUS_EARTH
 
 def wrap_angle_rad(x_rad):
+    """Wrap an angle in radians into the principal range minus pi to pi."""
     # Wrap an angle into the principal range
     return wrap_to_pi(float(x_rad))
 
 
 def atmosphere_from_state_vector(x):
+    """
+    Return a compact atmosphere and dynamic pressure summary for a state.
+
+    Parameters:
+        x: the translational state vector. Only radius and speed are used.
+
+    Returns:
+        A dictionary with altitude, density, temperature, pressure, and dynamic
+        pressure. Density is zero and temperature and pressure are NaN above the
+        atmosphere model range.
+    """
     # Read radius and speed from the translational state vector
     r_m, _, _, V_mps, _, _ = x
 
@@ -137,6 +174,19 @@ def milestone1_roll_update(
     dt_s,
     Izz_kgm2,
 ):
+    """
+    Advance the roll state by one step from an applied roll torque.
+
+    Parameters:
+        sigma_actual_rad: current bank angle in radians.
+        roll_rate_rad_s:  current roll rate in radians per second.
+        tau_rcs_z_Nm:     applied roll torque about body z in newton meters.
+        dt_s:             time step in seconds.
+        Izz_kgm2:         roll inertia in kilogram meter squared.
+
+    Returns:
+        The updated bank angle and roll rate after integrating the torque.
+    """
     # Convert applied roll torque into roll angular acceleration
     roll_accel_rad_s2 = float(tau_rcs_z_Nm) / float(Izz_kgm2)
 
@@ -596,6 +646,13 @@ print("Negative roll thrusters", rcs_system.roll_neg_names)
 
 def nominal_step_closed_loop(x_nominal_old, sigma_actual_rad, params, dt_s):
     # Run one nominal Euler step using the corrected shared implementation
+    """
+    Advance the nominal closed loop one step: guidance, RCS, roll, translation.
+
+    Runs the controller, applies the resulting roll torque through the roll
+    update, and integrates the translational state with the realized bank.
+    Returns the new state along with the control and roll telemetry for logging.
+    """
     step_info = nominal_eom_step(
         x=x_nominal_old,
         sigma_rad=float(sigma_actual_rad),
@@ -745,6 +802,12 @@ def control_step_fn_diag(
     sigma_actual_rad: float,
     roll_rate_rad_s: float,
 ):
+    """
+    Controller bridge for the diagnostic rollout.
+
+    Builds the control facing state, computes lift and drag, and steps the
+    control stack, matching the interface the nominal closed loop step expects.
+    """
     # Convert the translational state into the controller facing state object
     r_m, phi_rad, lam_rad, V_mps, gamma_rad, chi_rad = [float(v) for v in x_state]
 
@@ -896,6 +959,12 @@ rows = []
 
 # Build a controller bridge that matches the nominal closed loop step interface
 def control_step_fn_main(t_s, x_state, sigma_actual_rad, roll_rate_rad_s):
+    """
+    Controller bridge for the main simulation loop.
+
+    Builds the control facing state, computes lift and drag, and steps the
+    control stack, matching the interface the nominal closed loop step expects.
+    """
     # Convert the translational state into the controller facing state object
     r_m, phi_rad, lam_rad, V_mps, gamma_rad, chi_rad = [float(v) for v in x_state]
 
@@ -1626,6 +1695,7 @@ if "active_thrusters" in df.columns:
 thruster_fires_df = pd.DataFrame(_fire_records)
 
 def _run_sim_save_fig(name):
+    """Save the current matplotlib figure under PY_FIG_DIR using the given name."""
     path = PY_FIG_DIR / f"{name}.png"
     plt.savefig(path, bbox_inches="tight")
     print(f"  saved {path}")
@@ -1974,6 +2044,7 @@ print("Approximate total nominal path length km", total_distance_km)
 from mpl_toolkits.mplot3d import Axes3D
 
 def spherical_to_cartesian(r, phi, lam):
+    """Convert radius, latitude, and longitude into Cartesian x, y, z coordinates."""
     x = r * np.cos(phi) * np.cos(lam)
     y = r * np.cos(phi) * np.sin(lam)
     z = r * np.sin(phi)
@@ -2058,6 +2129,10 @@ lam0 = float(df["lam_rad"].iloc[0])
 # The approximation is local, so it is most useful when the path is viewed relative to the start point.
 def local_track_from_lat_lon_alt(phi_rad, lam_rad, alt_m, phi_ref_rad, lam_ref_rad, R_m):
     # East distance comes from longitude change scaled by the cosine of the reference latitude.
+    """
+    Convert a latitude, longitude, and altitude into a local east, north, up
+    track, in meters, relative to a reference latitude and longitude.
+    """
     east_m = R_m * (lam_rad - lam_ref_rad) * math.cos(phi_ref_rad)
 
     # North distance comes directly from latitude change.

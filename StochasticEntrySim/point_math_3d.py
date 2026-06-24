@@ -1,3 +1,25 @@
+"""
+Closed loop point mass dynamics and attitude helpers for the 3DOF simulator.
+
+This module ties the translational state to a simple roll only attitude model
+and the reaction control system. It provides:
+
+  Small vector and quaternion helpers (normalize, dot, cross, matrix products,
+  axis angle to quaternion, quaternion to direction cosine matrix).
+  Frame helpers that move between the local level frame, the aerodynamic frame,
+  the body frame, and the world frame.
+  The roll only attitude state and its one step update, where a roll torque
+  drives a roll rate and the bank angle.
+  The aerodynamic force adapter and the live translational derivatives, both of
+  which defer to the canonical equations in math_3d.
+  step_closed_loop_milestone1, which advances guidance, the timed RCS, the roll
+  attitude, and the translational state together for one outer step.
+
+The translational state order is [r, phi, lambda, V, gamma, chi]. The bank angle
+is recovered from the attitude quaternion, so the flown bank can differ from the
+commanded bank while the actuator and RCS catch up.
+"""
+
 import math
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -14,6 +36,7 @@ from ReactionControl import CapsuleRCSSystem, RCSWrench, ThrusterFireCommand
 # Small math helpers used throughout the nominal simulation path
 
 def wrap_to_pi(angle_rad: float) -> float:
+    """Wrap an angle in radians into the range minus pi to pi."""
     # Keep angles inside the principal interval used everywhere else in the sim
     while angle_rad > math.pi:
         angle_rad -= 2.0 * math.pi
@@ -25,11 +48,23 @@ def wrap_to_pi(angle_rad: float) -> float:
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
+    """Return value held inside the closed range [lower, upper]."""
     # Keep a scalar inside a closed interval
     return max(lower, min(upper, value))
 
 
 def normalize(vec: List[float], eps: Optional[float] = None) -> List[float]:
+    """
+    Return the unit length version of a three component vector.
+
+    Parameters:
+        vec: a three element sequence.
+        eps: smallest length treated as nonzero. Defaults to a small constant.
+
+    Returns:
+        The unit vector, or a zero vector when the input is too short to
+        normalize safely.
+    """
     # Pull the default norm threshold from constants when none is supplied
     if eps is None:
         eps = getattr(constants, "EPS_NORM", 1.0e-12)
@@ -50,11 +85,13 @@ def normalize(vec: List[float], eps: Optional[float] = None) -> List[float]:
 
 
 def dot3(a: List[float], b: List[float]) -> float:
+    """Return the dot product of two three component vectors."""
     # Standard three dimensional dot product
     return float(a[0]) * float(b[0]) + float(a[1]) * float(b[1]) + float(a[2]) * float(b[2])
 
 
 def cross3(a: List[float], b: List[float]) -> List[float]:
+    """Return the cross product of two three component vectors."""
     # Standard three dimensional cross product
     ax, ay, az = float(a[0]), float(a[1]), float(a[2])
     bx, by, bz = float(b[0]), float(b[1]), float(b[2])
@@ -67,6 +104,7 @@ def cross3(a: List[float], b: List[float]) -> List[float]:
 
 
 def mat_vec_mul(M: List[List[float]], v: List[float]) -> List[float]:
+    """Return the product of a three by three matrix and a three vector."""
     # Three by three matrix times three component vector
     return [
         float(M[0][0]) * float(v[0]) + float(M[0][1]) * float(v[1]) + float(M[0][2]) * float(v[2]),
@@ -76,6 +114,7 @@ def mat_vec_mul(M: List[List[float]], v: List[float]) -> List[float]:
 
 
 def mat_mul_3x3(A: List[List[float]], B: List[List[float]]) -> List[List[float]]:
+    """Return the product of two three by three matrices."""
     # Three by three matrix product
     return [
         [
@@ -89,6 +128,7 @@ def mat_mul_3x3(A: List[List[float]], B: List[List[float]]) -> List[List[float]]
 
 
 def safe_nonzero(value: float, eps: float = 1.0e-12) -> float:
+    """Nudge a value away from zero to keep divisions in the float path safe."""
     # Prevent division by zero in the float dynamics path
     if abs(value) >= eps:
         return value
@@ -97,6 +137,15 @@ def safe_nonzero(value: float, eps: float = 1.0e-12) -> float:
 
 
 def _get_param(params: Dict[str, Any], *keys: str, default: Optional[float] = None) -> float:
+    """
+    Return the first matching numeric parameter from a dictionary.
+
+    Parameters:
+        params:  the parameter dictionary.
+        keys:    candidate key names tried in order.
+        default: value returned when no key matches. When None, a missing key
+                 raises KeyError.
+    """
     # Return the first matching numeric parameter from a dictionary
     for key in keys:
         if key in params:
@@ -109,12 +158,32 @@ def _get_param(params: Dict[str, Any], *keys: str, default: Optional[float] = No
 
 
 def add_scaled_state(x: List[float], dx: List[float], dt_s: float) -> List[float]:
+    """
+    Take one forward Euler step on a flat state vector.
+
+    Parameters:
+        x:    the current state vector.
+        dx:   the derivative vector.
+        dt_s: the time step in seconds.
+
+    Returns:
+        The vector x plus dt_s times dx, element by element.
+    """
     # Forward Euler update for a flat state vector
     return [float(x[i]) + float(dt_s) * float(dx[i]) for i in range(len(x))]
 
 
 @dataclass
 class CapsuleAttitudeState:
+    """
+    Roll only attitude of the capsule.
+
+    Fields:
+        q_ba:          quaternion that maps body vectors into the aerodynamic
+                       frame.
+        omega_b_rad_s: body angular rate relative to the aerodynamic frame.
+        sigma_rel_rad: the bank angle the attitude currently represents.
+    """
     # q_ba maps body frame vectors into aerodynamic frame vectors
     q_ba: List[float]
 
@@ -127,6 +196,11 @@ class CapsuleAttitudeState:
 
 @dataclass
 class AggregatedRollChannelStepResult:
+    """
+    Roll channel telemetry aggregated across the internal RCS sub steps of one
+    outer step. Holds the commanded torque, the available capacity, the average
+    duty, the time averaged wrench, and the firing counts and backlog.
+    """
     # Outer step roll torque command from the controller
     tau_roll_cmd_Nm: float
 
@@ -169,6 +243,11 @@ class AggregatedRollChannelStepResult:
 
 @dataclass
 class Milestone1StepResult:
+    """
+    Full record of one closed loop outer step. Holds the time, the old and new
+    translational and attitude states, the bank before and after, the control
+    output, the aggregated roll telemetry, and the translational derivative.
+    """
     # Outer time at the start of the nominal step
     t_s: float
 
@@ -201,6 +280,15 @@ class Milestone1StepResult:
 
 
 def make_initial_capsule_attitude(sigma0_rad: float = 0.0) -> CapsuleAttitudeState:
+    """
+    Build the starting attitude as a pure roll about the aerodynamic z axis.
+
+    Parameters:
+        sigma0_rad: initial bank angle in radians.
+
+    Returns:
+        A CapsuleAttitudeState at the given bank with zero angular rate.
+    """
     # Initialize the capsule in a pure roll state relative to the aerodynamic frame
     q_ba = quat_from_axis_angle([0.0, 0.0, 1.0], sigma0_rad)
 
@@ -214,6 +302,7 @@ def make_initial_capsule_attitude(sigma0_rad: float = 0.0) -> CapsuleAttitudeSta
 # Quaternion helpers used by the roll attitude model
 
 def quat_normalize(q: List[float]) -> List[float]:
+    """Return the unit quaternion, falling back to identity when q is too small."""
     # Convert quaternion components to floats
     w, x, y, z = [float(v) for v in q]
 
@@ -228,6 +317,16 @@ def quat_normalize(q: List[float]) -> List[float]:
 
 
 def quat_from_axis_angle(axis: List[float], angle_rad: float) -> List[float]:
+    """
+    Build a unit quaternion for a rotation about an axis.
+
+    Parameters:
+        axis:      the rotation axis, normalized internally.
+        angle_rad: the rotation angle in radians.
+
+    Returns:
+        The rotation quaternion in [w, x, y, z] order.
+    """
     # Normalize the rotation axis first
     ax = normalize(axis)
 
@@ -244,6 +343,7 @@ def quat_from_axis_angle(axis: List[float], angle_rad: float) -> List[float]:
 
 
 def quat_to_dcm(q: List[float]) -> List[List[float]]:
+    """Return the direction cosine matrix for a quaternion, normalized first."""
     # Normalize before converting so the DCM stays orthonormal
     w, x, y, z = quat_normalize(q)
 
@@ -257,6 +357,16 @@ def quat_to_dcm(q: List[float]) -> List[List[float]]:
 # Frame helpers that move between local level aerodynamic body and world coordinates
 
 def local_level_frame(phi_rad: float, lam_rad: float) -> Tuple[List[float], List[float], List[float]]:
+    """
+    Return the local north, east, and up unit vectors in world coordinates.
+
+    Parameters:
+        phi_rad: latitude in radians.
+        lam_rad: longitude in radians.
+
+    Returns:
+        A tuple (north, east, up) of unit vectors.
+    """
     # Local north direction in world coordinates
     north = [
         -math.sin(phi_rad) * math.cos(lam_rad),
@@ -282,6 +392,7 @@ def local_level_frame(phi_rad: float, lam_rad: float) -> Tuple[List[float], List
 
 
 def position_world_from_state(x: List[float]) -> List[float]:
+    """Return the world position vector for a translational state, radius times up."""
     # Convert spherical position into a world position vector
     r = float(x[0])
     phi = float(x[1])
@@ -293,6 +404,7 @@ def position_world_from_state(x: List[float]) -> List[float]:
 
 
 def velocity_hat_from_state(x: List[float]) -> List[float]:
+    """Return the unit velocity direction in world coordinates from gamma and chi."""
     # Read the translational state
     _, phi, lam, _, gamma, chi = [float(v) for v in x]
 
@@ -310,6 +422,21 @@ def velocity_hat_from_state(x: List[float]) -> List[float]:
 
 
 def aero_frame_dcm_from_state(x: List[float]) -> List[List[float]]:
+    """
+    Return the aerodynamic frame basis in world coordinates as a matrix.
+
+    The aerodynamic z axis points opposite the velocity, the x axis is the
+    projection of local up into the plane normal to z, with north used as a
+    fallback when up is nearly aligned with z, and y completes a right handed
+    frame.
+
+    Parameters:
+        x: the translational state.
+
+    Returns:
+        A three by three matrix whose columns are the aerodynamic x, y, and z
+        axes expressed in world coordinates.
+    """
     # Build the aerodynamic frame basis in world coordinates
     _, phi, lam, _, _, _ = [float(v) for v in x]
 
@@ -347,6 +474,7 @@ def aero_frame_dcm_from_state(x: List[float]) -> List[List[float]]:
 
 
 def sigma_from_q_ba(q_ba: List[float]) -> float:
+    """Recover the bank angle in radians from the body to aerodynamic quaternion."""
     # Convert body to aerodynamic attitude into the actual bank angle
     R_ba = quat_to_dcm(q_ba)
     x_b_in_a = [R_ba[0][0], R_ba[1][0], R_ba[2][0]]
@@ -358,6 +486,7 @@ def sigma_from_q_ba(q_ba: List[float]) -> float:
 
 
 def body_to_world_dcm(x_trans: List[float], q_ba: List[float]) -> List[List[float]]:
+    """Return the body to world rotation, world from aero composed with aero from body."""
     # Compose world from aerodynamic with aerodynamic from body
     R_wa = aero_frame_dcm_from_state(x_trans)
     R_ba = quat_to_dcm(q_ba)
@@ -365,6 +494,7 @@ def body_to_world_dcm(x_trans: List[float], q_ba: List[float]) -> List[List[floa
 
 
 def heat_shield_normal_world(x_trans: List[float], q_ba: List[float]) -> List[float]:
+    """Return the heat shield normal, body z, expressed in world coordinates."""
     # Map body z into world coordinates so the current shield normal is available
     R_wb = body_to_world_dcm(x_trans, q_ba)
     return mat_vec_mul(R_wb, [0.0, 0.0, 1.0])
@@ -376,6 +506,20 @@ def thruster_world_pose(
     thruster_position_b_m: List[float],
     thruster_direction_b_unit: List[float],
 ) -> Tuple[List[float], List[float]]:
+    """
+    Convert a body fixed thruster pose into the world frame.
+
+    Parameters:
+        x_trans:                   the translational state.
+        q_ba:                      the body to aerodynamic quaternion.
+        thruster_position_b_m:     thruster position in body coordinates.
+        thruster_direction_b_unit: thruster direction in body coordinates.
+
+    Returns:
+        A tuple (position_world, direction_world). The position adds the world
+        offset to the center of mass position, and the direction is a unit
+        vector.
+    """
     # Convert a body fixed thruster pose into the world frame
     R_wb = body_to_world_dcm(x_trans, q_ba)
     r_cm_w = position_world_from_state(x_trans)
@@ -397,6 +541,22 @@ def step_capsule_roll_state(
     Izz_kgm2: Optional[float] = None,
     dt_s: Optional[float] = None,
 ) -> CapsuleAttitudeState:
+    """
+    Advance the roll only attitude model by one time step.
+
+    The roll torque about body z makes an angular acceleration through the roll
+    inertia. The roll rate is integrated first, then the bank angle, then the
+    quaternion is rebuilt from the new bank.
+
+    Parameters:
+        att:          the current attitude state.
+        tau_rcs_b_Nm: the body torque vector. Only the z component is used.
+        Izz_kgm2:     roll inertia. Defaults to the capsule value.
+        dt_s:         time step in seconds. Defaults to the entry step.
+
+    Returns:
+        The next attitude state.
+    """
     # Advance the roll only attitude model for one time step
     if Izz_kgm2 is None:
         Izz_kgm2 = float(getattr(constants, "CAPSULE_IZZ_KGM2", 20000.0))
@@ -562,6 +722,12 @@ def f_float(
     sigma_actual_rad: Optional[float] = None,
     sigma_cmd_rad: Optional[float] = None,
 ) -> List[float]:
+    """
+    Return the translational derivative as an ordered list.
+
+    A thin adapter around eom_3d that returns [r_dot, phi_dot, lam_dot, V_dot,
+    gamma_dot, chi_dot] in state order. Parameters match eom_3d.
+    """
     # Ordered derivative adapter for the translational state
     dx = eom_3d(
         t=t,
@@ -589,6 +755,20 @@ def make_control_step_fn(
     params: Dict[str, Any],
     dt_s: Optional[float] = None,
 ) -> Callable[[float, List[float], float, float], Any]:
+    """
+    Build a closure that runs one control stack step.
+
+    Parameters:
+        control:       the guidance and control stack.
+        aero_force_fn: function that returns the aero force components.
+        params:        vehicle and aero parameters.
+        dt_s:          control step in seconds. Defaults to the entry step.
+
+    Returns:
+        A function control_step_fn(t, x, sigma_actual_rad, roll_rate_rad_s) that
+        builds the control facing state, computes lift and drag, and steps the
+        control stack.
+    """
     # This helper presents the controller with the current translational state actual bank and roll rate
     if dt_s is None:
         dt_s = float(getattr(constants, "ENTRY_DT_S", 0.25))
@@ -601,6 +781,7 @@ def make_control_step_fn(
         sigma_actual_rad: float,
         roll_rate_rad_s: float,
     ):
+        """Build the control facing state, compute lift and drag, and step the stack."""
         # Build the controller facing state object from the translational state
         r, phi, lam, V, gamma, chi = [float(v) for v in x]
 
@@ -647,6 +828,20 @@ def make_sigma_fn(
     sigma_actual_provider: Callable[[], Tuple[float, float]],
     dt_s: Optional[float] = None,
 ) -> Callable[[float, List[float]], float]:
+    """
+    Build a backward compatible bank function for older call sites.
+
+    Parameters:
+        control:               the guidance and control stack.
+        aero_force_fn:         function that returns the aero force components.
+        params:                vehicle and aero parameters.
+        sigma_actual_provider: callable returning the current bank and roll rate.
+        dt_s:                  control step in seconds.
+
+    Returns:
+        A function sigma_fn(t, x) that steps the controller so its internal
+        state advances, then returns the realized bank.
+    """
     # Backward compatible adapter for older call sites that still expect sigma_fn
     control_step_fn = make_control_step_fn(
         control=control,
@@ -656,6 +851,7 @@ def make_sigma_fn(
     )
 
     def sigma_fn(t: float, x: List[float]) -> float:
+        """Step the controller from the provided bank and rate, then return the bank."""
         # Query the current realized bank and roll rate from the external provider
         sigma_actual_rad, roll_rate_rad_s = sigma_actual_provider()
 
@@ -674,6 +870,17 @@ def make_sigma_fn(
 
 
 def _aggregate_roll_substeps(roll_substeps: List[Any]) -> AggregatedRollChannelStepResult:
+    """
+    Combine the internal RCS sub step results into one outer step packet.
+
+    Parameters:
+        roll_substeps: the per sub step roll channel results. Must be non empty.
+
+    Returns:
+        An AggregatedRollChannelStepResult with the time averaged wrench, the
+        average duty per thruster, the fired counts, and the final channel
+        timing telemetry.
+    """
     # At least one internal substep must exist
     if not roll_substeps:
         raise ValueError("roll_substeps cannot be empty")
@@ -746,6 +953,28 @@ def step_closed_loop_milestone1(
     dt_s: Optional[float] = None,
     Izz_kgm2: Optional[float] = None,
 ) -> Milestone1StepResult:
+    """
+    Advance guidance, the RCS, the roll attitude, and the translation together.
+
+    One outer step runs the high level controller once, then steps the timed RCS
+    and the roll attitude on the smaller internal sub step, and finally advances
+    the translational state with one forward Euler step using the realized bank.
+
+    Parameters:
+        t_s:             current time in seconds.
+        x_trans:         the six element translational state.
+        att:             the current attitude state.
+        params:          vehicle and aero parameters.
+        control_step_fn: closure that runs one control stack step.
+        rcs:             the reaction control system.
+        dt_s:            outer step in seconds. Defaults to the entry step.
+        Izz_kgm2:        roll inertia. Defaults to the capsule value.
+
+    Returns:
+        A Milestone1StepResult with the old and new states, the bank before and
+        after, the control output, the aggregated roll telemetry, and the
+        translational derivative used for the step.
+    """
     # Fill in default outer step size and roll inertia when not supplied
     if dt_s is None:
         dt_s = float(getattr(constants, "ENTRY_DT_S", 0.25))

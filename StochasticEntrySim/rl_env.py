@@ -1,26 +1,30 @@
 """
-Phase 1 -- OrionEntryEnv: a Gymnasium environment around the existing Orion
-entry simulator, for training and benchmarking an RL surrogate controller
-against the traditional predictor-corrector.
+Phase 1. OrionEntryEnv is a Gymnasium environment wrapped around the existing
+Orion entry simulator, for training and benchmarking an RL surrogate controller
+against the traditional predictor corrector.
 
 Design (see docs/rl_mdp_spec.md):
-  * Controlled segment: entry interface -> drogue deploy (~7.6 km).
-  * Action: 1-D continuous bank command, a in [-1, 1] -> sigma_cmd = a * pi/2.
-  * Observation: ~13 normalized features (altitude, velocity, gamma, heading,
-    range-to-go, errors, energy, current bank, heat/g margins, hdot).
-  * Reward: terminal-dominated (miss at drogue) + dense heat/g/fuel shaping.
-  * Transition: the real physics -- bank actuator -> roll PD -> 12-jet RCS ->
-    roll dynamics -> 3DOF EOM -- via step_closed_loop_milestone1. The ONLY
-    substitution vs run_sim.py is the guidance decision.
+  Controlled segment: entry interface to drogue deploy, near 7.6 km.
+  Action: a one dimensional continuous bank command, a in [-1, 1], mapped to
+    sigma_cmd = a times pi/2.
+  Observation: 13 normalized features (altitude, velocity, gamma, heading,
+    range to go, errors, energy, current bank, heat and g margins, altitude
+    rate).
+  Reward: terminal dominated (the miss at drogue) plus dense heat, g, and fuel
+    shaping.
+  Transition: the real physics, namely the bank actuator, the roll PD law, the
+    12 jet RCS, the roll dynamics, and the 3DOF equations of motion, run through
+    step_closed_loop_milestone1. The only substitution compared to run_sim.py is
+    the guidance decision.
 
 Two controller modes:
-  * "policy"   (default): the env's action drives the bank (for RL).
-  * "baseline": the real continuous predictor-corrector drives the bank
-    (action ignored). Used to VALIDATE the env reproduces run_sim.py and to
-    characterize the classical baseline (Phase 3).
+  "policy"   (default): the environment action drives the bank, for RL.
+  "baseline": the real continuous predictor corrector drives the bank and the
+    action is ignored. Used to confirm the environment reproduces run_sim.py and
+    to characterize the classical baseline (Phase 3).
 
-The gymnasium import is optional so the file is usable locally for validation;
-in Colab, `pip install gymnasium` gives the real base class + spaces.
+The gymnasium import is optional so the file is usable locally for validation.
+In Colab, pip install gymnasium provides the real base class and spaces.
 """
 
 from __future__ import annotations
@@ -64,24 +68,30 @@ except Exception:  # pragma: no cover - exercised only when gym is absent
     _HAVE_GYM = False
 
     class _Box:
+        """Minimal stand in for gymnasium.spaces.Box used when gym is absent."""
         def __init__(self, low, high, shape, dtype=np.float32):
+            """Store the low and high bounds, the shape, and the dtype."""
             self.low = np.asarray(low, dtype=dtype) if np.ndim(low) else np.full(shape, low, dtype=dtype)
             self.high = np.asarray(high, dtype=dtype) if np.ndim(high) else np.full(shape, high, dtype=dtype)
             self.shape = tuple(shape)
             self.dtype = dtype
 
         def sample(self):
+            """Return a uniform random sample inside the box bounds."""
             return np.random.uniform(self.low, self.high).astype(self.dtype)
 
     class _Spaces:
+        """Minimal stand in for the gymnasium spaces module."""
         Box = _Box
 
     spaces = _Spaces()  # type: ignore
 
     class _EnvBase:
+        """Minimal base class used when the real gymnasium env is absent."""
         metadata: Dict[str, Any] = {}
 
     class gym:  # type: ignore
+        """Minimal stand in for the gymnasium module exposing an Env base."""
         Env = _EnvBase
 
 
@@ -118,21 +128,26 @@ class PolicyGuidance:
 
     def __init__(self, params: Optional[dict] = None,
                  target_phi_rad: float = 0.0, target_lam_rad: float = 0.0):
+        """Store the parameters and target, and start with a zero bank action."""
         self.params = params
         self.target_phi_rad = float(target_phi_rad)
         self.target_lam_rad = float(target_lam_rad)
         self._action_sigma_rad = 0.0
 
     def set_action(self, sigma_rad: float) -> None:
+        """Set the bank in radians that the next compute_sigma_cmd returns."""
         self._action_sigma_rad = float(sigma_rad)
 
     def compute_sigma_cmd(self, t_s, state, obs) -> float:
+        """Return the externally set bank, ignoring the time, state, and obs."""
         return float(self._action_sigma_rad)
 
     def reset(self) -> None:
+        """Reset the stored bank action to zero."""
         self._action_sigma_rad = 0.0
 
     def get_last_debug(self) -> Dict[str, Any]:
+        """Return a small debug dictionary recording the policy bank choice."""
         return {"predictor_mode": "rl_policy",
                 "chosen_sigma_cmd_deg": math.degrees(self._action_sigma_rad)}
 
@@ -160,6 +175,27 @@ class OrionEntryEnv(gym.Env):
         shield_horizon: int = 1,
         seed: Optional[int] = None,
     ):
+        """
+        Build the entry environment.
+
+        Parameters:
+            config_path:       mission config to fly.
+            controller_mode:   "policy" for RL, or "baseline" for the classical
+                               predictor corrector.
+            max_episode_steps: cap on guidance steps before truncation.
+            gload_limit_g:     load factor limit used in margins and the shield.
+            target_radius_km:  miss distance counted as a success.
+            reward_weights:    optional RewardWeights override.
+            fast_atmosphere:   use the fast tabulated atmosphere when True.
+            dispersion:        override the config dispersion flag when not None.
+            w_progress_per_km: weight on the dense range progress reward.
+            w_heading_per_rad: weight on the dense heading progress reward.
+            interval_obs:      append worst case interval features to the obs.
+            interval_reward:   penalize the interval upper bound on heat and g.
+            interval_shield:   veto unsafe banks via one step reachability.
+            shield_horizon:    number of steps the shield looks ahead.
+            seed:              RNG seed for dispersion draws.
+        """
         super().__init__()
         if controller_mode not in ("policy", "baseline"):
             raise ValueError("controller_mode must be 'policy' or 'baseline'")
@@ -245,6 +281,12 @@ class OrionEntryEnv(gym.Env):
 
     # ------------------------------------------------------------------
     def _build_control_stack(self) -> None:
+        """
+        Build the guidance, observation, actuator, roll controller, and RCS.
+
+        In baseline mode the guidance is the real predictor corrector. In policy
+        mode it is a stand in whose bank is set by the RL action.
+        """
         if self.controller_mode == "baseline":
             self.guidance = SimpleBankGuidance(
                 target_phi_rad=self.target_phi_rad,
@@ -288,6 +330,21 @@ class OrionEntryEnv(gym.Env):
         self.rcs = build_orion_cm_rcs_12()
 
     def _control_step_fn(self, t_s, x_state, sigma_actual_rad, roll_rate_rad_s):
+        """
+        Run one control stack step and return its output.
+
+        Builds the control facing state, computes the current lift and drag
+        magnitudes, and calls the control stack.
+
+        Parameters:
+            t_s:              current time in seconds.
+            x_state:          the six element translational state.
+            sigma_actual_rad: realized bank angle in radians.
+            roll_rate_rad_s:  realized roll rate in radians per second.
+
+        Returns:
+            The control stack output for this step.
+        """
         r_m, phi, lam, V, gamma, chi = [float(v) for v in x_state]
         state = ReentryState(
             r_m=r_m, phi_rad=phi, lam_rad=lam, V_mps=V, gamma_rad=gamma, chi_rad=chi,
@@ -306,6 +363,13 @@ class OrionEntryEnv(gym.Env):
         )
 
     def _reset_episode_state(self) -> None:
+        """
+        Reset all per episode state to the start of a run.
+
+        Clears the trajectory state, attitude, heat shield, timers, fuel, peak
+        trackers, the interval tube and its diagnostics, and the progress
+        shaping baselines.
+        """
         self.x = list(self._x0)
         self.att = make_initial_capsule_attitude(0.0)
         self.heat_shield = None
@@ -335,6 +399,20 @@ class OrionEntryEnv(gym.Env):
 
     # ------------------------------------------------------------------
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        """
+        Start a new episode and return the first observation and info.
+
+        Parameters:
+            seed:    optional RNG seed for this episode.
+            options: optional dict. An ic_override key replays an exact initial
+                     condition, for example from the frozen test set. A
+                     dispersion key overrides the default dispersion choice.
+
+        Returns:
+            A tuple (observation, info) for the initial state. The initial
+            condition is chosen in priority order: an explicit override, then a
+            dispersed draw when dispersion is on, otherwise the nominal.
+        """
         if seed is not None:
             self._rng = np.random.default_rng(seed)
         # Resolve the initial condition for this episode (config units), in
@@ -363,6 +441,7 @@ class OrionEntryEnv(gym.Env):
         return self._build_obs(), self._info(terminal=False)
 
     def _alt(self) -> float:
+        """Return the current geometric altitude in meters."""
         return float(self.x[0] - constants.RADIUS_EARTH)
 
     def _update_aux_metrics(self) -> None:
@@ -498,6 +577,14 @@ class OrionEntryEnv(gym.Env):
         return best_c, True
 
     def _build_obs(self) -> np.ndarray:
+        """
+        Build the normalized observation vector for the current state.
+
+        Returns:
+            A float32 array of the 13 base features. When interval_obs is on,
+            three worst case interval features are appended: the guaranteed heat
+            margin, the guaranteed g margin, and a clipped box width.
+        """
         r, phi, lam, V, gamma, chi = [float(v) for v in self.x]
         obs_d = self.obs_provider.observe(
             ReentryState(r_m=r, phi_rad=phi, lam_rad=lam, V_mps=V, gamma_rad=gamma,
@@ -532,6 +619,21 @@ class OrionEntryEnv(gym.Env):
 
     # ------------------------------------------------------------------
     def step(self, action):
+        """
+        Advance one guidance step and return the Gym step tuple.
+
+        In policy mode the action sets the bank, optionally vetoed by the
+        interval shield. In baseline mode the action is ignored and the
+        predictor computes the bank. The physics runs for the sub steps that
+        make up one guidance period, accumulating fuel and the interval tube,
+        and ends on drogue deploy, a near singular gate, or divergence.
+
+        Parameters:
+            action: a one element array in the range [-1, 1].
+
+        Returns:
+            A tuple (observation, reward, terminated, truncated, info).
+        """
         self._intervened_this_step = False
         if self.controller_mode == "policy":
             a = float(np.asarray(action).reshape(-1)[0])
@@ -593,6 +695,14 @@ class OrionEntryEnv(gym.Env):
 
     # ------------------------------------------------------------------
     def _great_circle_miss_km(self) -> float:
+        """
+        Return the great circle distance from the current point to the target.
+
+        Uses the haversine formula on the spherical Earth.
+
+        Returns:
+            The distance in kilometers.
+        """
         R = constants.RADIUS_EARTH / 1000.0
         p1, l1 = float(self.x[1]), float(self.x[2])
         p2, l2 = self.target_phi_rad, self.target_lam_rad
@@ -612,6 +722,22 @@ class OrionEntryEnv(gym.Env):
         return float(obs_d.get("heading_error_rad", 0.0))
 
     def _reward(self, terminated: bool, outcome: str) -> Tuple[float, float]:
+        """
+        Compute the reward for the current step and the current miss.
+
+        Combines the dense heat, g, and fuel penalties, the dense range and
+        heading progress shaping, and, on a drogue deploy, the terminal miss
+        penalty plus on target and survivability bonuses. A corridor exit or
+        divergence gets a large fixed penalty.
+
+        Parameters:
+            terminated: whether the episode ended this step.
+            outcome:    the outcome label, for example drogue, cos_gamma_fail,
+                        or diverged.
+
+        Returns:
+            A tuple (reward, miss_km).
+        """
         miss_km = self._great_circle_miss_km()
 
         # Dense per-step shaping (heat / g penalties -- only bite near limits).
@@ -654,6 +780,19 @@ class OrionEntryEnv(gym.Env):
         return float(r), float(miss_km)
 
     def _info(self, terminal: bool, outcome: str = "running", miss_km: float = float("nan")) -> Dict[str, Any]:
+        """
+        Build the info dictionary returned alongside each step and reset.
+
+        Parameters:
+            terminal: whether the episode has ended.
+            outcome:  the outcome label for the step.
+            miss_km:  the current miss distance in kilometers.
+
+        Returns:
+            A dictionary of flight metrics and interval diagnostics, including
+            altitude, speed, peak g, peak heat rate, fuel used, the success
+            flag, and shield intervention counts.
+        """
         return {
             "t_s": float(self.t_s), "altitude_m": self._alt(),
             "V_mps": float(self.x[3]), "miss_km": float(miss_km),

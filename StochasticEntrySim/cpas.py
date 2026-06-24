@@ -1,49 +1,46 @@
 """
-Orion Capsule Parachute Assembly System (CPAS) -- high-fidelity model.
+Orion Capsule Parachute Assembly System (CPAS), a high fidelity model.
 
 The model captures the full deployment sequence the real Orion CM uses:
 
-    STOWED -> FBC_JETTISONED -> DROGUE -> PILOT -> MAIN -> LANDED
+    STOWED to FBC_JETTISONED to DROGUE to PILOT to MAIN to LANDED
 
-and inside each chute phase models the discrete pyrotechnic reefing
-stages plus the mortar + line-stretch transient at deployment.
+and inside each chute phase it models the discrete pyrotechnic reefing stages
+plus the mortar and line stretch transient at deployment.
 
-Features implemented
---------------------
-1. **Forward Bay Cover (FBC) jettison**  fires before drogue, sheds 150 kg
-2. **Mortar deployment + line stretch**  initial ~0.6 s of zero drag,
-                                         followed by a short opening-shock
-                                         transient at >1 reefed drag
-3. **Reefing pyrotechnics**              drogues: 2 stages (50% -> 100%)
-                                         mains  : 3 stages (13% -> 35% -> 100%)
-4. **Chute pendulum swing**              damped harmonic oscillator
-                                         contributing horizontal velocity
-5. **Asymmetric inflation / squidding**  each operational main has a
-                                         random chance per step to briefly
-                                         collapse to ~20% area
-6. **Wind drift under chutes**           configurable east/north wind
-                                         applied to position update
-7. **2-of-3 main failure mode**          num_mains_operational config knob
-                                         (or random failure trigger)
-8. **RCS roll for splashdown**           exposes a target sigma during
-                                         drogue/main phases so the existing
-                                         roll controller keeps the capsule
-                                         oriented for impact
+Features implemented:
 
-Integration contract
---------------------
-Each simulation step the caller invokes ``CPAS.step(t_s, alt_m, V_mps,
-mach=None)`` and applies the returned ``CPASOutput`` to its dynamics:
+  1. Forward Bay Cover jettison. Fires before the drogue and sheds 150 kg.
+  2. Mortar deployment and line stretch. About 0.6 s of zero drag, then a short
+     opening shock transient above the reefed drag.
+  3. Reefing pyrotechnics. Drogues use 2 stages (50 percent then 100 percent),
+     mains use 3 stages (13 then 35 then 100 percent).
+  4. Chute pendulum swing. A self sustaining oscillator that adds horizontal
+     velocity, used only when the cluster is degraded.
+  5. Asymmetric inflation, also called squidding. Each operational main has a
+     random chance per step to briefly collapse to about 20 percent area.
+  6. Wind drift under chutes. A configurable east and north wind applied to the
+     position update.
+  7. A 2 of 3 main failure mode. Set by num_mains_operational, or by a random
+     failure trigger.
+  8. RCS roll for splashdown. Exposes a target bank during the drogue and main
+     phases so the existing roll controller keeps the capsule oriented for
+     impact.
 
-    drag_area_cdA_m2          -> add F = q_bar * drag_area_cdA_m2 anti-V
-    lift_scale                -> multiply aero CL by this scalar
-    mass_shed_kg              -> subtract from params['mass_kg'] once
-    wind_east_mps / north_mps -> add to position rate under chutes
-    pendulum_lateral_v_mps    -> add to horizontal velocity
-    target_sigma_rad          -> guidance / RCS roll target (if not NaN)
+Integration contract:
 
-The module itself has zero dependency on the rest of the simulator so it
-remains unit-testable standalone (see verify_cpas.py).
+Each simulation step the caller invokes CPAS.step(t_s, alt_m, V_mps, mach=None)
+and applies the returned CPASOutput to its dynamics:
+
+    drag_area_cdA_m2          add a force q_bar times drag_area_cdA_m2 opposite V
+    lift_scale                multiply the aero CL by this scalar
+    mass_shed_kg              subtract from params['mass_kg'] once
+    wind_east_mps, north_mps  add to the position rate under chutes
+    pendulum_lateral_v_mps    add to horizontal velocity
+    target_sigma_rad          guidance or RCS roll target, when not NaN
+
+The module has zero dependency on the rest of the simulator, so it stays unit
+testable on its own. See verify_cpas.py.
 """
 
 from __future__ import annotations
@@ -247,6 +244,21 @@ class CPAS:
     def __init__(self, config: Optional[CPASConfig] = None,
                  rng: Optional[random.Random] = None,
                  pendulum_azimuth_rad: Optional[float] = None):
+        """
+        Build the CPAS sequencer and roll the random outcomes for this descent.
+
+        Parameters:
+            config:               tunable CPAS parameters. Defaults are used when
+                                  None.
+            rng:                  a random.Random for the failure and squidding
+                                  draws. A fixed seed source is used when None.
+            pendulum_azimuth_rad: fixed swing direction for the pendulum. A
+                                  random direction is chosen when None.
+
+        At construction each main is independently failed against the configured
+        probability, or set from num_mains_operational when stochastic failure is
+        off, and the pendulum constants are precomputed for the hot path.
+        """
         self.config: CPASConfig = config or CPASConfig()
         self.state: CPASState = CPASState()
         self._rng = rng or random.Random(0)
@@ -426,6 +438,14 @@ class CPAS:
     # Convenience accessors
     # ------------------------------------------------------------------
     def summary(self) -> dict:
+        """
+        Return a snapshot of the sequencer state for logging.
+
+        Returns:
+            A dictionary with the current phase, the jettison and deploy
+            timestamps, the total mass shed, the per main operational mask, and
+            the pendulum swing direction in degrees.
+        """
         return {
             "phase": self.state.phase.value,
             "fbc_jettisoned": bool(self.state.fbc_jettisoned),
@@ -443,6 +463,18 @@ class CPAS:
     # Internal helpers
     # ------------------------------------------------------------------
     def _can_deploy_drogue(self, alt_m, V_mps, mach):
+        """
+        Report whether the drogue may deploy at the current condition.
+
+        Parameters:
+            alt_m: geometric altitude in meters.
+            V_mps: speed in meters per second.
+            mach:  Mach number, or None when not available.
+
+        Returns:
+            True only when the altitude is at or below the deploy altitude and
+            the speed and Mach are within their deploy limits.
+        """
         cfg = self.config
         if alt_m > cfg.drogue_deploy_alt_m:
             return False

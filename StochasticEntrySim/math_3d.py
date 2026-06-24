@@ -819,6 +819,7 @@ def classify_interval_against_limits(
     speed_interval = x_interval_new[3]
 
     def classify_upper(iv: Interval, upper: Optional[float]) -> Optional[str]:
+        """Classify an interval against an upper limit as inside, outside, or mixed."""
         if upper is None:
             return None
         if iv.hi <= upper:
@@ -828,6 +829,7 @@ def classify_interval_against_limits(
         return "mixed"
 
     def classify_lower(iv: Interval, lower: Optional[float]) -> Optional[str]:
+        """Classify an interval against a lower limit as inside, outside, or mixed."""
         if lower is None:
             return None
         if iv.lo >= lower:
@@ -1446,6 +1448,13 @@ def aero_coefficients_from_speed_altitude(V_mps: float, altitude_m: float, param
     # atmosphere query it already does); if absent we query atmosphere here
     # so the function still returns the right answer in isolation.
     def _fmv_blended(V_mps_, V_kfps_, T_K_):
+        """
+        Return the blended velocity parameter used by the aero schedule.
+
+        Below 8.8 kft/s it is the Mach number, above 9.8 kft/s it is the speed in
+        kft/s, and between the two it blends linearly. Falls back to the kft/s
+        speed when temperature is missing, so Mach cannot be formed.
+        """
         if V_kfps_ >= 9.8:
             return V_kfps_
         if T_K_ is None or not (T_K_ == T_K_) or T_K_ <= 0.0:

@@ -1,29 +1,29 @@
 """
-Shared per-timestep telemetry: derived physics quantities and RL reward
-ingredients computed identically by both drivers (run_sim.py and the
-notebook) so the generated dataset is consistent regardless of driver.
+Shared per timestep telemetry: derived physics quantities and RL reward
+ingredients computed the same way by both drivers (run_sim.py and the notebook),
+so the generated dataset is consistent regardless of which driver produced it.
 
-Everything here is a pure function of already-logged state — no
-simulation side effects — so values are fully reproducible and traceable.
+Everything here is a pure function of already logged state, with no simulation
+side effects, so the values are fully reproducible and traceable.
 
 Quantities (all SI unless noted):
-    mach                       V / a, local speed of sound from atmosphere T
+    mach                       V divided by the local speed of sound
     fmv                        Bibb 2010 blended velocity parameter (passthrough)
     specific_kinetic_e_j_kg    0.5 * V^2
-    specific_potential_e_j_kg  g0 * altitude  (energy-height convention)
-    specific_energy_j_kg       kinetic + potential (entry-guidance energy E)
-    energy_height_m            E / g0  (the "energy altitude")
-    load_factor_g              sqrt(L^2 + D^2) / (m * g0)   sensed aero g's
+    specific_potential_e_j_kg  g0 * altitude, using the energy height convention
+    specific_energy_j_kg       kinetic plus potential, the entry guidance energy
+    energy_height_m            E / g0, the energy altitude
+    load_factor_g              sqrt(L^2 + D^2) / (m * g0), the sensed aero g load
     aero_decel_mps2            sqrt(L^2 + D^2) / m
     drag_decel_mps2            D / m
-    dynamic_pressure_pa        q = 0.5 * rho * V^2  (echo, for completeness)
+    dynamic_pressure_pa        q = 0.5 * rho * V^2, echoed for completeness
 
-RL reward (documented default — override weights in the RL env layer):
+RL reward (the documented default; weights can be overridden in the RL env):
     reward_default             a transparent weighted sum of the terms below
-    rew_range_term             - w_range  * range_to_go_m
-    rew_heat_term              - w_heat   * max(0, qdot - qdot_limit)
-    rew_gload_term             - w_gload  * max(0, load_factor_g - g_limit)
-    rew_fuel_term              - w_fuel   * rcs_fuel_rate_kg_s
+    rew_range_term             minus w_range  times range_to_go_m
+    rew_heat_term              minus w_heat   times max(0, qdot minus qdot_limit)
+    rew_gload_term             minus w_gload  times max(0, load_factor_g minus g_limit)
+    rew_fuel_term              minus w_fuel   times rcs_fuel_rate_kg_s
 """
 
 from __future__ import annotations
@@ -34,8 +34,9 @@ from typing import Dict, Optional
 
 import constants
 
-# Air properties for Mach (calorically perfect air below ~90 km; above that
-# Mach loses its usual meaning but the ratio is still a useful logged scalar).
+# Air properties used for Mach. Air is treated as calorically perfect below
+# about 90 km. Above that the ratio is still a useful logged scalar even though
+# Mach loses its usual meaning.
 _GAMMA_AIR = 1.4
 _R_AIR = 287.053
 _G0 = float(constants.STANDARD_GRAVITY_MPS2)
@@ -53,11 +54,29 @@ def compute_derived_metrics(
     mass_kg: float,
     fmv: float = float("nan"),
 ) -> Dict[str, float]:
-    """Return a dict of derived per-step physics scalars."""
+    """
+    Return a dictionary of derived per step physics scalars.
+
+    Parameters:
+        r_m:        distance from the center of the Earth in meters.
+        V_mps:      speed in meters per second.
+        altitude_m: geometric altitude in meters.
+        T_K:        static temperature in kelvin, or None when not available.
+        rho_kgm3:   atmospheric density in kilograms per cubic meter.
+        drag_mag_N: drag force magnitude in newtons.
+        lift_mag_N: lift force magnitude in newtons.
+        mass_kg:    vehicle mass in kilograms.
+        fmv:        the blended velocity parameter, passed through unchanged.
+
+    Returns:
+        A dictionary with the quantities listed in the module docstring. Mach
+        and the speed of sound are NaN when the temperature is missing or not
+        positive.
+    """
     V = float(V_mps)
     alt = float(altitude_m)
 
-    # Mach number (guard missing / non-physical temperature)
+    # Mach number. Guard a missing or non positive temperature.
     if T_K is not None and T_K == T_K and T_K > 0.0:
         a_sound = math.sqrt(_GAMMA_AIR * _R_AIR * float(T_K))
         mach = V / a_sound if a_sound > 0.0 else float("nan")
@@ -65,13 +84,13 @@ def compute_derived_metrics(
         a_sound = float("nan")
         mach = float("nan")
 
-    # Energy (energy-height convention used in entry guidance)
+    # Energy, using the energy height convention common in entry guidance.
     ke = 0.5 * V * V
     pe = _G0 * alt
     E = ke + pe
     energy_height_m = E / _G0 if _G0 > 0.0 else float("nan")
 
-    # Load factor (sensed aerodynamic acceleration in g's)
+    # Load factor, the sensed aerodynamic acceleration expressed in g.
     aero_force_N = math.sqrt(float(drag_mag_N) ** 2 + float(lift_mag_N) ** 2)
     m = float(mass_kg)
     aero_decel = aero_force_N / m if m > 0.0 else float("nan")
@@ -96,22 +115,30 @@ def compute_derived_metrics(
     }
 
 
-# =============================================================================
 # RCS propellant model
-# =============================================================================
+
 
 def rcs_propellant_kg(
     fired_thruster_seconds: float,
     thrust_per_thruster_N: float = float(constants.ORION_CM_RCS_THRUST_N),
     isp_s: float = float(constants.ORION_CM_RCS_ISP_S),
 ) -> float:
-    """Propellant mass burned for a given amount of thruster on-time.
+    """
+    Return the propellant mass burned for a given amount of thruster on time.
 
-        mdot_per_thruster = thrust / (Isp * g0)
-        propellant        = mdot * fired_thruster_seconds
+    The mass flow per thruster is thrust divided by (Isp times g0), and the
+    propellant is that flow times the total fired thruster seconds.
 
-    `fired_thruster_seconds` is the SUM over all thrusters of their on-time
-    this step (e.g. 3 thrusters firing for 0.1 s = 0.3 thruster-seconds).
+    Parameters:
+        fired_thruster_seconds: total on time summed across all thrusters this
+                                step. For example three thrusters firing for
+                                0.1 s each is 0.3 thruster seconds.
+        thrust_per_thruster_N:  thrust of one jet in newtons.
+        isp_s:                  specific impulse in seconds.
+
+    Returns:
+        The propellant mass burned in kilograms. Returns zero when Isp is not
+        positive.
     """
     if isp_s <= 0.0:
         return 0.0
@@ -119,15 +146,26 @@ def rcs_propellant_kg(
     return float(mdot) * float(fired_thruster_seconds)
 
 
-# =============================================================================
-# RL reward (documented default)
-# =============================================================================
+# RL reward (the documented default)
+
 
 @dataclass
 class RewardWeights:
-    """Default reward weights. Override in the RL environment layer; these
-    exist so the generated dataset ships with a transparent, reproducible
-    baseline reward column rather than baking the choice in irreversibly."""
+    """
+    Default reward weights.
+
+    These can be overridden in the RL environment layer. They exist so the
+    generated dataset ships with a transparent, reproducible baseline reward
+    column instead of baking the choice in permanently.
+
+    Fields:
+        w_range:         penalty per meter of range to go (the miss).
+        w_heat:          penalty per W/m^2 over the heat rate limit.
+        w_gload:         penalty per g over the load factor limit.
+        w_fuel:          penalty per kg/s of RCS propellant flow.
+        qdot_limit_w_m2: heat rate limit used in the heat penalty.
+        gload_limit_g:   load factor limit used in the g penalty.
+    """
     w_range: float = 1.0e-5     # per metre of range-to-go (miss)
     w_heat: float = 1.0e-6      # per W/m^2 over the heat-rate limit
     w_gload: float = 1.0e-1     # per g over the load-factor limit
@@ -144,11 +182,24 @@ def composite_reward(
     rcs_fuel_rate_kg_s: float,
     weights: Optional[RewardWeights] = None,
 ) -> Dict[str, float]:
-    """Return the per-step reward ingredients and the composite default.
+    """
+    Return the per step reward ingredients and the composite default.
 
-    The composite is a transparent negative-cost sum; the RL env is free to
-    re-weight or replace it. Terminal bonuses (on-target, soft touchdown)
-    are intentionally NOT included here — they belong to the episode layer.
+    The composite is a transparent negative cost sum. The RL environment is
+    free to re weight or replace it. Terminal bonuses, such as landing on target
+    or a soft touchdown, are intentionally left out here, since they belong to
+    the episode layer.
+
+    Parameters:
+        range_to_go_m:      remaining great circle distance to target in meters.
+        qdot_w_m2:          current heat rate in W/m^2.
+        load_factor_g:      current load factor in g.
+        rcs_fuel_rate_kg_s: current RCS propellant flow in kg/s.
+        weights:            a RewardWeights instance, or None to use defaults.
+
+    Returns:
+        A dictionary with the four named reward terms and the composite
+        reward_default, which is their sum.
     """
     w = weights or RewardWeights()
     rew_range = -w.w_range * max(0.0, float(range_to_go_m))
