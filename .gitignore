@@ -31,3 +31,10 @@ StochasticEntrySim/ReEntryAI_run.ipynb
 StochasticEntrySim/interval_ReEntry4.ipynb
 /RL_Model/
 /testSim/
+
+# Local-only docs and run-output dirs (kept locally, not pushed).
+StochasticEntrySim/docs/
+StochasticEntrySim/data_intv/
+StochasticEntrySim/revision_v1/
+StochasticEntrySim/revision_v1_py/
+StochasticEntrySim/runs/
