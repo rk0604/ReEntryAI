@@ -23,3 +23,11 @@ StochasticEntrySim/_p*.png
 StochasticEntrySim/helpers/_plot_cells_dump.json
 StochasticEntrySim/old_code/constants (1).py
 RL_Model/main_2d_broken.ipynb
+
+# Superseded notebooks and old prototype dirs (kept locally, not pushed).
+# Canonical pair lives on: StochasticEntrySim/run_sim.py + ReEntryAI_run2.ipynb
+StochasticEntrySim/old_code/
+StochasticEntrySim/ReEntryAI_run.ipynb
+StochasticEntrySim/interval_ReEntry4.ipynb
+/RL_Model/
+/testSim/
