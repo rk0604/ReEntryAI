@@ -38,3 +38,6 @@ StochasticEntrySim/data_intv/
 StochasticEntrySim/revision_v1/
 StochasticEntrySim/revision_v1_py/
 StochasticEntrySim/runs/
+
+# JEPA world-model experiment outputs (data cache, checkpoints, classical cache)
+StochasticEntrySim/jepa_runs/
