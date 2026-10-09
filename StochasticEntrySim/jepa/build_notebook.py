@@ -30,6 +30,8 @@ def code(text):
 md(r"""
 # ReEntryAI × SkyJEPA — a latent world model + MPPI for entry guidance
 
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/rk0604/ReEntryAI/blob/jepa-variant/StochasticEntrySim/ReEntryAI_JEPA.ipynb)
+
 **Question.** Can a JEPA-style latent world model, trained only on randomized
 closed-loop sim data, steer Orion to the drogue-deploy target by planning
 (MPPI) rather than by a learned policy?
@@ -60,7 +62,33 @@ results are cached under `jepa_runs/`, so re-runs skip what is already done.
 """)
 
 # ---------------------------------------------------------------------------
-md("## 0. Setup")
+md(r"""
+## 0. Setup
+
+**On Google Colab** the first cell clones the `jepa-variant` branch and installs
+`pymsis` (Colab already has torch, numpy, pandas, matplotlib). Locally it does
+nothing, so start Jupyter in `StochasticEntrySim/`. The branch ships the cached
+episodes and classical-baseline runs in `jepa_runs/`, which saves most of the run
+time on Colab's 2 CPUs. Set `USE_DRIVE = True` to keep new outputs across Colab sessions.
+""")
+code(r"""
+import os, sys
+if "google.colab" in sys.modules:
+    USE_DRIVE = False          # True: keep jepa_runs/ on Google Drive between sessions
+    REPO = "/content/ReEntryAI"
+    if not os.path.exists(REPO):
+        !git clone -q -b jepa-variant https://github.com/rk0604/ReEntryAI.git {REPO}
+    %pip install -q pymsis
+    os.chdir(f"{REPO}/StochasticEntrySim")
+    if USE_DRIVE:
+        from google.colab import drive
+        drive.mount("/content/drive")
+        dst = "/content/drive/MyDrive/ReEntryAI_jepa_runs"
+        if not os.path.exists(dst):
+            !cp -r jepa_runs {dst}
+        !rm -rf jepa_runs && ln -s {dst} jepa_runs
+print("working dir:", os.getcwd())
+""")
 code(r"""
 import os, sys, math, time, pickle
 from pathlib import Path
@@ -202,6 +230,30 @@ ds_va_p = D.MacroDataset(val_eps, RF, CFG["prober_horizon"], stats)
 print(f"episodes train/val/test = {len(train_eps)}/{len(val_eps)}/{len(test_eps)}")
 print(f"windows (T={CFG['horizon']}) train/val = {len(ds_tr)}/{len(ds_va)};  rf = {RF} macro steps "
       f"= {RF * MACRO_DT:.0f} s of history")
+""")
+
+# ---------------------------------------------------------------------------
+md(r"""
+## Under the hood: the PyTorch
+
+All the model code lives in [`jepa/models.py`](jepa/models.py). The cell below prints the
+four pieces that *are* the JEPA, straight from that file:
+
+* `JEPAWorldModel` (two causal-TCN encoders + a GRU predictor),
+* `SIGReg` (the anti-collapse regularizer),
+* `jepa_loss` (encode states, encode actions, unroll, compare to encoded future, add SIGReg),
+* `PIProber.corrections` + `integrate_eom` (latent → physics).
+
+A training step is then just
+`loss, logs = jepa_loss(wm, sigreg, batch, 0.02); loss.backward(); opt.step()`
+inside `M.fit`.
+""")
+code(r"""
+import inspect
+for obj in (M.CausalTCN, M.JEPAWorldModel, M.SIGReg, M.jepa_loss,
+            M.aero_from_corrections, M.integrate_eom, M.PIProber):
+    print(inspect.getsource(obj))
+    print("#" + "-" * 78)
 """)
 
 # ---------------------------------------------------------------------------
