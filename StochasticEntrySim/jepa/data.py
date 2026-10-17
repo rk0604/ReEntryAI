@@ -50,6 +50,7 @@ import constants
 # World model / planner step. One bank command is held for this long.
 MACRO_DT_S = 5.0
 SIGMA_MAX_RAD = math.pi / 2.0     # same handle as the RL env: action 1 -> 90 deg
+SKIP_OUT_ALT_M = 160_000.0       # top of the atmosphere table; a flight above it has skipped out
 G0 = float(constants.STANDARD_GRAVITY_MPS2)
 R_EARTH = float(constants.RADIUS_EARTH)
 
@@ -75,6 +76,47 @@ class DomainSpec:
 
 
 NOMINAL_DOMAIN = {"density_scale": 1.0, "lift_scale": 1.0, "mass_scale": 1.0}
+
+# Wider truth randomization for the wide-envelope dataset.
+WIDE_DOMAIN = DomainSpec(density_scale=(0.70, 1.30), lift_scale=(0.70, 1.30), mass_scale=(0.90, 1.10))
+
+
+@dataclass
+class EnvelopeSpec:
+    """
+    Uniform ranges for the entry-interface state of wide-envelope data.
+
+    The default config only disperses the entry by about 1 km, 100 m/s, 0.4 deg
+    of flight-path angle and 3 deg of heading, so every flight starts in the same
+    corridor. These ranges cover entry altitude, sub-circular to super-circular
+    speed, shallow to steep flight-path angle, any heading, and a band of
+    latitudes. Longitude barely matters (the dynamics do not depend on it).
+
+    Fast, shallow entries skip back out of the atmosphere, so the shallowest
+    allowed flight-path angle steepens with speed: from gamma_deg's upper bound
+    at skip_guard_speed_mps[0] down to skip_guard_gamma_deg at [1] (checked with
+    bank 0, thin air, high L/D, the worst case for skipping).
+    """
+    altitude_m: tuple = (100_000.0, 140_000.0)
+    velocity_mps: tuple = (6_800.0, 8_600.0)
+    gamma_deg: tuple = (-6.0, -1.0)
+    chi_deg: tuple = (0.0, 360.0)
+    phi_deg: tuple = (-30.0, 30.0)
+    lambda_deg: tuple = (-20.0, 20.0)
+    skip_guard_speed_mps: tuple = (7_600.0, 8_600.0)
+    skip_guard_gamma_deg: float = -4.0
+
+
+def sample_entry_ic(rng: np.random.Generator, spec: EnvelopeSpec) -> Dict[str, float]:
+    """Draw one entry-interface condition (an ic_override dict) from the envelope."""
+    V = float(rng.uniform(*spec.velocity_mps))
+    v0, v1 = spec.skip_guard_speed_mps
+    frac = min(max((V - v0) / (v1 - v0), 0.0), 1.0)
+    shallowest = spec.gamma_deg[1] + frac * (spec.skip_guard_gamma_deg - spec.gamma_deg[1])
+    return {"altitude_m": float(rng.uniform(*spec.altitude_m)), "velocity_mps": V,
+            "gamma_deg": float(rng.uniform(spec.gamma_deg[0], shallowest)),
+            "chi_deg": float(rng.uniform(*spec.chi_deg)), "phi_deg": float(rng.uniform(*spec.phi_deg)),
+            "lambda_deg": float(rng.uniform(*spec.lambda_deg))}
 
 
 def sample_domain(rng: np.random.Generator, spec: DomainSpec) -> Dict[str, float]:
@@ -178,7 +220,9 @@ def collect_episode(job: dict) -> dict:
 
     Parameters:
         job: dict with config_path, seed, kind ("gp" or "reversal"),
-             randomize (bool), spec (DomainSpec fields as a dict), max_steps.
+             randomize (bool), spec (DomainSpec fields as a dict), max_steps,
+             and optionally envelope (EnvelopeSpec fields as a dict) to start
+             from a wide-envelope entry condition instead of the config's.
 
     Returns:
         Episode dict: y [N+1, N_Y] float32 at 1 Hz, cmd [N] float32 (rad, the
@@ -190,13 +234,16 @@ def collect_episode(job: dict) -> dict:
     domain = (sample_domain(rng, DomainSpec(**job["spec"])) if job["randomize"]
               else dict(NOMINAL_DOMAIN))
     apply_domain(env.params, domain)
-    _, info = env.reset(seed=int(job["seed"]))
+    # Drawn after the domain so jobs without an envelope keep their old seeds' results.
+    options = ({"ic_override": sample_entry_ic(rng, EnvelopeSpec(**job["envelope"]))}
+               if job.get("envelope") else None)
+    _, info = env.reset(seed=int(job["seed"]), options=options)
 
     n_sub = int(round(MACRO_DT_S / env.guidance_period_s))
     profile = sample_bank_profile(rng, job["max_steps"] // n_sub + 2, job["kind"])
     ys = [physical_state(env)]
     cmds = []
-    done, k = False, 0
+    done, k, outcome = False, 0, None
     while not done:
         sigma = float(profile[k // n_sub])
         _, _, term, trunc, info = env.step(np.array([sigma / SIGMA_MAX_RAD], dtype=np.float32))
@@ -204,10 +251,13 @@ def collect_episode(job: dict) -> dict:
         ys.append(physical_state(env))
         k += 1
         done = bool(term or trunc)
+        # Above the atmosphere table there is nothing left to learn, only coasting.
+        if ys[-1][0] > SKIP_OUT_ALT_M:
+            done, outcome = True, "skip_out"
     return {
         "y": np.asarray(ys, dtype=np.float32), "cmd": np.asarray(cmds, dtype=np.float32),
         "domain": domain, "kind": job["kind"], "seed": int(job["seed"]),
-        "outcome": info["outcome"], "miss_km": float(info["miss_km"]),
+        "outcome": outcome or info["outcome"], "miss_km": float(info["miss_km"]),
         "t_final_s": float(info["t_s"]), "ic": dict(info["ic"]),
     }
 
@@ -270,6 +320,53 @@ def collect_dataset(n_episodes: int, config_path: str = "configs/default.json",
         with open(cache_path, "wb") as f:
             pickle.dump(eps, f)
         print(f"[data] saved {len(eps)} episodes -> {cache_path}")
+    return eps
+
+
+def collect_shards(n_total: int, out_dir: str, shard_size: int = 250, seed0: int = 100_000,
+                   workers: int = 1, max_steps: int = 1200, kinds: Sequence[str] = ("gp", "reversal"),
+                   spec: Optional[DomainSpec] = None, envelope: Optional[EnvelopeSpec] = None,
+                   config_path: str = "configs/default.json") -> None:
+    """
+    Collect a large dataset as numbered shard files, resumable across sessions.
+
+    Shard k holds episodes k*shard_size .. (k+1)*shard_size-1, and episode i
+    always uses seed seed0 + i, so a rerun skips finished shards and produces
+    the same data. Each shard is written to a temp file and renamed, so a
+    disconnect mid-write never leaves a corrupt shard behind.
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    spec = spec or DomainSpec()
+    n_shards = (n_total + shard_size - 1) // shard_size
+    t0, done_now = time.time(), 0
+    for k in range(n_shards):
+        path = out / f"shard_{k:03d}.pkl"
+        if path.exists():
+            continue
+        ids = range(k * shard_size, min(n_total, (k + 1) * shard_size))
+        jobs = [{"config_path": config_path, "seed": seed0 + i, "kind": kinds[i % len(kinds)],
+                 "randomize": True, "spec": asdict(spec), "max_steps": max_steps,
+                 "envelope": asdict(envelope) if envelope else None} for i in ids]
+        eps = run_parallel(collect_episode, jobs, workers, label=f"shard {k + 1}/{n_shards}")
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "wb") as f:
+            pickle.dump(eps, f)
+        tmp.replace(path)
+        done_now += 1
+        left = sum(not (out / f"shard_{j:03d}.pkl").exists() for j in range(n_shards))
+        per = (time.time() - t0) / done_now
+        print(f"[data] shard {k + 1}/{n_shards} saved ({len(eps)} episodes) | "
+              f"{left} left, ~{per * left / 60:.0f} min remaining")
+    print(f"[data] all {n_shards} shards present in {out}")
+
+
+def load_shards(out_dir: str) -> List[dict]:
+    """Concatenate every shard in a directory, in shard order."""
+    eps: List[dict] = []
+    for path in sorted(Path(out_dir).glob("shard_*.pkl")):
+        with open(path, "rb") as f:
+            eps += pickle.load(f)
     return eps
 
 
