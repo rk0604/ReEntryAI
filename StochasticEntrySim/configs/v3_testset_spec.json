@@ -1,0 +1,48 @@
+{
+ "spec": {
+  "n_bridge": 16,
+  "n_new": 48,
+  "sobol_seed": 20261018,
+  "altitude_m": [
+   105000.0,
+   135000.0
+  ],
+  "velocity_mps": [
+   7200.0,
+   8400.0
+  ],
+  "gamma_deg": [
+   -4.0,
+   -1.5
+  ],
+  "skip_guard_speed_mps": [
+   7600.0,
+   8600.0
+  ],
+  "skip_guard_gamma_deg": -4.0,
+  "downrange_frac": [
+   0.1,
+   0.9
+  ],
+  "crossrange_frac": [
+   -0.7,
+   0.7
+  ],
+  "margin_km": 50.0,
+  "max_entry_lat_deg": 30.0,
+  "max_liftup_peak_g": 4.0,
+  "load_limit_g": 4.5,
+  "bank_step_deg": 5.0,
+  "max_candidates": 4096,
+  "target_phi_deg": 15.0,
+  "target_lambda_deg": 15.0,
+  "footprint_dt_s": 1.0
+ },
+ "rejections": {
+  "margin below limit": 1,
+  "lift-up peak g above limit": 84,
+  "entry latitude outside training range": 15
+ },
+ "n_candidates": 148,
+ "horizon_steps": 188
+}
