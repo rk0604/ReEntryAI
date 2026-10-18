@@ -224,7 +224,9 @@ def build(A, figs, bias_png, out_pdf):
                "Treat it as \"about equal, classical slightly ahead\".",
                "<b>Failures overlap:</b> every v2 failure is also a classical and v1 failure. Under ×0.78 air the "
                "classical controller misses 6 cases by between 23 and 27 km, so its 37.5% success depends on where "
-               "the 25 km line is drawn."])
+               "the 25 km line is drawn.",
+               "<b>The cleanest comparison is the ×0.78 atmosphere,</b> because there the load is matched (v2 4.04 g, "
+               "classical 4.06 g): v2 wins all 16 cases."])
 
     d.h1("2. Open loop: predicting where the capsule lands")
     d.fig(figs["open"], "Median error of the predicted parachute point, given the state at a time-to-go and the "
@@ -296,8 +298,9 @@ def build(A, figs, bias_png, out_pdf):
                 "no overfitting yet. Try 48,000 steps, and a second seed to measure run-to-run spread.",
                 "<b>Rethink the uncertainty term:</b> it has no closed-loop effect at weight 1. Try a larger weight "
                 "only late in flight, or drop it and keep plain ensemble averaging.",
-                "<b>Infeasible cases:</b> check whether cases 4, 5 and 14 under ×0.78 air can reach the target at all "
-                "(a reachability sweep). If not, score success only on reachable cases."])
+                "<b>Infeasible cases:</b> a full lift-up flight in the true ×0.78 atmosphere lands 74 km (case 5) and "
+                "82 km (case 14) short of the target, so no controller can reach it. Score success only on reachable "
+                "cases, and check case 4 the same way."])
 
     doc = SimpleDocTemplate(out_pdf, pagesize=letter, leftMargin=0.75 * inch, rightMargin=0.75 * inch,
                             topMargin=0.6 * inch, bottomMargin=0.7 * inch, title="SpaceJEPA v2: first full results")
