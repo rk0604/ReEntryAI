@@ -460,7 +460,7 @@ def analyze(cfg: S.StudyConfig, layout: S.Layout, df: Optional[pd.DataFrame] = N
     cases = sorted(S.load_testset(cfg).case.tolist())
     load = f"{cfg.g_primary:g}g"
     P = primary(df, cfg)
-    seeds = sorted(s for s in P[P.controller == "v2"].seed.unique() if s >= 0)
+    seeds = sorted(int(s) for s in P[P.controller == "v2"].seed.unique() if s >= 0)
     out: Dict[str, object] = {"seeds": seeds, "n_flights": len(df), "load": load}
 
     # ---- T01 / T02: the main metric tables ----
