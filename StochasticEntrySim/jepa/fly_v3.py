@@ -201,7 +201,7 @@ def fly_classical(job: dict) -> dict:
 class V2Adapter:
     """The v2 ensemble (or a member subset) on its device, with AMP."""
 
-    def __init__(self, models: dict, chunk: int = 4096):
+    def __init__(self, models: dict, chunk: int = 2048):
         from jepa.models_v2 import amp_dtype
         self.wm, self.pi, self.stats = models["wm"], models["pi"], models["stats"]
         self.rf, self.M = self.wm.rf, self.wm.M
@@ -264,9 +264,10 @@ class V1Adapter:
 _ADAPTERS: Dict[tuple, object] = {}
 
 
-def load_adapter(kind: str, ckpt: str, device: str = "cpu", members: Optional[Sequence[int]] = None):
+def load_adapter(kind: str, ckpt: str, device: str = "cpu", members: Optional[Sequence[int]] = None,
+                 chunk: int = 2048):
     """Build (once per process) the adapter of a checkpoint: kind 'v1' or 'v2'."""
-    key = (kind, str(ckpt), str(device), tuple(members) if members is not None else None)
+    key = (kind, str(ckpt), str(device), tuple(members) if members is not None else None, int(chunk))
     if key not in _ADAPTERS:
         if kind == "v1":
             from jepa.models import load_checkpoint
@@ -274,7 +275,7 @@ def load_adapter(kind: str, ckpt: str, device: str = "cpu", members: Optional[Se
         else:
             from jepa.models_v2 import load_checkpoint_v2, select_members
             m = load_checkpoint_v2(ckpt, device)
-            _ADAPTERS[key] = V2Adapter(select_members(m, members) if members is not None else m)
+            _ADAPTERS[key] = V2Adapter(select_members(m, members) if members is not None else m, chunk)
     return _ADAPTERS[key]
 
 
@@ -300,7 +301,7 @@ class FlightV3(_Flight):
 
 @torch.no_grad()
 def run_lockstep_v3(jobs: Sequence[dict], adapter, mppi: Optional[dict] = None, n_sub: int = 2,
-                    max_rows: int = 8192, on_done: Optional[Callable[[dict], None]] = None,
+                    max_rows: int = 4096, on_done: Optional[Callable[[dict], None]] = None,
                     verbose: bool = True) -> List[dict]:
     """
     Fly every job with MPPI on the adapter's model, all flights in lockstep

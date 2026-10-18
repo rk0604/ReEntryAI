@@ -330,7 +330,7 @@ METRICS: Dict[str, Callable] = {
 }
 
 
-def metric_table(df: pd.DataFrame, by=("controller", "atmosphere")) -> pd.DataFrame:
+def metric_table(df: pd.DataFrame, by=("controller", "atmosphere")) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Per group and seed: every metric; then mean / min / max over seeds and the pooled value."""
     by = list(by)
     rows = []
@@ -340,8 +340,10 @@ def metric_table(df: pd.DataFrame, by=("controller", "atmosphere")) -> pd.DataFr
     out = []
     for key, g in per_seed.groupby(by, dropna=False):
         key = key if isinstance(key, tuple) else (key,)
-        pooled = df.set_index(by).loc[key] if len(by) > 1 else df[df[by[0]] == key[0]]
-        pooled = pooled.reset_index() if len(by) > 1 else pooled
+        mask = np.ones(len(df), dtype=bool)
+        for col, v in zip(by, key):
+            mask &= (df[col] == v).to_numpy()
+        pooled = df[mask]
         r = {**dict(zip(by, key)), "n_seeds": g.seed.nunique(), "n_flights": int(g.n.sum())}
         for k in METRICS:
             r[f"{k}"] = g[k].mean()

@@ -9,8 +9,10 @@ are what matter:
      placement round-trips, and the frozen CSV is reproduced from its Sobol
      indices
   2. the lockstep runner flies the same decisions as the unchanged
-     mppi.run_episode, for v1 (shipped checkpoint) and for single-member v2,
-     on 3 cases
+     mppi.run_episode for v1 (shipped checkpoint, 20 decisions, 3 cases);
+     for single-member v2 it is identical to mppi_v2.run_lockstep over whole
+     flights, its parallel rollout matches the step-by-step one, and its first
+     decisions match mppi.run_episode
   3. common random numbers: every learned controller gets the same MPPI
      noise for the same (seed, case, atmosphere, rep), and different
      conditions get different noise
@@ -96,28 +98,74 @@ def t1_testset() -> None:
 
 
 def t2_equivalence(v2_ckpt: str) -> None:
-    print("2. lockstep runner == mppi.run_episode (first 20 decisions, 3 cases)")
+    print("2. lockstep runner == the unchanged runners (3 cases)")
+    from jepa import models as M1
     from jepa import models_v2 as V
-    cases = pd.read_csv("configs/v3_testset.csv")
+    from jepa import mppi_v2 as P2
+    cases = pd.read_csv("configs/v3_testset.csv").set_index("case")
     cfg_m = {"n_samples": 48, "n_sub": 2, "g_limit": 4.5, "horizon": 120}
+
+    def job(c, seed, ctrl):
+        return {"ic": TS.ic_of(cases.loc[c]), "domain": dict(D.NOMINAL_DOMAIN), "atmosphere": "nominal", "case": c,
+                "set": "x", "controller": ctrl, "load": "4.5g", "seed": 0, "mppi_rep": 0, "record": True,
+                "mppi": {**cfg_m, "seed": seed, "w_unc_km": 0.0}}
+
+    # v1: the v3 runner against the unchanged mppi.run_episode, closed loop (same arithmetic -> exact).
+    ad1 = F.load_adapter("v1", V1_CKPT, "cpu")
+    worst = 0.0
+    for c in (0, 16, 40):
+        seed = F.crn_seed(0, c, "nominal", 0)
+        ref = P.run_episode({"controller": "jepa", "ic": TS.ic_of(cases.loc[c]), "domain": dict(D.NOMINAL_DOMAIN),
+                             "ckpt": V1_CKPT, "mppi": {**cfg_m, "seed": seed}, "record": True})
+        got = F.run_lockstep_v3([job(c, seed, "v1")], ad1, {}, verbose=False)[0]
+        n = min(20, len(ref["traj"]) - 1)
+        worst = max(worst, float(np.abs(np.degrees(ref["traj"][:n, 10])
+                                        - got["telemetry"]["sigma_cmd_deg"][1::5][:n]).max()))
+    check("v1: same decisions as mppi.run_episode over the first 20 decisions", worst < 0.5,
+          f"(max |d cmd| {worst:.2e} deg)")
+    # v2 single member: (a) the v3 runner against mppi_v2.run_lockstep (the v2 study's runner), whole flight.
     one = V.select_members(V.load_checkpoint_v2(v2_ckpt), [0])
-    P._MODEL_CACHE["smoke-v3-v2"] = V.as_v1(one)
-    for kind, ckpt, adapter in (("v1", V1_CKPT, F.load_adapter("v1", V1_CKPT, "cpu")),
-                                ("v2 single", "smoke-v3-v2", F.V2Adapter(one))):
-        worst = 0.0
-        for c in (0, 16, 40):
-            row = cases.set_index("case").loc[c]
-            seed = F.crn_seed(0, c, "nominal", 0)
-            ref = P.run_episode({"controller": "jepa", "ic": TS.ic_of(row), "domain": dict(D.NOMINAL_DOMAIN), "ckpt": ckpt,
-                                 "mppi": {**cfg_m, "seed": seed}, "record": True, "tag": "nominal", "case": c})
-            job = {"ic": TS.ic_of(row), "domain": dict(D.NOMINAL_DOMAIN), "atmosphere": "nominal", "case": c,
-                   "set": "x", "controller": "v1", "load": "4.5g", "seed": 0, "mppi_rep": 0,
-                   "mppi": {**cfg_m, "seed": seed, "w_unc_km": 0.0}}
-            got = F.run_lockstep_v3([job], adapter, {}, verbose=False)[0]
-            n = min(20, len(ref["traj"]) - 1)
-            cmd = got["telemetry"]["sigma_cmd_deg"][1::5][:n]
-            worst = max(worst, float(np.abs(np.degrees(ref["traj"][:n, 10]) - cmd).max()))
-        check(f"{kind}: same decisions", worst < 0.5, f"(max |d cmd| {worst:.2e} deg)")
+    ad2 = F.V2Adapter(one)
+    worst, n_cmp = 0.0, 0
+    for c in (0, 16, 40):
+        seed = F.crn_seed(0, c, "nominal", 0)
+        old = P2.run_lockstep([{"ic": TS.ic_of(cases.loc[c]), "domain": dict(D.NOMINAL_DOMAIN), "record": True}], one,
+                              {**cfg_m, "seed": seed, "w_unc_km": 0.0}, verbose=False)[0]
+        got = F.run_lockstep_v3([job(c, seed, "v2single")], ad2, {}, verbose=False)[0]
+        a, b = np.degrees(old["traj"][:-1, 10]), got["telemetry"]["sigma_cmd_deg"][1::5]
+        n = min(len(a), len(b))
+        n_cmp += n
+        worst = max(worst, float(np.abs(a[:n] - b[:n]).max()), abs(old["miss_km"] - got["result"]["miss_km"]))
+    check("v2 single: identical to mppi_v2.run_lockstep for the whole flight", worst < 1e-4,   # float32 telemetry
+          f"({n_cmp} decisions, max diff {worst:.1e})")
+    # (b) the parallel predictor (lockstep) against the KV-cached step-by-step path run_episode uses.
+    import rl_env
+    env = rl_env.OrionEntryEnv(controller_mode="policy", dispersion=False, fast_atmosphere=True)
+    env.reset(seed=0, options={"ic_override": TS.ic_of(cases.loc[16])})
+    for _ in range(60):
+        env.step(np.array([0.3], dtype=np.float32))
+    y = torch.as_tensor(D.physical_state(env), dtype=torch.float32)
+    yh, uh = y[None].repeat(one["wm"].rf, 1), torch.full((one["wm"].rf - 1,), 0.4)
+    u = (torch.randn(64, 110, generator=torch.Generator().manual_seed(0)) * 0.6).clamp(-1.5, 1.5)
+    from jepa.evaluate import crossing_point
+    view = V.as_v1(one)
+    with torch.no_grad():
+        ref = M1.jepa_predict(view["wm"], view["pi"], one["stats"].norm_feats(yh)[None], yh[-1, :6].expand(64, 6),
+                              uh.expand(64, -1), u, D.MACRO_DT_S, 2, h_stop=7600.0)["y6"]
+        got, _ = ad2.rollout(ad2.context([yh]).repeat_interleave(64, 1), yh[-1, :6].expand(64, 6), uh.expand(64, -1),
+                             u, 2, 7600.0)
+    p1, p2 = crossing_point(ref.double(), 7600.0), crossing_point(got[:, 0].double(), 7600.0)
+    d_km = float(torch.maximum((p1[0] - p2[0]).abs(), (p1[1] - p2[1]).abs()).max()) * 6371.0
+    check("v2: parallel rollout == step-by-step rollout (landing points)", d_km < 0.01, f"(max {1000 * d_km:.2f} m)")
+    # (c) closed loop against mppi.run_episode: the first decisions agree; float32 round-off between the two
+    # predictor paths (above: sub-meter) is then amplified by the closed loop, so no long-horizon claim.
+    P._MODEL_CACHE["smoke-v3-v2"] = view
+    seed = F.crn_seed(0, 0, "nominal", 0)
+    ref = P.run_episode({"controller": "jepa", "ic": TS.ic_of(cases.loc[0]), "domain": dict(D.NOMINAL_DOMAIN),
+                         "ckpt": "smoke-v3-v2", "mppi": {**cfg_m, "seed": seed}, "record": True})
+    got = F.run_lockstep_v3([job(0, seed, "v2single")], ad2, {}, verbose=False)[0]
+    d = np.abs(np.degrees(ref["traj"][:3, 10]) - got["telemetry"]["sigma_cmd_deg"][1::5][:3])
+    check("v2 single: first 3 decisions match mppi.run_episode", float(d.max()) < 0.5, f"(max {d.max():.1e} deg)")
 
 
 def t3_crn() -> None:
@@ -190,19 +238,20 @@ def t6_training(cfg: S.StudyConfig, layout: S.Layout, data: dict) -> str:
         calls["n"] += 1
         if calls["stop"] is not None and calls["n"] > calls["stop"]:
             raise KeyboardInterrupt
-        return ((m(x) - y) ** 2).mean(), {"mse": float(((m(x) - y) ** 2).mean())}
+        loss = ((m(x) - y) ** 2).mean()
+        return loss, {"mse": float(loss.detach())}
 
     tmp = Path(tempfile.mkdtemp()) / "state.pt"
     c = S.StudyConfig.smoke()
     c.save_every_s, c.v1_log_every, c.v1_extend_tol = 0.0, 10, -1.0      # tol < 0: always extend
-    calls["stop"] = 37
+    calls["stop"] = 37                     # call 38 raises: 37 steps done and checkpointed
     try:
         S.fit_resumable(m, loss_fn, 60, tmp, lambda: float(((m(x) - y) ** 2).mean()), c, "unit")
     except KeyboardInterrupt:
         pass
     calls["stop"], calls["n"] = None, 0
     h = S.fit_resumable(m, loss_fn, 60, tmp, lambda: float(((m(x) - y) ** 2).mean()), c, "unit")
-    check("resumed where it stopped", calls["n"] == 90 - 36, f"({calls['n']} steps after resume)")
+    check("resumed where it stopped", calls["n"] == 90 - 37, f"({calls['n']} steps after resume)")
     check("extension rule ran once", h["extended"]["extend"] and h["step"][-1] == 90)
     c.v1_extend_tol = 10.0
     tmp2 = Path(tempfile.mkdtemp()) / "state.pt"

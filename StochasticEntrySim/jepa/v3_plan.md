@@ -1,7 +1,9 @@
 # SpaceJEPA v3: full study plan (v1 vs v2 vs classical)
 
-Branch: `jepa-v3` (from `jepa-v2`). Status: **plan only, no code yet.** This file is the reference
-for building and running v3. The v1/v2 design is in `PLAN.md` §1–11; v2's first results are in
+Branch: `jepa-v3` (from `jepa-v2`). Status: **implemented, ready to run on Colab.** The code is in
+`jepa/` (`testset_v3`, `study_v3`, `fly_v3`, `analyze_v3`, `smoke_v3`, `build_notebooks_v3`), and the four
+notebooks are `ReEntryAI_JEPA_v3_{0_testset,1_train,2_fly,3_analyze}.ipynb`. §13 lists where the code
+had to make a choice the plan left open. This file is the reference for building and running v3. The v1/v2 design is in `PLAN.md` §1–11; v2's first results are in
 `SpaceJEPA_v2_results.pdf`.
 
 ---
@@ -38,7 +40,8 @@ Decisions already made (from the planning discussion):
 
 ### 1.1 Composition
 * **16 bridge cases:** the same first 16 frozen ICs used in v1 and v2 (`configs/heldout_testset.csv`,
-  rows 0–15). They connect v3 to the earlier results, and their classical runs are already cached on Drive.
+  rows 0–15). They connect v3 to the earlier results. Their classical runs are flown again so they
+  have telemetry (§13).
 * **48 new cases:** entry altitude, speed, flight-path angle, heading and entry position varied far
   more widely (below). They are all feasible by construction.
 
@@ -151,7 +154,7 @@ GPU training is not bit-for-bit deterministic. Seeds reproduce statistically, no
 
 | Controller | Seeds | Load limit | Conditions | Flights |
 |---|---|---|---|---|
-| classical predictor-corrector | 1 (deterministic) | its own guidance | 256 (64 bridge flights cached) | 192 new |
+| classical predictor-corrector | 1 (deterministic) | its own guidance | 256 | 256 (all re-flown for telemetry) |
 | **v1** (fair budget) | 5 | **4.5 g** (primary) | 256 | 1,280 |
 | **v2** (ensemble) | 5 | **4.5 g** (primary) | 256 | 1,280 |
 | v2 single member | 5 | 4.5 g | 256 | 1,280 |
@@ -365,3 +368,57 @@ results to the same Drive folder.
   targets, atmospheres that decouple density from L/D or vary with altitude, mass dispersion in the tests.
 * No new world-model architecture in v3. Model changes suggested by v2 (on-policy data, terminal-phase
   replanning, a redesigned uncertainty term) wait until v3 has measured the current models properly.
+
+---
+
+## 13. Implementation notes (decisions made while building)
+
+* **Footprints respect the load limit.** A constant-bank sweep from ±0° to ±90° reaches short ranges only
+  by pulling up to 10 g. A target there would be infeasible at the 4.5 g limit (§3), which would break the
+  intent of §1.2 step 5. So the reachable region uses only the banks whose peak load stays ≤ 4.5 g:
+  * The sweep runs in 5° steps outward from lift-up, stopping at the first bank over the limit.
+  * Mixing banks (reversals, late lift-up) reaches at least this region, so it is a conservative
+    inner estimate.
+  * The sweep was checked against real simulator flights and lands within about 4 km of them
+    (`smoke_v3.py` check 1).
+* **The frozen test set** (`configs/v3_testset.csv`, built by `python jepa/testset_v3.py`):
+  * 148 Sobol candidates gave 48 accepted cases. Rejections: 84 for lift-up peak g > 4.0, 15 for entry
+    latitude outside ±30°, and 1 for margin.
+  * Coverage: altitude 105–135 km, speed 7.43–8.40 km/s, γ −1.69° to −3.97°, approach heading 8°–355°,
+    downrange 1,980–3,100 km.
+  * Bridge cases flagged infeasible at 4.5 g: nominal {5}, ×0.88 {4, 5}, ×0.78 {3, 4, 5, 6, 13, 14}.
+    They stay in the primary results, and T02 leaves them out.
+* **Planning horizon** = 188 steps (940 s), from the longest lift-up flight (876 s in the ×1.12
+  atmosphere) + 60 s. That is 1.96× v2's longest training horizon (96 steps) and 7.8× v1's (24). The
+  extrapolation is the same for every seed, and is recorded in the study config.
+* **Classical:** all 256 conditions are flown again instead of reusing the 64 cached bridge flights, for
+  two reasons:
+  * The cached results have no telemetry, and §6 needs RCS data for every flight.
+  * The cache (`jepa_runs/classical_cache.pkl`, which v2's notebook also reused for nominal and ×0.88)
+    comes from an earlier simulator version. Example: bridge case 0 at ×0.88 is 3.43 km cached vs 3.48 km
+    now, with flight time 559.25 vs 559.0 s. `fly_v3.fly_classical` reproduces the current
+    `mppi.run_episode` exactly.
+
+  The cost is about 1.6 extra CPU-hours.
+* **v1 convergence extension (§2.3):**
+  * The rule compares the validation loss at the last log at or before 80% of the steps with the final
+    one.
+  * An extension trains 50% more steps on a fresh cosine cycle, warm-restarted at 30% of the peak
+    learning rate.
+  * It applies to both v1 stages and is recorded in the checkpoint.
+* **Holm (§8.1)** adjusts the bootstrap p-values of the hypothesis-test criteria (C1, C2, C7). Each of them
+  then also needs a Holm-adjusted p < 0.05. C3–C6 and Bridge are threshold checks.
+* **Classical planning time** is the wall time of the whole 1 s guidance step, which includes the
+  physics. It is not comparable with MPPI's amortized per-decision time.
+* **Lockstep equivalence (§4.1)**, `smoke_v3.py` check 2:
+  * **v1:** the runner reproduces `mppi.run_episode` to within 1e-5° per decision and to the same miss
+    and fuel.
+  * **Single-member v2:** the runner is identical to v2's own `mppi_v2.run_lockstep` over whole flights.
+    Its parallel predictor rollout matches the KV-cached step-by-step rollout that `run_episode` uses to
+    within about a metre in landing point.
+  * **Why v2 can't match `run_episode` for 20 decisions:** the closed loop amplifies that float32
+    round-off. The decisions agree to about 1e-3° for the first several steps and then drift apart (up
+    to tens of degrees by decision 20 with a smoke-trained model). So the plan's "< 0.5° over 20
+    decisions" is applied to v1, and v2 is checked by the three deterministic tests above.
+* **GPU memory:** each lockstep worker batches ≤ 4,096 samples per rollout and 2,048 rows per predictor
+  pass, about 5 GB at the 188-step horizon. The fly notebook starts min(4, CPUs, GPU GB ÷ 5) workers.

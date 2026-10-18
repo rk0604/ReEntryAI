@@ -303,8 +303,10 @@ with more cores, writing into the same Drive folder.
     ("md", SETUP_MD), ("code", SETUP),
     ("code", r"""
 JOBS = S.build_jobs(CFG, L)
+GPU_MEM_GB = torch.cuda.get_device_properties(0).total_memory / 1e9 if DEVICE == "cuda" else 0.0
 CPU_WORKERS = CPUS                         # classical: one simulator per core
-GPU_WORKERS = max(1, min(4, CPUS))         # learned: processes sharing the GPU, each stepping its own simulators
+# learned: processes sharing the GPU, each stepping its own simulators on one core (~5 GB of GPU memory each)
+GPU_WORKERS = max(1, min(4, CPUS, int(GPU_MEM_GB // 5) if DEVICE == "cuda" else CPUS))
 RUN_CLASSICAL, RUN_LEARNED = True, True
 tab = pd.DataFrame([{"controller": j["controller"], "load": j["load"], "seed": j["seed"], "mppi_rep": j["mppi_rep"],
                      "done": S.flight_done(L, j)} for j in JOBS])
@@ -316,9 +318,9 @@ print(f"{len(JOBS)} flights, {int(tab.done.sum())} done. MPPI horizon {S.horizon
     ("md", r"""
 ## 1. Classical predictor-corrector (CPU)
 
-All 256 conditions run again, including the 64 bridge flights that v1/v2 cached, so every classical
-flight also has telemetry (the cached results had none). The guidance is deterministic, so the bridge
-results should reproduce the cached ones.
+All 256 conditions run again, including the 64 bridge flights that v1/v2 cached, for two reasons:
+every classical flight then has telemetry (the cached results had none), and the cache came from an
+earlier simulator version. The guidance is deterministic: re-running gives identical flights.
 """),
     ("code", r"""
 if RUN_CLASSICAL:

@@ -100,7 +100,8 @@ class StudyConfig:
                                                     n_iters_first=4, n_sub=2))
     horizon: Optional[int] = None                       # None = from the test set (plan 4.2)
     w_unc_km: float = 1.0
-    max_rows: int = 8192
+    max_rows: int = 4096                                # samples per batched rollout (latents: M x rows x K x D floats)
+    v2_chunk: int = 2048                                # rows per predictor pass (activations ~ M x chunk x K x 768)
     # ---- analysis ----
     success_km: float = 5.0
     legacy_success_km: float = 25.0
@@ -728,9 +729,9 @@ def run_classical(jobs: Sequence[dict], layout: Layout, workers: int = 1, log=pr
 
 def _learned_worker(arg) -> int:
     """Pool worker: fly one shard of a model run in lockstep; results are written by on_done."""
-    shard, kind, ckpt, members, device, mppi, max_rows, root, threads, verbose = arg
+    shard, kind, ckpt, members, device, mppi, max_rows, chunk, root, threads, verbose = arg
     torch.set_num_threads(int(threads))
-    adapter = F.load_adapter(kind, ckpt, device, members)
+    adapter = F.load_adapter(kind, ckpt, device, members, chunk)
     layout = Layout(root)
     F.run_lockstep_v3(shard, adapter, mppi, n_sub=int(mppi.get("n_sub", 2)), max_rows=max_rows,
                       on_done=lambda rec: write_flight(layout, rec), verbose=verbose)
@@ -764,7 +765,7 @@ def run_learned(cfg: StudyConfig, jobs: Sequence[dict], layout: Layout, device: 
                 continue
             t0 = time.time()
             shards = [todo[i::max(1, workers)] for i in range(max(1, workers))]
-            args = [(s, kind, ckpt, members, device, dict(cfg.mppi), cfg.max_rows, str(layout.root), 1,
+            args = [(s, kind, ckpt, members, device, dict(cfg.mppi), cfg.max_rows, cfg.v2_chunk, str(layout.root), 1,
                      pool is None) for s in shards if s]
             if pool is None:
                 for a in args:
