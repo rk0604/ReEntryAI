@@ -243,6 +243,11 @@ def _run_blocks(blocks: nn.ModuleList, x: torch.Tensor, use_ckpt: bool, **kw) ->
     return x
 
 
+def _full(x: torch.Tensor) -> torch.Tensor:
+    """Upcast half-precision (autocast) outputs to fp32; leave fp32/fp64 alone."""
+    return x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
+
+
 def action_features(u: torch.Tensor) -> torch.Tensor:
     """Bank commands (rad) [..., L] -> [..., L, 3]: scaled command and its sine/cosine."""
     return torch.stack([u / SIGMA_MAX_RAD, torch.sin(u), torch.cos(u)], -1)
@@ -293,7 +298,7 @@ class WorldModelV2(nn.Module):
         x = self.enc_in(self._members(feats, 4))
         x = _run_blocks(self.enc_blocks, x, self.grad_ckpt,
                         mask=band_mask(x.shape[2], self.enc_band, x.device))
-        return self.enc_out(self.enc_norm(x[:, :, self.rf - 1:]))
+        return _full(self.enc_out(self.enc_norm(x[:, :, self.rf - 1:])))   # latents never in half precision
 
     def action_tokens(self, u: torch.Tensor) -> torch.Tensor:
         """
@@ -312,7 +317,7 @@ class WorldModelV2(nn.Module):
         """Parallel rollout: s0 [M, B, D], tokens a [M, B, K, d] -> latents s~_t+1..t+K [M, B, K, D]."""
         ctx = self.ctx_in(s0)[:, :, None]
         x = _run_blocks(self.pred_blocks, torch.cat([ctx, a.to(ctx.dtype)], 2), self.grad_ckpt, causal=True)
-        return s0[:, :, None] + self.readout(self.pred_norm(x[:, :, 1:])).to(s0.dtype)
+        return _full(s0)[:, :, None] + _full(self.readout(self.pred_norm(x[:, :, 1:])))
 
     # ---- incremental (KV-cached) predictor, the v1 step-by-step API -----------
     def start(self, s0: torch.Tensor) -> dict:
@@ -329,7 +334,7 @@ class WorldModelV2(nn.Module):
         for blk, c in zip(self.pred_blocks, cache["layers"]):
             x = blk(x, pos0=cache["pos"], cache=c)
         cache["pos"] += 1
-        return cache["s0"] + self.readout(self.pred_norm(x[:, :, 0])).to(cache["s0"].dtype), cache
+        return _full(cache["s0"]) + _full(self.readout(self.pred_norm(x[:, :, 0]))), cache
 
 
 # ============================================================================
