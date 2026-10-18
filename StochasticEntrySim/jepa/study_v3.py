@@ -744,16 +744,16 @@ def run_learned(cfg: StudyConfig, jobs: Sequence[dict], layout: Layout, device: 
     at a time in queue order, its flights in lockstep, split over `workers`
     processes that share the GPU (each steps its own envs on one CPU core).
     """
-    gs = groups(jobs)
-    n_all = sum(len(g) for _, g in gs)
-    n_done0 = sum(flight_done(layout, j) for _, g in gs for j in g)
-    log(f"[learned] {n_done0}/{n_all} flights done, {len(gs)} model runs, {workers} worker(s) on {device}")
+    gs = [(k, g) for k, g in groups(jobs) if only is None or k in only]
+    ready = [(k, g) for k, g in gs if os.path.exists(model_ckpt(layout, k[0], k[2])[1])]
+    n_all = sum(len(g) for _, g in ready)
+    n_done0 = sum(flight_done(layout, j) for _, g in ready for j in g)
+    log(f"[learned] {n_done0}/{n_all} flights done in {len(ready)} model runs with a checkpoint "
+        f"({len(gs) - len(ready)} runs wait for training); {workers} worker(s) on {device}")
     pool = mp.get_context("spawn").Pool(int(workers)) if workers > 1 else None
     t_all, n_flown = time.time(), 0
     try:
         for key, g in gs:
-            if only is not None and key not in only:
-                continue
             todo = [j for j in g if not flight_done(layout, j)]
             if not todo:
                 continue
