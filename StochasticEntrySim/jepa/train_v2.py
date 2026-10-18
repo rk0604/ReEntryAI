@@ -38,26 +38,31 @@ REPO = "rk0604/ReEntryAI"
 # ============================================================================
 # Data
 # ============================================================================
+def _has_shards(path: str) -> bool:
+    """True if path is a directory holding collect_shards output."""
+    return bool(path) and os.path.isdir(path) and any(Path(path).glob("shard_*.pkl"))
+
+
 def find_wide_dataset(candidates: Sequence[str], download_dir: str) -> str:
     """
-    Return a path to episodes_wide_6000.pkl.
+    Return a path to the wide-envelope episodes: a pickle, or a shard directory.
 
-    Tries each candidate path, then the GitHub release (gh CLI if it is
-    installed and authenticated, else a plain HTTPS download, which works
-    for a public repo), saving into download_dir.
+    Tries each candidate in order (a merged episodes_wide_6000.pkl, or the
+    shard directory ReEntryAI_JEPA_data.ipynb writes to Drive), then the
+    GitHub release (gh CLI if installed and authenticated, else plain HTTPS,
+    which works for a public repo), saving into download_dir.
+    load_episodes() reads either kind.
     """
     for c in candidates:
-        if c and os.path.exists(c):
+        if c and (os.path.isfile(c) or _has_shards(c)):
             return c
     os.makedirs(download_dir, exist_ok=True)
     dst = os.path.join(download_dir, RELEASE_FILE)
     if os.path.exists(dst):
         return dst
+    url = f"https://github.com/{REPO}/releases/download/{RELEASE_TAG}/{RELEASE_FILE}"
     cmds = [["gh", "release", "download", RELEASE_TAG, "-R", REPO, "-p", RELEASE_FILE, "-D", download_dir],
-            ["wget", "-q", "-O", dst + ".part",
-             f"https://github.com/{REPO}/releases/download/{RELEASE_TAG}/{RELEASE_FILE}"],
-            ["curl", "-sSLf", "-o", dst + ".part",
-             f"https://github.com/{REPO}/releases/download/{RELEASE_TAG}/{RELEASE_FILE}"]]
+            ["wget", "-q", "-O", dst + ".part", url], ["curl", "-sSLf", "-o", dst + ".part", url]]
     for cmd in cmds:
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
@@ -67,14 +72,29 @@ def find_wide_dataset(candidates: Sequence[str], download_dir: str) -> str:
             os.replace(dst + ".part", dst)
         if os.path.exists(dst) and os.path.getsize(dst) > 1_000_000:
             return dst
-        print(f"[data] {' '.join(cmd[:3])}: {r.returncode} {r.stderr.strip()[:200]}")
+        print(f"[data] {' '.join(cmd[:3])}: exit {r.returncode} {r.stderr.strip()[:200]}")
     raise FileNotFoundError(
-        f"{RELEASE_FILE} not found in {list(candidates)} and the {RELEASE_TAG} release could not be "
-        f"downloaded. Collect it with ReEntryAI_JEPA_data.ipynb (it writes the file to Drive).")
+        f"No wide-envelope data in {[c for c in candidates if c]} and the {RELEASE_TAG} release could not be "
+        f"downloaded. Collect it with ReEntryAI_JEPA_data.ipynb (it writes shards and the merged file to Drive).")
+
+
+def local_copy(path: str, local_dir: str) -> str:
+    """Copy a (Drive-mounted) pickle to local disk once; faster to read, and pool workers reread it."""
+    if os.path.isdir(path):
+        return path
+    os.makedirs(local_dir, exist_ok=True)
+    dst = os.path.join(local_dir, os.path.basename(path))
+    if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(path):
+        import shutil
+        shutil.copyfile(path, dst + ".part")
+        os.replace(dst + ".part", dst)
+    return dst
 
 
 def load_episodes(path: str) -> List[dict]:
-    """Unpickle a list of collect_episode dicts."""
+    """A pickle of collect_episode dicts, or a collect_shards directory."""
+    if os.path.isdir(path):
+        return D.load_shards(path)
     with open(path, "rb") as f:
         return pickle.load(f)
 

@@ -39,7 +39,8 @@ from jepa.mppi import MPPI, MPPIConfig
 class MPPIConfigV2(MPPIConfig):
     """v1's MPPIConfig (same defaults) plus the ensemble-uncertainty weight."""
     w_unc_km: float = 1.0              # km of cost per km of landing-point spread across members
-    trim_horizon: bool = True          # after the first decision, roll out ~1.5x the predicted time-to-go
+    trim_horizon: bool = False         # True: after the first decision roll out only ~1.5x the predicted
+                                       # time-to-go (cheaper; v1 always rolls the full horizon)
 
 
 class EnsembleMPPI(MPPI):
@@ -171,7 +172,7 @@ class _Flight:
 
 @torch.no_grad()
 def run_lockstep(jobs: Sequence[dict], models: dict, mppi: Optional[dict] = None, n_sub: int = 2,
-                 chunk: int = 4096, verbose: bool = True) -> List[dict]:
+                 chunk: int = 4096, max_rows: int = 8192, verbose: bool = True) -> List[dict]:
     """
     Fly every job (same keys as jepa.mppi.run_episode: ic, domain, tag, case,
     seed, record, config_path, plus optional label and per-job mppi overrides)
@@ -179,7 +180,8 @@ def run_lockstep(jobs: Sequence[dict], models: dict, mppi: Optional[dict] = None
 
     models: load_checkpoint_v2(...) dict on any device. mppi: MPPIConfigV2
     fields. plan_ms per episode is the batched round time divided by the
-    number of episodes deciding in it (amortized).
+    number of episodes deciding in it (amortized). max_rows caps the samples
+    per batched rollout (memory: the latents alone are M x rows x K x D floats).
     """
     wm, pi, stats = models["wm"], models["pi"], models["stats"]
     dev = next(wm.parameters()).device
@@ -201,28 +203,30 @@ def run_lockstep(jobs: Sequence[dict], models: dict, mppi: Optional[dict] = None
             iters = [f.mppi.begin() for f in deciding]
             for it in range(max(iters)):
                 group = [i for i, f in enumerate(deciding) if it < iters[i]]
-                us = [deciding[i].mppi.propose() for i in group]
-                S = us[0].shape[0]
-                K = flights[0].mppi.cfg.horizon
-                if all(deciding[i].mppi.cfg.trim_horizon and deciding[i].mppi.u_nom is not None
-                       and deciding[i].mppi.k_rem < K for i in group):
-                    K = min(K, int(1.5 * max(deciding[i].mppi.k_rem for i in group)) + 12)
-                u = torch.cat(us)[:, :K]
-                s0 = s_ctx[:, group].repeat_interleave(S, 1)
-                y0 = torch.stack([deciding[i].y_hist[-1, :6] for i in group]).repeat_interleave(S, 0)
-                uh = torch.stack([deciding[i].u_hist for i in group]).repeat_interleave(S, 0)
-                with torch.autocast(dev.type, dtype=dt_amp, enabled=dt_amp is not None):
-                    out = ensemble_rollout(wm, pi, s0, y0.to(dev), uh.to(dev), u.to(dev), MACRO_DT_S, n_sub,
-                                           h_stop=float(deciding[0].env.drogue_alt_m), chunk=chunk)
-                y6 = out["y6"].cpu()
-                gl = (out["acc"].norm(dim=-1) / G0).cpu()
-                for j, i in enumerate(group):
-                    f = deciding[i]
-                    sl = slice(j * S, (j + 1) * S)
-                    cmd = f.mppi.update({"y6": y6[sl], "gload": gl[sl]}, us[j], f.u_hist[-1:],
-                                        final=it == iters[i] - 1)
-                    if cmd is not None:
-                        f.commit(cmd)
+                us = {i: deciding[i].mppi.propose() for i in group}
+                S = us[group[0]].shape[0]
+                per = max(1, max_rows // S)
+                for g0 in range(0, len(group), per):
+                    sub = group[g0:g0 + per]
+                    K = flights[0].mppi.cfg.horizon
+                    if all(deciding[i].mppi.cfg.trim_horizon and deciding[i].mppi.k_rem < K for i in sub):
+                        K = min(K, int(1.5 * max(deciding[i].mppi.k_rem for i in sub)) + 12)
+                    u = torch.cat([us[i] for i in sub])[:, :K]
+                    s0 = s_ctx[:, sub].repeat_interleave(S, 1)
+                    y0 = torch.stack([deciding[i].y_hist[-1, :6] for i in sub]).repeat_interleave(S, 0)
+                    uh = torch.stack([deciding[i].u_hist for i in sub]).repeat_interleave(S, 0)
+                    with torch.autocast(dev.type, dtype=dt_amp, enabled=dt_amp is not None):
+                        out = ensemble_rollout(wm, pi, s0, y0.to(dev), uh.to(dev), u.to(dev), MACRO_DT_S, n_sub,
+                                               h_stop=float(deciding[0].env.drogue_alt_m), chunk=chunk)
+                    y6 = out["y6"].cpu()
+                    gl = (out["acc"].norm(dim=-1) / G0).cpu()
+                    for j, i in enumerate(sub):
+                        f = deciding[i]
+                        sl = slice(j * S, (j + 1) * S)
+                        cmd = f.mppi.update({"y6": y6[sl], "gload": gl[sl]}, us[i], f.u_hist[-1:],
+                                            final=it == iters[i] - 1)
+                        if cmd is not None:
+                            f.commit(cmd)
             ms = 1000.0 * (time.perf_counter() - tr) / len(deciding)
             for f in deciding:
                 f.plan_ms.append(ms)
@@ -249,3 +253,68 @@ def run_lockstep_job(job: dict) -> List[dict]:
 def shard(jobs: Sequence[dict], n: int) -> List[List[dict]]:
     """Split jobs into n round-robin shards (similar flight lengths per shard)."""
     return [list(jobs[i::n]) for i in range(n) if jobs[i::n]]
+
+
+# ============================================================================
+# Persistent closed-loop results (survive a Colab disconnect)
+# ============================================================================
+def run_episode_keyed(job: dict) -> dict:
+    """jepa.mppi.run_episode, relabeled with job["label"] and tagged with job["key"] (pool worker)."""
+    from jepa.mppi import run_episode
+    r = run_episode(job)
+    r["controller"] = job.get("label", r["controller"])
+    r["key"] = job["key"]
+    return r
+
+
+def file_id(path: str) -> str:
+    """Short content hash of a checkpoint, so cached results are tied to the exact model."""
+    import hashlib
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()[:10]
+
+
+class ResultCache:
+    """
+    Closed-loop results keyed by (label, tag, case, model id), pickled to one
+    file after every put (atomic rename). Seed it from the v1 notebook's
+    classical cache, whose keys are (tag, case).
+    """
+
+    def __init__(self, path: str, seed_classical: Optional[str] = None):
+        import os
+        import pickle
+        import threading
+        self.path, self._lock = str(path), threading.Lock()
+        self.d: Dict[tuple, dict] = {}
+        if os.path.exists(self.path):
+            with open(self.path, "rb") as f:
+                self.d = pickle.load(f)
+        if seed_classical and os.path.exists(seed_classical):
+            with open(seed_classical, "rb") as f:
+                for (tag, case), r in pickle.load(f).items():
+                    self.d.setdefault(("classical", tag, case, "classical"), {**r, "controller": "classical"})
+
+    def __contains__(self, key) -> bool:
+        return key in self.d
+
+    def get(self, key):
+        return self.d.get(key)
+
+    def put(self, key, r: dict) -> None:
+        """Store one result and persist the cache."""
+        import os
+        import pickle
+        with self._lock:
+            self.d[key] = r
+            tmp = self.path + ".tmp"
+            with open(tmp, "wb") as f:
+                pickle.dump(self.d, f)
+            os.replace(tmp, self.path)
+
+    def put_result(self, r: dict) -> None:
+        """Pool callback for run_episode_keyed results."""
+        self.put(r["key"], r)
