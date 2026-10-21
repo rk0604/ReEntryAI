@@ -100,8 +100,8 @@ class StudyConfig:
                                                     n_iters_first=4, n_sub=2))
     horizon: Optional[int] = None                       # None = from the test set (plan 4.2)
     w_unc_km: float = 1.0
-    max_rows: int = 4096                                # samples per batched rollout (latents: M x rows x K x D floats)
-    v2_chunk: int = 2048                                # rows per predictor pass (activations ~ M x chunk x K x 768)
+    max_rows: int = 2048                                # samples per batched rollout (latents: M x rows x K x D floats)
+    v2_chunk: int = 512                                 # rows per predictor pass (activations ~ M x chunk x K x 768)
     # ---- analysis ----
     success_km: float = 5.0
     legacy_success_km: float = 25.0
@@ -257,16 +257,21 @@ def sha1(path, block: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+# Batching knobs that change speed and GPU memory, never results: free to differ between sessions.
+RUNTIME_KEYS = ("max_rows", "v2_chunk")
+
+
 def freeze_config(cfg: StudyConfig, layout: Layout, extra: Optional[dict] = None) -> dict:
     """
     Write 00_study/study_config.json on first use. Later sessions must use the
-    same settings: a difference raises (start a new study folder instead).
+    same settings (except RUNTIME_KEYS): a difference raises (start a new study folder instead).
     """
     path = layout.study / "study_config.json"
     want = json.loads(json.dumps(asdict(cfg), default=_json_default))
     if path.exists():
         have = json.loads(path.read_text())
-        diff = {k: (have["config"].get(k), v) for k, v in want.items() if have["config"].get(k) != v}
+        diff = {k: (have["config"].get(k), v) for k, v in want.items()
+                if k not in RUNTIME_KEYS and have["config"].get(k) != v}
         if diff:
             raise ValueError(f"settings differ from the frozen {path}: {diff}. Use a new study folder.")
         return have

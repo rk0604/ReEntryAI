@@ -303,10 +303,13 @@ with more cores, writing into the same Drive folder.
     ("md", SETUP_MD), ("code", SETUP),
     ("code", r"""
 JOBS = S.build_jobs(CFG, L)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")   # inherited by the GPU workers
 GPU_MEM_GB = torch.cuda.get_device_properties(0).total_memory / 1e9 if DEVICE == "cuda" else 0.0
 CPU_WORKERS = CPUS                         # classical: one simulator per core
-# learned: processes sharing the GPU, each stepping its own simulators on one core (~5 GB of GPU memory each)
-GPU_WORKERS = max(1, min(4, CPUS, int(GPU_MEM_GB // 5) if DEVICE == "cuda" else CPUS))
+# learned: processes sharing the GPU, each stepping its own simulators on one core. Budget 6 GB of GPU
+# memory per worker (measured peak of one rollout batch: <= 5 GB), keeping 2 GB spare: L4 -> 3, T4 -> 2.
+# If a worker still runs out of GPU memory, lower GPU_WORKERS and re-run: finished flights are kept.
+GPU_WORKERS = max(1, min(4, CPUS, int((GPU_MEM_GB - 2) // 6) if DEVICE == "cuda" else CPUS))
 RUN_CLASSICAL, RUN_LEARNED = True, True
 tab = pd.DataFrame([{"controller": j["controller"], "load": j["load"], "seed": j["seed"], "mppi_rep": j["mppi_rep"],
                      "done": S.flight_done(L, j)} for j in JOBS])

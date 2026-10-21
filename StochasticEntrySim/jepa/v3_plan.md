@@ -420,5 +420,10 @@ results to the same Drive folder.
     round-off. The decisions agree to about 1e-3° for the first several steps and then drift apart (up
     to tens of degrees by decision 20 with a smoke-trained model). So the plan's "< 0.5° over 20
     decisions" is applied to v1, and v2 is checked by the three deterministic tests above.
-* **GPU memory:** each lockstep worker batches ≤ 4,096 samples per rollout and 2,048 rows per predictor
-  pass, about 5 GB at the 188-step horizon. The fly notebook starts min(4, CPUs, GPU GB ÷ 5) workers.
+* **GPU memory:** the first L4 run ran out of memory. With 4,096 samples per rollout and 2,048 rows per
+  predictor pass, each worker needed 6.7 GB, against the 5 GB I had estimated, and 4 workers did not fit
+  in 22 GB. The fix:
+  * The defaults are now 2,048 samples per rollout and 512 rows per pass, whose measured peak is ≤ 5 GB.
+  * The notebook budgets 6 GB per worker with 2 GB spare (L4 → 3 workers, T4 → 2) and sets
+    `expandable_segments`.
+  * These batching knobs change speed and memory, never results, so the frozen-config check ignores them.
