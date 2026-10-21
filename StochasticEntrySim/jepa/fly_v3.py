@@ -302,13 +302,14 @@ class FlightV3(_Flight):
 @torch.no_grad()
 def run_lockstep_v3(jobs: Sequence[dict], adapter, mppi: Optional[dict] = None, n_sub: int = 2,
                     max_rows: int = 2048, on_done: Optional[Callable[[dict], None]] = None,
-                    verbose: bool = True) -> List[dict]:
+                    verbose: bool = True, progress: Optional[Callable[[dict], None]] = None) -> List[dict]:
     """
     Fly every job with MPPI on the adapter's model, all flights in lockstep
     (same loop and arithmetic as mppi_v2.run_lockstep). Job keys: ic, domain,
     controller/load/seed/mppi_rep/case/atmosphere labels, and job["mppi"]
     overrides (its "seed" is the flight's CRN noise seed). on_done(record)
-    is called as soon as each flight lands, so results persist mid-batch.
+    is called as soon as each flight lands, so results persist mid-batch;
+    progress(dict) is called every 5 decision rounds.
     Returns the records ({"result", "telemetry"}) in job order.
     """
     flights = [FlightV3(j, adapter.rf, MPPIConfigV2(**{**(mppi or {}), **j.get("mppi", {})})) for j in jobs]
@@ -349,6 +350,9 @@ def run_lockstep_v3(jobs: Sequence[dict], adapter, mppi: Optional[dict] = None, 
             for f in deciding:
                 f.plan_ms.append(ms)
             n_round += 1
+            if progress is not None and n_round % 5 == 0:
+                progress({"round": n_round, "flying": len(active), "total": len(flights),
+                          "sec": round(time.time() - t0, 1), "ms_per_decision": round(ms, 1)})
             if verbose and n_round % 25 == 0:
                 print(f"  [lockstep] round {n_round}: {len(active)}/{len(flights)} flying, "
                       f"{ms:.0f} ms/decision, {time.time() - t0:.0f}s", flush=True)

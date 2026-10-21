@@ -732,23 +732,56 @@ def run_classical(jobs: Sequence[dict], layout: Layout, workers: int = 1, log=pr
     return out
 
 
+PROGRESS_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "jepa_v3_progress"
+
+
 def _learned_worker(arg) -> int:
-    """Pool worker: fly one shard of a model run in lockstep; results are written by on_done."""
-    shard, kind, ckpt, members, device, mppi, max_rows, chunk, root, threads, verbose = arg
+    """
+    Pool worker: fly one shard of a model run in lockstep; results are written
+    by on_done. Every 5 decision rounds it writes its progress to a small local
+    file, which run_learned reads (worker stdout does not reach a notebook).
+    """
+    shard, kind, ckpt, members, device, mppi, max_rows, chunk, root, threads, verbose, prog = arg
     torch.set_num_threads(int(threads))
     adapter = F.load_adapter(kind, ckpt, device, members, chunk)
     layout = Layout(root)
+
+    def report(p):
+        if prog:
+            try:
+                atomic_bytes(prog, json.dumps(p).encode())
+            except OSError:
+                pass
+
     F.run_lockstep_v3(shard, adapter, mppi, n_sub=int(mppi.get("n_sub", 2)), max_rows=max_rows,
-                      on_done=lambda rec: write_flight(layout, rec), verbose=verbose)
+                      on_done=lambda rec: write_flight(layout, rec), verbose=verbose, progress=report)
     return len(shard)
 
 
+def _progress_line(files: Sequence[Path], n_shard_flights: int) -> str:
+    """One status line from the workers' progress files."""
+    ps = []
+    for f in files:
+        try:
+            ps.append(json.loads(f.read_text()))
+        except (OSError, json.JSONDecodeError):
+            pass
+    if not ps:
+        return "loading models and starting flights"
+    flying = sum(p["flying"] for p in ps) + max(0, len(files) - len(ps)) * (n_shard_flights // max(1, len(files)))
+    rnd = max(p["round"] for p in ps)
+    ms = sum(p["ms_per_decision"] for p in ps) / len(ps)
+    return (f"decision round {rnd} (~{rnd * 5} s of flight time simulated; flights last ~500-900 s), "
+            f"{flying} still flying, {ms:.0f} ms per decision")
+
+
 def run_learned(cfg: StudyConfig, jobs: Sequence[dict], layout: Layout, device: str = "cuda", workers: int = 1,
-                only: Optional[Sequence[tuple]] = None, log=print) -> None:
+                only: Optional[Sequence[tuple]] = None, log=print, report_every_s: float = 300.0) -> None:
     """
     Fly every pending learned job, one model run (controller, load, seed, rep)
     at a time in queue order, its flights in lockstep, split over `workers`
     processes that share the GPU (each steps its own envs on one CPU core).
+    With workers > 1, a status line is printed every report_every_s seconds.
     """
     gs = [(k, g) for k, g in groups(jobs) if only is None or k in only]
     ready = [(k, g) for k, g in gs if os.path.exists(model_ckpt(layout, k[0], k[2])[1])]
@@ -770,13 +803,25 @@ def run_learned(cfg: StudyConfig, jobs: Sequence[dict], layout: Layout, device: 
                 continue
             t0 = time.time()
             shards = [todo[i::max(1, workers)] for i in range(max(1, workers))]
-            args = [(s, kind, ckpt, members, device, dict(cfg.mppi), cfg.max_rows, cfg.v2_chunk, str(layout.root), 1,
-                     pool is None) for s in shards if s]
+            shards = [sh for sh in shards if sh]
+            PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+            progs = [PROGRESS_DIR / f"worker{i}.json" for i in range(len(shards))]
+            for f in progs:
+                f.unlink(missing_ok=True)
+            args = [(sh, kind, ckpt, members, device, dict(cfg.mppi), cfg.max_rows, cfg.v2_chunk, str(layout.root), 1,
+                     pool is None, str(pf) if pool is not None else None) for sh, pf in zip(shards, progs)]
             if pool is None:
                 for a in args:
                     _learned_worker(a)
             else:
-                pool.map(_learned_worker, args)
+                res = pool.map_async(_learned_worker, args)
+                while True:
+                    try:
+                        res.get(timeout=report_every_s)
+                        break
+                    except mp.TimeoutError:
+                        log(f"    ... {ctrl} {load} seed {seed} mppi {rep}: {(time.time() - t0) / 60:.0f} min, "
+                            f"{_progress_line(progs, len(todo))}")
             n_flown += len(todo)
             el = time.time() - t_all
             left = n_all - n_done0 - n_flown
