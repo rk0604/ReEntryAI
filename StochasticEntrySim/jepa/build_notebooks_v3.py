@@ -6,16 +6,26 @@ Build the four SpaceJEPA v3 study notebooks (jepa/v3_plan.md section 10):
     ReEntryAI_JEPA_v3_2_fly.ipynb       the flight queue: classical + learned            (GPU + CPUs)
     ReEntryAI_JEPA_v3_3_analyze.ipynb   open loop, statistics, figures, tables, report   (CPU, High-RAM)
 
-All logic lives in jepa/ (testset_v3, study_v3, fly_v3, analyze_v3); the
-notebooks configure, call, and show. Edit this builder, not the .ipynb files:
+and ReEntryAI_JEPA_v3_resultspdf.ipynb, which puts everything the four saved
+into one PDF (jepa/results_pdf_v3.py; CPU).
 
-    python jepa/build_notebooks_v3.py        (from StochasticEntrySim/)
+All logic lives in jepa/ (testset_v3, study_v3, fly_v3, analyze_v3, results_pdf_v3);
+the notebooks configure, call, and show. Edit this builder, not the .ipynb files:
+
+    python jepa/build_notebooks_v3.py              (from StochasticEntrySim/; writes all five)
+    python jepa/build_notebooks_v3.py resultspdf   (only the notebooks whose name contains an argument)
+
+Rebuilding a notebook replaces a copy saved from Colab with its outputs, so name
+the one you changed.
 
 Smoke mode (every stage, tiny, numbers meaningless): set JEPA_V3_MODE=smoke.
 Locally, JEPA_V3_ROOT sets the study folder and JEPA_WIDE_DATA the data.
 """
 import os
+import sys
 import nbformat as nbf
+
+ONLY = sys.argv[1:]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SIM = os.path.dirname(HERE)
@@ -122,16 +132,21 @@ print(f"MODE={MODE}  study folder={STUDY_ROOT}  device={DEVICE}  cpus={CPUS}  gi
 """ + AUTO_DISCONNECT_CODE
 
 
-def notebook(name, cells, gpu=True):
-    """Write a notebook; every one ends by releasing its Colab runtime. gpu=False opens on a High-RAM CPU runtime."""
+def notebook(name, cells, gpu=True, high_ram=True):
+    """
+    Write a notebook; every one ends by releasing its Colab runtime. gpu=False opens on a CPU runtime,
+    High-RAM unless high_ram=False. Skipped unless its name contains one of the command-line arguments (if any).
+    """
+    if ONLY and not any(o in name for o in ONLY):
+        return
     cells = list(cells) + [("md", DONE_MD), ("code", DONE)]
     nb = nbf.v4.new_notebook()
     nb["cells"] = [nbf.v4.new_markdown_cell(t.strip("\n")) if k == "md" else nbf.v4.new_code_cell(t.strip("\n"))
                    for k, t in cells]
+    cpu = {"colab": {"machine_shape": "hm", "provenance": []}} if high_ram else {"colab": {"provenance": []}}
     nb["metadata"] = {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
                       "language_info": {"name": "python"},
-                      **({"accelerator": "GPU", "colab": {"gpuType": "L4", "provenance": []}} if gpu else
-                         {"colab": {"machine_shape": "hm", "provenance": []}})}
+                      **({"accelerator": "GPU", "colab": {"gpuType": "L4", "provenance": []}} if gpu else cpu)}
     path = os.path.join(SIM, name)
     nbf.write(nb, path)
     print(f"wrote {path} ({len(cells)} cells)")
@@ -475,5 +490,89 @@ if R:
     print("report:", pdf)
 S.update_manifest(L)
 print(open(L.study / "README.md").read())
+"""),
+])
+
+# ============================================================================
+# Everything in one PDF
+# ============================================================================
+RESULTS_SETUP = r"""
+import os, sys
+IN_COLAB = "google.colab" in sys.modules
+BRANCH = "jepa-v3"
+MODE = os.environ.get("JEPA_V3_MODE", "full")     # "full": the study | "smoke": the smoke-mode study folder
+if IN_COLAB:
+    REPO = "/content/ReEntryAI"
+    if not os.path.exists(REPO):
+        !git clone -q -b {BRANCH} https://github.com/rk0604/ReEntryAI.git {REPO}
+    else:
+        !git -C {REPO} pull -q
+    %pip install -q pymsis reportlab
+    os.chdir(f"{REPO}/StochasticEntrySim")
+    from google.colab import drive
+    drive.mount("/content/drive")
+    STUDY_ROOT = "/content/drive/MyDrive/ReEntryAI_jepa_v3" + ("" if MODE == "full" else f"_{MODE}")
+else:
+    STUDY_ROOT = os.environ.get("JEPA_V3_ROOT", f"jepa_runs/v3_{MODE}")
+
+from pathlib import Path
+SIM_DIR = Path.cwd()
+assert (SIM_DIR / "rl_env.py").exists(), "start Jupyter in StochasticEntrySim/"
+sys.path.insert(0, str(SIM_DIR))
+from jepa import study_v3 as S, results_pdf_v3 as RP
+L = S.Layout(STUDY_ROOT)
+assert L.root.exists(), f"no study folder at {STUDY_ROOT}: run the v3 notebooks first (or check MODE)"
+print(f"MODE={MODE}  study folder={STUDY_ROOT}")
+""" + AUTO_DISCONNECT_CODE
+
+notebook("ReEntryAI_JEPA_v3_resultspdf.ipynb", gpu=False, high_ram=False, cells=[
+    ("md", f"""
+# SpaceJEPA v3 · All results in one PDF
+
+{BADGE.format(name="ReEntryAI_JEPA_v3_resultspdf.ipynb")}
+
+**Runtime: standard CPU** (it opens that way; nothing here needs a GPU or High-RAM). It takes about
+5–10 min, most of it reading from Drive, and releases the runtime by itself when it finishes or a
+cell fails (set `AUTO_DISCONNECT = False` in the setup cell to keep it).
+
+It reads what the four v3 notebooks saved in **`MyDrive/ReEntryAI_jepa_v3/`** and writes one PDF,
+**`06_report/SpaceJEPA_v3_full_results.pdf`**, with:
+
+| Section | From | What |
+|---|---|---|
+| 0. What is in the study folder | all | files and MB per stage, what is finished |
+| 1. Settings | `00_study/` | every frozen setting, git commit, environment |
+| 2. Test set | notebook 0 | the 64 cases, feasibility per atmosphere, entry ranges, F01, F02 |
+| 3. Training | notebook 1 | per model and seed: checkpoint notes, final losses, latent health, training curves |
+| 4. Flights | notebook 2 | flights per arm, how they ended, first look per atmosphere, timing |
+| 5. Closed loop | notebook 3 | criteria C1–C7 + Bridge (T05), T01–T08, F10–F21 |
+| 6. Open loop | notebook 3 | F30, F31, T09, T10, along-track bias |
+| Appendix | all | the long tables (full T01, T01b, T11, the test set), anything not shown above, every caption, a folder index |
+
+Nothing is recomputed: every number, table and figure is read from the files, with captions and
+data sources from `05_analysis/captions.json`. With a partly finished study it shows what exists
+and names what is missing. It is a separate file from notebook 3's shorter
+`SpaceJEPA_v3_report.pdf`.
+"""),
+    ("md", """
+## 0. Setup
+
+On Colab this clones the `jepa-v3` branch, installs `pymsis` and `reportlab`, and mounts Google Drive.
+"""),
+    ("code", RESULTS_SETUP),
+    ("md", "## 1. Build the PDF"),
+    ("code", r"""
+PDF = RP.build(STUDY_ROOT)
+"""),
+    ("md", r"""
+## 2. Refresh the folder index
+
+Rebuilds `00_study/manifest.csv` and `README.md` so they list the new PDF and everything notebook 3
+wrote.
+"""),
+    ("code", r"""
+S.update_manifest(L)
+print(open(L.study / "README.md").read())
+print("PDF:", PDF)
 """),
 ])

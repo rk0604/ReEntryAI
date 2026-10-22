@@ -46,11 +46,20 @@ RULE = colors.HexColor("#d9d8d3")
 TEXT_W = 7.0 * inch
 
 
+def _font_dir() -> str:
+    """The system DejaVu fonts, else the copies matplotlib ships (Colab and Windows have no system DejaVu)."""
+    if os.path.exists(os.path.join(FONT_DIR, "DejaVuSans.ttf")):
+        return FONT_DIR
+    import matplotlib
+    return os.path.join(matplotlib.get_data_path(), "fonts", "ttf")
+
+
 def _fonts():
     """DejaVu Sans covers Greek and math symbols (the built-in PDF fonts do not)."""
-    pdfmetrics.registerFont(TTFont("DV", os.path.join(FONT_DIR, "DejaVuSans.ttf")))
-    pdfmetrics.registerFont(TTFont("DVB", os.path.join(FONT_DIR, "DejaVuSans-Bold.ttf")))
-    pdfmetrics.registerFont(TTFont("DVM", os.path.join(FONT_DIR, "DejaVuSansMono.ttf")))
+    fd = _font_dir()
+    pdfmetrics.registerFont(TTFont("DV", os.path.join(fd, "DejaVuSans.ttf")))
+    pdfmetrics.registerFont(TTFont("DVB", os.path.join(fd, "DejaVuSans-Bold.ttf")))
+    pdfmetrics.registerFont(TTFont("DVM", os.path.join(fd, "DejaVuSansMono.ttf")))
     from reportlab.pdfbase.pdfmetrics import registerFontFamily
     registerFontFamily("DV", normal="DV", bold="DVB", italic="DV", boldItalic="DVB")
 

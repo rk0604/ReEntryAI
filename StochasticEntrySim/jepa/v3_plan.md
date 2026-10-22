@@ -331,6 +331,7 @@ so a disconnect never leaves a half-written file.
 | `v3_1_train` | GPU | train v2 and v1 for seeds 0–4 (resumable, one seed at a time) | ~4.5 h | ~8.5 h |
 | `v3_2_fly` | GPU + CPUs | the job queue: classical (CPU pool), v1/v2 lockstep (GPU), telemetry | ~4–8 h* | ~7–9 h* |
 | `v3_3_analyze` | GPU optional | open-loop per seed, statistics, figures, tables, the PDF report | ~30 min | ~45 min |
+| `v3_resultspdf` | CPU | everything the four notebooks saved, in one PDF (`06_report/SpaceJEPA_v3_full_results.pdf`, `jepa/results_pdf_v3.py`); reads only, recomputes nothing | ~5–10 min | ~5–10 min |
 
 \*The flight stage is limited by CPU cores, not the GPU:
 * classical: ~6.4 CPU-hours (+6.4 h if the optional oracle runs);
