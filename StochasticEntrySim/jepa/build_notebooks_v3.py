@@ -4,7 +4,7 @@ Build the four SpaceJEPA v3 study notebooks (jepa/v3_plan.md section 10):
     ReEntryAI_JEPA_v3_0_testset.ipynb   freeze the 64 cases to Drive, coverage figures  (any runtime)
     ReEntryAI_JEPA_v3_1_train.ipynb     v2 and v1 for seeds 0-4, resumable             (GPU)
     ReEntryAI_JEPA_v3_2_fly.ipynb       the flight queue: classical + learned            (GPU + CPUs)
-    ReEntryAI_JEPA_v3_3_analyze.ipynb   open loop, statistics, figures, tables, report   (GPU optional)
+    ReEntryAI_JEPA_v3_3_analyze.ipynb   open loop, statistics, figures, tables, report   (CPU, High-RAM)
 
 All logic lives in jepa/ (testset_v3, study_v3, fly_v3, analyze_v3); the
 notebooks configure, call, and show. Edit this builder, not the .ipynb files:
@@ -31,6 +31,50 @@ goes to **`MyDrive/ReEntryAI_jepa_v3/`** (`ReEntryAI_jepa_v3_smoke/` in smoke mo
 `jepa/v3_plan.md` §9 and in the auto-written `00_study/README.md`. The 6,000 flights are read from
 `MyDrive/ReEntryAI_jepa_data/wide_6000/`. Every stage is resumable: after a disconnect, run all
 cells again and finished work is skipped.
+"""
+
+# Release the Colab runtime when the notebook finishes or a cell fails, so it never idles on paid compute
+# (repo rule, see CLAUDE.md). Locally (not Colab) it only prints what it would do.
+AUTO_DISCONNECT_CODE = r"""
+# ---- Auto-disconnect: stop paying for the runtime once the work is done or a cell fails ----
+AUTO_DISCONNECT = IN_COLAB      # set to False to keep the runtime (e.g. to explore results by hand)
+
+def release_runtime(reason):
+    # Flush Drive, then release the Colab runtime so it stops using compute units.
+    if not (IN_COLAB and AUTO_DISCONNECT):
+        print(f"[auto-disconnect off] {reason}")
+        return
+    print(f"[auto-disconnect] {reason}. Flushing Drive and releasing the runtime; outputs stay visible.", flush=True)
+    try:
+        drive.flush_and_unmount()
+    except Exception as e:
+        print("  Drive flush:", e)
+    from google.colab import runtime
+    runtime.unassign()
+
+def _release_on_error(result):
+    err = result.error_in_exec or result.error_before_exec
+    if err is not None and not isinstance(err, KeyboardInterrupt):     # pressing stop is not a failure
+        release_runtime(f"a cell failed ({type(err).__name__}: {str(err)[:200]})")
+
+_ip = get_ipython()
+for _cb in list(_ip.events.callbacks["post_run_cell"]):
+    if getattr(_cb, "__name__", "") == "_release_on_error":
+        _ip.events.unregister("post_run_cell", _cb)
+_ip.events.register("post_run_cell", _release_on_error)
+print("auto-disconnect on: the runtime is released when the last cell finishes or a cell fails" if AUTO_DISCONNECT
+      else "auto-disconnect off (not on Colab, or switched off): the runtime stays up until you disconnect it")
+"""
+
+DONE_MD = r"""
+## Done: release the runtime
+
+Everything this notebook made is already on Drive. This cell flushes Drive and releases the Colab
+runtime, so it stops using compute units (a failed cell does the same). To keep the runtime, set
+`AUTO_DISCONNECT = False` in the setup cell before running.
+"""
+DONE = r"""
+release_runtime("all cells finished")
 """
 
 SETUP = r"""
@@ -75,16 +119,19 @@ FROZEN = S.freeze_config(CFG, L)
 CPUS = os.cpu_count() or 2
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"MODE={MODE}  study folder={STUDY_ROOT}  device={DEVICE}  cpus={CPUS}  git={FROZEN['git_commit'][:10]}")
-"""
+""" + AUTO_DISCONNECT_CODE
 
 
-def notebook(name, cells):
+def notebook(name, cells, gpu=True):
+    """Write a notebook; every one ends by releasing its Colab runtime. gpu=False opens on a High-RAM CPU runtime."""
+    cells = list(cells) + [("md", DONE_MD), ("code", DONE)]
     nb = nbf.v4.new_notebook()
     nb["cells"] = [nbf.v4.new_markdown_cell(t.strip("\n")) if k == "md" else nbf.v4.new_code_cell(t.strip("\n"))
                    for k, t in cells]
     nb["metadata"] = {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
-                      "language_info": {"name": "python"}, "accelerator": "GPU",
-                      "colab": {"gpuType": "L4", "provenance": []}}
+                      "language_info": {"name": "python"},
+                      **({"accelerator": "GPU", "colab": {"gpuType": "L4", "provenance": []}} if gpu else
+                         {"colab": {"machine_shape": "hm", "provenance": []}})}
     path = os.path.join(SIM, name)
     nbf.write(nb, path)
     print(f"wrote {path} ({len(cells)} cells)")
@@ -93,7 +140,7 @@ def notebook(name, cells):
 # ============================================================================
 # 0. Test set
 # ============================================================================
-notebook("ReEntryAI_JEPA_v3_0_testset.ipynb", [
+notebook("ReEntryAI_JEPA_v3_0_testset.ipynb", gpu=False, cells=[
     ("md", f"""
 # SpaceJEPA v3 · 0. The test set
 
@@ -357,11 +404,14 @@ S.update_manifest(L);
 # ============================================================================
 # 3. Analysis
 # ============================================================================
-notebook("ReEntryAI_JEPA_v3_3_analyze.ipynb", [
+notebook("ReEntryAI_JEPA_v3_3_analyze.ipynb", gpu=False, cells=[
     ("md", f"""
 # SpaceJEPA v3 · 3. Analysis and report
 
 {BADGE.format(name="ReEntryAI_JEPA_v3_3_analyze.ipynb")}
+
+**Runtime: CPU with High-RAM** (it opens that way; nothing here uses a GPU, so a GPU only costs credits).
+It takes roughly 30–60 min and releases the runtime by itself when it finishes.
 
 Reads the flights and checkpoints from Drive and writes:
 * `03_open_loop/`: footprint error, along-track bias, and ensemble spread per model and seed, on the
