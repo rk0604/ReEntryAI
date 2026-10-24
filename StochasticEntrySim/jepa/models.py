@@ -252,23 +252,34 @@ class PIProber(nn.Module):
     physics model with instantaneous bank: the "physics prior only" ablation.
     """
 
-    def __init__(self, d_latent: int, hidden: int = 64):
-        """Zero-init the output layer."""
+    def __init__(self, d_latent: int, hidden: int = 64, state_aware: bool = False):
+        """
+        Zero-init the output layer. state_aware=True (v4 ablation B2): the MLP also sees the
+        rollout's own altitude and speed, normalized as in v2's prober (models_v2.H_NORM, V_NORM).
+        """
         super().__init__()
         self.hparams = dict(d_latent=d_latent, hidden=hidden)
-        self.net = _mlp(d_latent, hidden, 3)
+        self.state_aware = bool(state_aware)
+        if self.state_aware:
+            from jepa.models_v2 import H_NORM, V_NORM
+            self.hparams["state_aware"] = True
+            self._hv_norm = (H_NORM, V_NORM)
+        self.net = _mlp(d_latent + (2 if self.state_aware else 0), hidden, 3)
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
-    def corrections(self, s: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-        """Latent [..., D] and command [...] -> (c_D, c_L, sigma_eff)."""
+    def corrections(self, s: torch.Tensor, u: torch.Tensor, y6: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Latent [..., D] and command [...] (+ state [..., 6] if state-aware) -> (c_D, c_L, sigma_eff)."""
+        if self.state_aware:
+            (h0, hs), (v0, vs) = self._hv_norm
+            s = torch.cat([s, ((y6[..., 0] - h0) / hs)[..., None], ((y6[..., 3] - v0) / vs)[..., None]], -1)
         o = self.net(s)
         return torch.stack([o[..., 0].clamp(-5.0, 5.0), o[..., 1].clamp(-3.0, 3.0),
                             u + SIGMA_MAX_RAD * torch.tanh(o[..., 2])], -1)
 
     def step(self, s: torch.Tensor, y6: torch.Tensor, u: torch.Tensor, dt: float, n_sub: int):
         """Advance the physical state one macro step. Returns (y6_next, mean forces)."""
-        return integrate_eom(y6, self.corrections(s, u), dt, n_sub)
+        return integrate_eom(y6, self.corrections(s, u, y6), dt, n_sub)
 
 
 class MLPProber(nn.Module):

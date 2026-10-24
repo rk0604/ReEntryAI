@@ -152,10 +152,44 @@ def notebook(name, cells, gpu=True, high_ram=True):
     print(f"wrote {path} ({len(cells)} cells)")
 
 
-# ============================================================================
-# 0. Test set
-# ============================================================================
-notebook("ReEntryAI_JEPA_v3_0_testset.ipynb", gpu=False, cells=[
+# Setup code of the results-PDF notebook (defined before the guard below; it only joins strings).
+RESULTS_SETUP = r"""
+import os, sys
+IN_COLAB = "google.colab" in sys.modules
+BRANCH = "jepa-v3"
+MODE = os.environ.get("JEPA_V3_MODE", "full")     # "full": the study | "smoke": the smoke-mode study folder
+if IN_COLAB:
+    REPO = "/content/ReEntryAI"
+    if not os.path.exists(REPO):
+        !git clone -q -b {BRANCH} https://github.com/rk0604/ReEntryAI.git {REPO}
+    else:
+        !git -C {REPO} pull -q
+    %pip install -q pymsis reportlab
+    os.chdir(f"{REPO}/StochasticEntrySim")
+    from google.colab import drive
+    drive.mount("/content/drive")
+    STUDY_ROOT = "/content/drive/MyDrive/ReEntryAI_jepa_v3" + ("" if MODE == "full" else f"_{MODE}")
+else:
+    STUDY_ROOT = os.environ.get("JEPA_V3_ROOT", f"jepa_runs/v3_{MODE}")
+
+from pathlib import Path
+SIM_DIR = Path.cwd()
+assert (SIM_DIR / "rl_env.py").exists(), "start Jupyter in StochasticEntrySim/"
+sys.path.insert(0, str(SIM_DIR))
+from jepa import study_v3 as S, results_pdf_v3 as RP
+L = S.Layout(STUDY_ROOT)
+assert L.root.exists(), f"no study folder at {STUDY_ROOT}: run the v3 notebooks first (or check MODE)"
+print(f"MODE={MODE}  study folder={STUDY_ROOT}")
+""" + AUTO_DISCONNECT_CODE
+
+
+# The notebooks are written only when this file is run, not when it is imported (build_notebook_v4
+# imports AUTO_DISCONNECT_CODE, DONE_MD and DONE from here).
+if __name__ == "__main__":
+    # ============================================================================
+    # 0. Test set
+    # ============================================================================
+    notebook("ReEntryAI_JEPA_v3_0_testset.ipynb", gpu=False, cells=[
     ("md", f"""
 # SpaceJEPA v3 · 0. The test set
 
@@ -238,10 +272,10 @@ print("saved to", L.testset)
 """),
 ])
 
-# ============================================================================
-# 1. Training
-# ============================================================================
-notebook("ReEntryAI_JEPA_v3_1_train.ipynb", [
+    # ============================================================================
+    # 1. Training
+    # ============================================================================
+    notebook("ReEntryAI_JEPA_v3_1_train.ipynb", [
     ("md", f"""
 # SpaceJEPA v3 · 1. Train v2 and v1, five seeds each
 
@@ -331,10 +365,10 @@ for kind in ("v2", "v1"):
 """),
 ])
 
-# ============================================================================
-# 2. Flights
-# ============================================================================
-notebook("ReEntryAI_JEPA_v3_2_fly.ipynb", [
+    # ============================================================================
+    # 2. Flights
+    # ============================================================================
+    notebook("ReEntryAI_JEPA_v3_2_fly.ipynb", [
     ("md", f"""
 # SpaceJEPA v3 · 2. Fly the study
 
@@ -416,10 +450,10 @@ S.update_manifest(L);
 """),
 ])
 
-# ============================================================================
-# 3. Analysis
-# ============================================================================
-notebook("ReEntryAI_JEPA_v3_3_analyze.ipynb", gpu=False, cells=[
+    # ============================================================================
+    # 3. Analysis
+    # ============================================================================
+    notebook("ReEntryAI_JEPA_v3_3_analyze.ipynb", gpu=False, cells=[
     ("md", f"""
 # SpaceJEPA v3 · 3. Analysis and report
 
@@ -493,39 +527,10 @@ print(open(L.study / "README.md").read())
 """),
 ])
 
-# ============================================================================
-# Everything in one PDF
-# ============================================================================
-RESULTS_SETUP = r"""
-import os, sys
-IN_COLAB = "google.colab" in sys.modules
-BRANCH = "jepa-v3"
-MODE = os.environ.get("JEPA_V3_MODE", "full")     # "full": the study | "smoke": the smoke-mode study folder
-if IN_COLAB:
-    REPO = "/content/ReEntryAI"
-    if not os.path.exists(REPO):
-        !git clone -q -b {BRANCH} https://github.com/rk0604/ReEntryAI.git {REPO}
-    else:
-        !git -C {REPO} pull -q
-    %pip install -q pymsis reportlab
-    os.chdir(f"{REPO}/StochasticEntrySim")
-    from google.colab import drive
-    drive.mount("/content/drive")
-    STUDY_ROOT = "/content/drive/MyDrive/ReEntryAI_jepa_v3" + ("" if MODE == "full" else f"_{MODE}")
-else:
-    STUDY_ROOT = os.environ.get("JEPA_V3_ROOT", f"jepa_runs/v3_{MODE}")
-
-from pathlib import Path
-SIM_DIR = Path.cwd()
-assert (SIM_DIR / "rl_env.py").exists(), "start Jupyter in StochasticEntrySim/"
-sys.path.insert(0, str(SIM_DIR))
-from jepa import study_v3 as S, results_pdf_v3 as RP
-L = S.Layout(STUDY_ROOT)
-assert L.root.exists(), f"no study folder at {STUDY_ROOT}: run the v3 notebooks first (or check MODE)"
-print(f"MODE={MODE}  study folder={STUDY_ROOT}")
-""" + AUTO_DISCONNECT_CODE
-
-notebook("ReEntryAI_JEPA_v3_resultspdf.ipynb", gpu=False, high_ram=False, cells=[
+    # ============================================================================
+    # Everything in one PDF
+    # ============================================================================
+    notebook("ReEntryAI_JEPA_v3_resultspdf.ipynb", gpu=False, high_ram=False, cells=[
     ("md", f"""
 # SpaceJEPA v3 · All results in one PDF
 

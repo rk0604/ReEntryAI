@@ -248,8 +248,16 @@ def _full(x: torch.Tensor) -> torch.Tensor:
     return x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
 
 
-def action_features(u: torch.Tensor) -> torch.Tensor:
-    """Bank commands (rad) [..., L] -> [..., L, 3]: scaled command and its sine/cosine."""
+ACTION_DIMS = {"v2": 3, "v1": 1}
+
+
+def action_features(u: torch.Tensor, mode: str = "v2") -> torch.Tensor:
+    """
+    Bank commands (rad) [..., L] -> [..., L, 3]: scaled command and its sine/cosine.
+    mode="v1" (v4 ablation A8): [..., L, 1], the scaled command only, as v1's action encoder sees it.
+    """
+    if mode == "v1":
+        return (u / SIGMA_MAX_RAD)[..., None]
     return torch.stack([u / SIGMA_MAX_RAD, torch.sin(u), torch.cos(u)], -1)
 
 
@@ -262,25 +270,39 @@ class WorldModelV2(nn.Module):
     def __init__(self, n_members: int = 5, n_feat: int = N_FEAT_V2, d_latent: int = 64,
                  enc_dim: int = 128, enc_layers: int = 3, enc_heads: int = 4, enc_band: int = 9,
                  pred_dim: int = 192, pred_layers: int = 4, pred_heads: int = 6, act_chunk: int = 4,
-                 mlp_ratio: int = 4, dropout: float = 0.0):
-        """Defaults: rf = 1 + 3 * 8 = 25 macro steps (120 s), ~2.4M parameters per member."""
+                 mlp_ratio: int = 4, dropout: float = 0.0, feat_mask: Optional[Sequence[int]] = None,
+                 action_mode: str = "v2"):
+        """
+        Defaults: rf = 1 + 3 * 8 = 25 macro steps (120 s), ~2.4M parameters per member.
+        v4 ablations (defaults reproduce v3): feat_mask = indices into the n_feat input features
+        the encoder sees (A1, A1b); action_mode = "v1" tokenizes only u / sigma_max (A8).
+        """
         super().__init__()
         self.hparams = dict(n_members=n_members, n_feat=n_feat, d_latent=d_latent, enc_dim=enc_dim,
                             enc_layers=enc_layers, enc_heads=enc_heads, enc_band=enc_band,
                             pred_dim=pred_dim, pred_layers=pred_layers, pred_heads=pred_heads,
                             act_chunk=act_chunk, mlp_ratio=mlp_ratio, dropout=dropout)
+        # The v4 options are recorded only when used, so v3 checkpoints keep their exact hparams.
+        if feat_mask is not None:
+            self.hparams["feat_mask"] = tuple(int(i) for i in feat_mask)
+        if action_mode != "v2":
+            self.hparams["action_mode"] = action_mode
         M = n_members
         self.M, self.d_latent, self.enc_band, self.c = M, d_latent, enc_band, act_chunk
+        self.feat_mask = None if feat_mask is None else [int(i) for i in feat_mask]
+        self.action_mode = action_mode
         self.rf = 1 + enc_layers * (enc_band - 1)
         assert act_chunk <= self.rf
         self.grad_ckpt = False
-        self.enc_in = ELinear(M, n_feat, enc_dim, std=n_feat ** -0.5)
+        n_in = n_feat if feat_mask is None else len(self.feat_mask)
+        self.enc_in = ELinear(M, n_in, enc_dim, std=n_in ** -0.5)
         self.enc_blocks = nn.ModuleList(EBlock(M, enc_dim, enc_heads, mlp_ratio, enc_layers, dropout)
                                         for _ in range(enc_layers))
         self.enc_norm = ELayerNorm(M, enc_dim)
         self.enc_out = ELinear(M, enc_dim, d_latent, std=enc_dim ** -0.5)
         self.ctx_in = ELinear(M, d_latent, pred_dim, std=d_latent ** -0.5)
-        self.act_in = ELinear(M, 3 * act_chunk, pred_dim, std=(3 * act_chunk) ** -0.5)
+        n_act = ACTION_DIMS[action_mode] * act_chunk
+        self.act_in = ELinear(M, n_act, pred_dim, std=n_act ** -0.5)
         self.pred_blocks = nn.ModuleList(EBlock(M, pred_dim, pred_heads, mlp_ratio, pred_layers, dropout)
                                          for _ in range(pred_layers))
         self.pred_norm = ELayerNorm(M, pred_dim)
@@ -295,6 +317,8 @@ class WorldModelV2(nn.Module):
 
     def encode_states(self, feats: torch.Tensor) -> torch.Tensor:
         """Normalized features [M or -, B, L, F] -> latents [M, B, L - rf + 1, D]."""
+        if self.feat_mask is not None:
+            feats = feats[..., self.feat_mask]
         x = self.enc_in(self._members(feats, 4))
         x = _run_blocks(self.enc_blocks, x, self.grad_ckpt,
                         mask=band_mask(x.shape[2], self.enc_band, x.device))
@@ -309,7 +333,7 @@ class WorldModelV2(nn.Module):
         is one token per planned step (the same alignment as v1's encode_actions).
         """
         u = self._members(u, 3)
-        a = action_features(u).unfold(2, self.c, 1)           # [M, B, L-c+1, 3, c]
+        a = action_features(u, self.action_mode).unfold(2, self.c, 1)   # [M, B, L-c+1, 3, c]
         a = a.transpose(-1, -2).flatten(-2)                   # [M, B, L-c+1, 3c]
         return self.act_in(a[:, :, self.rf - self.c:])
 
@@ -396,6 +420,23 @@ def per_step_sigreg(sig: SIGRegV2, x: torch.Tensor, mask: torch.Tensor, steps: t
     ok = (n >= min_rows).float()
     stat, ok = stat.view(M, -1), ok.view(M, -1)
     return (stat * ok).sum(1) / ok.sum(1).clamp_min(1.0)
+
+
+def pooled_sigreg(sig: SIGRegV2, S: torch.Tensor, m_S: torch.Tensor, pred: torch.Tensor, m_pred: torch.Tensor,
+                  rows: int = 1024) -> torch.Tensor:
+    """
+    v1's SIGReg (models.jepa_loss), per member: one statistic on `rows` latents
+    drawn without replacement from the encoded and predicted latents pooled over
+    every rollout step (valid rows only). S [M, B, T+1, D], pred [M, B, T, D],
+    masks [M, B, T+1] / [M, B, T]. Returns [M].
+    """
+    M, D = S.shape[0], S.shape[-1]
+    x = torch.cat([pred.reshape(M, -1, D), S.reshape(M, -1, D)], 1).float()
+    w = torch.cat([m_pred.reshape(M, -1), m_S.reshape(M, -1)], 1).float()
+    n = int(min(rows, float(w.sum(1).min())))
+    idx = torch.multinomial(w, max(1, n), replacement=False)                 # uniform over the valid rows
+    stat, _ = sig(torch.gather(x, 1, idx[..., None].expand(-1, -1, D)))
+    return stat
 
 
 # ============================================================================
@@ -530,7 +571,8 @@ class WindowsV2:
 # Losses
 # ============================================================================
 def wm_loss_v2(wm: WorldModelV2, sig: SIGRegV2, b: Dict[str, torch.Tensor],
-               lam: Union[float, torch.Tensor], sig_steps: int = 16, sig_min_rows: int = 32):
+               lam: Union[float, torch.Tensor], sig_steps: int = 16, sig_min_rows: int = 32,
+               sigreg_mode: str = "per_step", sig_pool_rows: int = 1024):
     """
     Masked multi-step latent prediction + per-step SIGReg, for all members.
 
@@ -539,6 +581,8 @@ def wm_loss_v2(wm: WorldModelV2, sig: SIGRegV2, b: Dict[str, torch.Tensor],
     SIGReg is evaluated at sig_steps random rollout steps per iteration
     (an unbiased estimate of the mean over all steps; all of them is ~T/16 x
     the memory), on the encoded targets and on the predictions.
+    sigreg_mode="pooled" (v4 ablation A5) uses v1's regularizer instead:
+    pooled_sigreg on sig_pool_rows latents pooled over time.
     """
     S = wm.encode_states(b["feats"])                           # [M, B, T+1, D]
     pred = wm.predict(S[:, :, 0], wm.action_tokens(b["u"]))    # [M, B, T, D]
@@ -547,12 +591,15 @@ def wm_loss_v2(wm: WorldModelV2, sig: SIGRegV2, b: Dict[str, torch.Tensor],
     err = (pred.float() - S[:, :, 1:].float()).pow(2).mean(-1)
     l_pred = (err * m).sum((1, 2)) / m.sum((1, 2)).clamp_min(1.0)        # [M]
     dev = m.device
-    k = torch.randperm(T, device=dev)[:max(1, sig_steps - 1)] + 1             # rollout steps 1..T
-    k_tgt = torch.cat([torch.zeros(1, dtype=torch.long, device=dev), k])     # + the context latent
-    k_pred = k - 1                                                           # pred[:, :, j] is step j+1
     m_tgt = torch.cat([torch.ones_like(m[:, :, :1]), m], 2)
-    l_sig = (per_step_sigreg(sig, S, m_tgt, k_tgt, sig_min_rows)
-             + per_step_sigreg(sig, pred, m, k_pred, sig_min_rows))         # [M]
+    if sigreg_mode == "pooled":
+        l_sig = pooled_sigreg(sig, S, m_tgt, pred, m, sig_pool_rows)         # [M]
+    else:
+        k = torch.randperm(T, device=dev)[:max(1, sig_steps - 1)] + 1         # rollout steps 1..T
+        k_tgt = torch.cat([torch.zeros(1, dtype=torch.long, device=dev), k])  # + the context latent
+        k_pred = k - 1                                                        # pred[:, :, j] is step j+1
+        l_sig = (per_step_sigreg(sig, S, m_tgt, k_tgt, sig_min_rows)
+                 + per_step_sigreg(sig, pred, m, k_pred, sig_min_rows))      # [M]
     lam_t = torch.as_tensor(lam, dtype=torch.float32, device=dev)
     loss = (l_pred + lam_t * l_sig).sum()
     return loss, {"pred": float(l_pred.mean().detach()), "sigreg": float(l_sig.mean().detach()),

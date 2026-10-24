@@ -576,7 +576,176 @@ v2, 2 seeds, 2 cases, a few flights), then run v4 on top of it in smoke mode. Ch
 
 ## 14. Implementation notes
 
-(Filled in by the implementing session.)
+Implemented on `space-jepa4` (2026-10-23). Code: `jepa/{study,fly,physics,ablate,analyze,report,smoke}_v4.py`,
+`jepa/build_notebook_v4.py` → `ReEntryAI_JEPA_v4.ipynb`. Every choice the plan left open, and one finding:
+
+**Finding: the classical oracle does not get the true L/D.** `fly_v3.fly_classical(classical_knows_truth=True)`
+applies the domain to the guidance's params, but the predictor's long rollout
+(`math_3d.rollout_nominal_to_terminal`) copies the params and resets `cpas_lift_scale` to 1.0 (to keep
+parachute terms out of entry predictions). So `classical_oracle` predicts with the true density (through
+`ref_area_m2`) and mass but the **nominal L/D**, not "density, L/D and mass" as §4.1 says. The simulator is
+not changed (§0.4), so the arm is flown as is: P4 measures what knowing density and mass gives the classical
+controller, a lower bound on what full knowledge would give it. `mppi_truth` does use the true L/D (its own
+model, §4.1.1), so P3 is unaffected. Decided with the user (2026-10-24): keep the simulator unchanged and
+label the arm "classical, knows density & mass" in the tables, figures, criteria and notebook.
+
+**Physics model (§4.1.1, `physics_v4.py`)**
+* Same equations and parameters as the guidance's predictor: a float64 torch port of
+  `math_3d.nominal_eom_step` and `nominal_aero_forces_from_state`, including the simulator's fast
+  atmosphere table (`AtmosphereModel._ATM_TABLE`, the one `fast_atmosphere=True` envs and the guidance
+  use; `np.interp` arithmetic ported) and the `orion_cm_trim` CD and L/D schedule with the Mach/FMV blend.
+  Nominal parameters: `evaluate.nominal_params()`; truth: `ref_area_m2 × density`, `cpas_lift_scale`,
+  `mass_kg × mass`, as `data.apply_domain`.
+* **Integration step.** The guidance predicts with explicit Euler at `long_prediction_dt_s = 2 s`. A 5 s
+  macro step is not a multiple of 2 s, so each macro step is integrated as Euler steps of **2, 2 and 1 s**:
+  the predictor's step, with the last one cut so every command starts on the 5 s grid.
+* **Bank.** Starts at the realized bank (`physical_state` index 6). The bank used over a substep is the one
+  at its start; after the substep it moves toward the command by at most 20°/s × the substep. No
+  acceleration limit or roll-loop dynamics (the env has a 40°/s² limit and a roll PD loop), so the modelled
+  lag is a lower bound. The roll rate is passed in the context (as §4.1.2 asks) but not used.
+* **g-load** = |drag + lift| / (m g0), the largest over the substeps of each 5 s step (evaluated at each
+  substep's start state).
+* A row is frozen (state held, load 0) once it is below drogue altitude or its flight path is near vertical
+  (|cos γ| < 0.05, where the predictor stops as "singular"). Frozen-steep rows never cross, so MPPI charges
+  them the no-crossing penalty, as the predictor penalizes not reaching the terminal altitude. Freezing
+  never changes a row before its crossing, and keeps every value finite. Early stop: every row below drogue
+  altitude, checked every 5 steps (as `V1Adapter`).
+* The planner gets y6 and g-load as float32 (as from the learned adapters); the model runs in float64.
+  `rf = 2` (one previous command, which the smoothness term needs). The runner's `n_sub` is ignored.
+* **`mppi_prior`**: `models.integrate_eom` with zero corrections, fp32, 2 Euler substeps of 2.5 s, the
+  commanded bank applied at once: exactly what v2's prober integrates with zero output (smoke check 3
+  compares it with an untrained `PIProberV2`).
+
+**Runner (§4.1.2, `fly_v4.py`)**
+* `run_lockstep_v4` is `run_lockstep_v3` with the two changes. The v1/v2 adapters accept and ignore `jobs`
+  through small subclasses (`V1AdapterV4`, `V2AdapterV4`); `fly_v3` is unchanged.
+* Decision log, per decision, in the telemetry `.npz` as `dec_*` arrays: time, h, V, command, `J_min`,
+  `miss_best_km`, `spread_km`, `ess`, `k_rem`, the predicted peak g and landing point of the best sample.
+  "Best sample" = argmax of the softmax weights, computed with `update`'s own arithmetic before it (a pure
+  function of the rollout: no random numbers, so E0c holds). Predicted peak g = each member's largest
+  predicted load before its own drogue crossing, mean over members.
+* Flight ids follow v3's `flight_id`: `<arm>/<load>/seed<k>/mppi0/<atm>_case<NN>`, and `<arm>/<atm>_case<NN>`
+  for deterministic arms. v3's arm name is reused for the same model at new loads (`v2/4g`, `v2/3.5g`,
+  `v2/matched`). E4 uses arm `diag_case10` with load `<model>_<g>` (`v2_4.5g`, `v2single_8g`, ...), since
+  two models share the arm. E0 arms: `classical_E0a`, `v1_v4run`, `v2single_v4run` (+ `v2_v4run` if E0b fails).
+  Load labels: `4.5g`, `4g`, `3.5g`, `8g`, `matched`, `own`.
+* Matched load: per condition, the `peak_g` of v3's classical result JSON.
+
+**E0**
+* E0a conditions: cases 0, 8, 16, …, 56 (2 bridge, 6 new) × 4 atmospheres. Identical = same outcome,
+  |Δ miss| ≤ 1e-6 km, fuel exactly equal. The oracle-vs-classical comparison in nominal air is reported once
+  E1 has flown the oracle.
+* E0b passes if, for both pairs, outcome agreement ≥ 98% and the 95% CI of the mean paired log-miss
+  difference (bootstrap over cases within atmospheres; one seed) includes 0. On failure the contingency is
+  automatic: `build_jobs` adds `v1_v4run`, `v2_v4run`, `v2single_v4run` for every seed, and the analysis uses
+  them in place of v3's arms at 4.5 g. The §15 entry is for the user to write.
+* E0c runs in the notebook too (CPU, v3's seed-0 checkpoints, cases 0, 16, 40 in nominal air), with 32 MPPI
+  samples to keep it to minutes (runner equivalence does not depend on the sample count). Every result field
+  except wall and planning time, and every telemetry array v3 records, must be equal.
+* Physics check 2: v3's v2 seed-0 flights at 4.5 g on the even cases (0, 2, …, 62) in nominal and dense air
+  (64 flights); time-to-go on the flight's 5 s decision grid; the commands actually flown (from telemetry),
+  last one held; landing point = the telemetry's 7.6 km crossing. Reported with true and with nominal
+  parameters (the classical model's own error).
+
+**E3 variants (`ablate_v4.py`)**
+* Parameter counts per member (world model + prober), full size, computed before any training:
+
+  | Variant | Parameters | | Variant | Parameters |
+  |---|---|---|---|---|
+  | R0 | 2,454,531 | | A6_latent_32 | 2,433,987 |
+  | A1_inputs_v1 | 2,453,891 | | **A7a_size_250k** | **253,211** (+1.3%) |
+  | A1b_no_measured_aero | 2,454,275 | | **A7b_size_33k** | **32,027** (−2.0% of 32,675) |
+  | A2_memory_35s (rf 7) | 2,454,531 | | A8_actions_v1 | 2,453,571 |
+  | A3_blind_prober | 2,454,275 | | B1_v1_plus_inputs | 33,155 |
+  | A4_train_T24 | 2,454,531 | | B2_v1_plus_state_prober | 32,803 |
+  | A5_sigreg_pooled | 2,454,531 | | B3_v1_plus_memory_120s (rf 25) | 40,451 |
+
+* **A7a**: `enc_dim 40, pred_dim 60`, prober `hidden 40`, heads 4 / 6 (head dims 10), depths, band, latent
+  64, chunk 4 unchanged. **A7b**: `enc_dim 16, pred_dim 18`, prober `hidden 16`, encoder heads 4, **predictor
+  heads 3** (6 heads would give an odd head dim, which RoPE cannot rotate; 12 or 24 wide predictors miss the
+  target by more than 10%).
+* A1: the encoder sees indices 0–9 of `FEAT_NAMES_V2` (v1's ten features); A1b: all but `cD_meas`,
+  `cL_meas`. The mask selects after v2's normalization (stats unchanged). New `WorldModelV2(feat_mask=...)`.
+* A2: `enc_band 3` (rf 7). It trains on the shared rf-25 windows with the history cut to its last 6 steps;
+  front padding repeats the entry state either way, so the windows equal rebuilt ones (smoke check 5).
+* A5: `wm_loss_v2(sigreg_mode="pooled")`: v1's statistic per member on 1,024 latents drawn uniformly without
+  replacement from the valid encoded and predicted latents of every step, 32 projections, 17 knots; λ 0.02.
+* A8: `act_chunk 7`, `WorldModelV2(action_mode="v1")` (feature u / σmax only).
+* B1: `JEPAWorldModel(n_feat=15)` on v2's features and `StatsV2` normalization; the checkpoint records
+  `feat_set: "v2"` so `fly_v4.load_v1_family` rebuilds `StatsV2` (models.load_checkpoint would not).
+  B2: new `models.PIProber(state_aware=True)` (h, V normalized with `H_NORM`, `V_NORM`). B3: channels
+  (32,)×4 / (16,)×4, dilations (1, 2, 3, 6), rf 25 (checked).
+* New arguments are recorded in `hparams` only when used, so v3's checkpoints and v3-default models keep
+  their exact hparams (smoke check 1 loads a default model's hparams into the pristine code).
+* Training: v2 family through `ablate_v4.train_stage_v4`, a copy of `models_v2.train_stage` (same
+  arithmetic) whose train state also holds the RNG state and is written atomically through the guarded
+  layout every 300 s; same seeding and validation batches as `train_v2`. R0 = v2's recipe with
+  `n_members = 1` (checked to train, save and reload). v1 family through `study_v3.fit_resumable` (which
+  already saves the RNG state), with v3's v1 settings and the convergence-extension rule. On the CPU an
+  interrupted and resumed run equals an uninterrupted one bit for bit (smoke check 5).
+* Open loop: `evaluate_v2.footprint_points` per model and seed on the test and validation splits; v1 is
+  re-evaluated in v4 from v3's checkpoints so it has the validation split too.
+
+**Statistics and analysis (`analyze_v4.py`)**
+* `Boot` reproduces `analyze_v3.hboot`'s resampling (seeds, then cases within each atmosphere,
+  deterministic arms repeated over seeds, its random-stream structure; same numbers for a mean difference)
+  and adds statistics of several arms from the same resamples: the paired mean (log miss), the P6 shares and
+  B's gap closed. Each comparison's seed is a CRC of its name. p as v3; 95% intervals, 90% for P3.
+* Cache: `05_analysis/cache/<comparison>.json` holds the result and a SHA-1 of the input values; a rerun
+  recomputes only comparisons whose inputs changed.
+* "Holds in a seed" = same sign as the pooled effect; required in ≥ n − 1 seeds (4 of 5). Holm within RQ1
+  (P2, P4, P5), RQ2 (L2), RQ3 (13 variants); a criterion is met only if its Holm p < 0.05 too.
+* M: Spearman ρ between the per-model means over seeds (open-loop median error at 300 s, test split;
+  closed-loop mean log miss); CI by resampling seeds jointly for all models.
+* Case 10: "separates" = the 1 Hz ground tracks of the diagnostic flight and v3's classical flight are first
+  more than 5 km apart; predicted miss and prediction error averaged over the last 20 decisions; "load
+  binding" = predicted peak g of the chosen plan ≥ limit − 0.1 g.
+* v3's flights are read from its `flights.csv` (else its result files); v4's `flights.csv` is rebuilt from
+  the result files on every analysis.
+
+**Plumbing**
+* Write guard: `LayoutV4.guard` resolves a path and refuses it unless it is inside the v4 folder and
+  outside every read-only input (the v3 folder, the Drive data folder); a v4 folder overlapping the v3
+  folder is refused at construction. Every v4 write goes through it, including paths handed to v3
+  helpers (checked before the call).
+* Workers: CPU pool = every core; GPU workers = min(4, CPUs, (GPU GB − 2) // 6), as v3. Physics and prior
+  arms batch up to 16,384 sample rows per rollout (elementwise models: fewer kernel launches; a runtime knob
+  that does not change results). Status rates come from the result files' modification times.
+* Notebook: `AUTO_DISCONNECT` lives in the Settings cell; v3's `AUTO_DISCONNECT_CODE` is imported with its
+  assignment line rewritten to keep that setting. Cell ids are fixed, so rebuilding gives the same file. In
+  full mode on a CPU runtime the GPU stages print what remains and skip; smoke mode runs them on the CPU.
+* `build_notebooks_v3.py`: the five `notebook(...)` calls are under `if __name__ == "__main__":`
+  (`RESULTS_SETUP`, a string constant, moved above the guard). The five notebooks it writes are identical
+  to before except nbformat's cell ids, which are random on every run of the unchanged builder as well.
+* Smoke mode: v3's smoke settings (2 seeds, cases 0 and 16, 32 MPPI samples), diagnostic case 0 (case 10
+  is not in the smoke set), the tiny v3 smoke architecture as R0, 40 + 20 training steps, 200 resamples.
+
+**Smoke test** (`python jepa/smoke_v4.py`, CPU). Status at the first push (2026-10-24): checks 1–6 and 10
+passed, run one by one; the notebook's end-to-end smoke run (check 9) had passed E0–E4 and training and was
+flying E3; checks 7–8 had passed on its partial results. The full script's output replaces this paragraph
+once it has run end to end.
+
+```
+1. default-argument equivalence with jepa-v3: 12/12 PASS (models_v2 action_features, WorldModelV2 init /
+   encode_states / action_tokens / predict, PIProberV2.step, ensemble_rollout, wm_loss_v2 incl. random
+   numbers drawn, default hparams load in the pristine code; models.PIProber, jepa_predict)
+2. E0c: run_lockstep_v4 == run_lockstep_v3 on the CPU, v1 and v2 adapters: PASS (6 flights, 641 decisions)
+3. physics: port vs math_3d.nominal_eom_step, 1,000 states: max relative error 4.6e-16 (increment 6.7e-15,
+   load 4.8e-16) PASS; one rollout vs math_3d stepped by hand (2+2+1 s, lagged bank, max load): 0.0 / 1.6e-16
+   PASS; bank rate limit PASS; mppi_truth(nominal) == mppi_nominal exactly PASS; mppi_prior == untrained
+   PIProberV2 PASS
+4. CRN: one stream per (seed, case, atmosphere) across every arm; physics index s == v2 seed s: PASS
+5. A7a 253,211 (+1.3%), A7b 32,027 (−2.0%), B3 rf 25, A2 rf 7: PASS; sliced == rebuilt windows PASS; all 14
+   variants interrupted at step 7, resumed (with a torn temp file present), finished, saved, reload: PASS;
+   R0 and B1 interrupted + resumed == uninterrupted bit for bit: PASS
+6. queue: matched limits == v3 classical peak g; finished flight skipped; deleted one re-flown; decision log
+   present (110 decisions): PASS
+10. write guard: v3 folder, outside, "..", v4-inside-v3, escaping flight id all refused; v3 untouched: PASS
+E0 on smoke data: E0a identical; E0b outcome agreement 100%, misses identical (CPU); E0c identical.
+Physics-model fidelity on smoke data (4 recorded v2 flights, cases 0 and 16, nominal and dense): landing error
+with true parameters 2.8–7.1 km at 200 s to go and 0.27–0.57 km at 100 s (nominal parameters: up to 6.6 km
+and 1.8 km in dense air).
+```
 
 ---
 
