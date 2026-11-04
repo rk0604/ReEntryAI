@@ -1,0 +1,97 @@
+{
+ "draw_order": [
+  "fpa",
+  "azimuth",
+  "speed",
+  "mass",
+  "density",
+  "cd",
+  "cl"
+ ],
+ "footprint": {
+  "ic": {
+   "altitude_m": 121920.0,
+   "chi_deg": 45.99,
+   "gamma_deg": -1.4,
+   "lambda_deg": 0.0,
+   "phi_deg": 0.0,
+   "velocity_mps": 7623.5
+  },
+  "sigma0": {
+   "crossrange_km": 0.1308952634179739,
+   "downrange_km": 3379.156934702533,
+   "end_altitude_m": 7596.176350625232,
+   "end_gamma_deg": -78.67754147530925,
+   "outcome": "drogue",
+   "peak_g": 2.459635899476643,
+   "sigma_deg": 0.0,
+   "t_s": 749.0
+  },
+  "sigma90": {
+   "crossrange_km": -83.24887583413704,
+   "downrange_km": 2273.339331132966,
+   "end_altitude_m": 8466.179325418547,
+   "end_gamma_deg": -87.13481658724318,
+   "outcome": "cos_gamma_fail",
+   "peak_g": 9.384817230973354,
+   "sigma_deg": 90.0,
+   "t_s": 437.75
+  },
+  "sim": "rl_env policy mode, constant command"
+ },
+ "spec": {
+  "altitude_m": 121920.0,
+  "chi_deg": 45.99,
+  "footprint_dt_s": 1.0,
+  "footprint_step_deg": 5.0,
+  "gamma_deg": -1.4,
+  "lambda_deg": 0.0,
+  "load_limit_g": 4.5,
+  "n_blocks": 3,
+  "n_cases": 3000,
+  "n_seeds": 5,
+  "phi_deg": 0.0,
+  "seed": 20261103,
+  "sigma3_azimuth_deg": 0.1,
+  "sigma3_cd_frac": 0.05,
+  "sigma3_cl_frac": 0.05,
+  "sigma3_density_frac": 0.3,
+  "sigma3_fpa_deg": 0.1,
+  "sigma3_mass_frac": 0.05,
+  "sigma3_speed_mps": 15.0,
+  "target_fracs": [
+   0.25,
+   0.5,
+   0.75
+  ],
+  "target_round_km": 0.1,
+  "truncate_sigma": 3.0,
+  "velocity_mps": 7623.5
+ },
+ "targets": [
+  {
+   "config_path": "configs/benchmark_v5/orb1_target0.json",
+   "downrange_km": 2549.8,
+   "frac": 0.25,
+   "lambda_deg": 16.360394763,
+   "phi_deg": 16.255867353,
+   "target_index": 0
+  },
+  {
+   "config_path": "configs/benchmark_v5/orb1_target1.json",
+   "downrange_km": 2826.2,
+   "frac": 0.5,
+   "lambda_deg": 18.249160851,
+   "phi_deg": 17.960774261,
+   "target_index": 1
+  },
+  {
+   "config_path": "configs/benchmark_v5/orb1_target2.json",
+   "downrange_km": 3102.7,
+   "frac": 0.75,
+   "lambda_deg": 20.175224249,
+   "phi_deg": 19.647670207,
+   "target_index": 2
+  }
+ ]
+}

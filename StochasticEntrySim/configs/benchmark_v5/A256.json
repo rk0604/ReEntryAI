@@ -1,0 +1,30 @@
+{
+ "atmospheres": {
+  "mismatch": {
+   "density_scale": 0.88,
+   "lift_scale": 0.88,
+   "mass_scale": 1.0
+  },
+  "mismatch_high": {
+   "density_scale": 1.12,
+   "lift_scale": 1.12,
+   "mass_scale": 1.0
+  },
+  "nominal": {
+   "density_scale": 1.0,
+   "lift_scale": 1.0,
+   "mass_scale": 1.0
+  },
+  "out_of_range": {
+   "density_scale": 0.78,
+   "lift_scale": 0.8,
+   "mass_scale": 1.0
+  }
+ },
+ "file": "configs/v3_testset.csv",
+ "n_cases": 64,
+ "n_conditions": 256,
+ "note": "the v3 test set unchanged; every v3 and v4 flight pairs with v5 flights on it",
+ "sha256": "cbf1b279854de260370e72680d42ee3b221bdd0ad9ff88bfbb8b5f63bff0d354",
+ "suite": "A256"
+}

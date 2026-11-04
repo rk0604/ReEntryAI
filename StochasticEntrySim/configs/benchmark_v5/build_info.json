@@ -1,0 +1,13 @@
+{
+ "git_commit": "af99feb41c7aa1c454533872da64a46f3fe41cf7",
+ "n_dev48": 12,
+ "n_orb1": 3000,
+ "orb1_feasible": 3000,
+ "orb1_feasible_4p5g": 2025,
+ "orb1_feasible_4p5g_by_target": {
+  "0": 27,
+  "1": 999,
+  "2": 999
+ },
+ "orb1_in_training_domain": 2998
+}

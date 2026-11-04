@@ -1,0 +1,96 @@
+{
+ "n_candidates": 60,
+ "rejections": {
+  "entry latitude outside training range": 1,
+  "lift-up peak g above limit": 30
+ },
+ "skipped_sobol_indices": [
+  7,
+  9,
+  11,
+  12,
+  17,
+  18,
+  21,
+  23,
+  25,
+  29,
+  35,
+  36,
+  40,
+  45,
+  47,
+  49,
+  51,
+  52,
+  57,
+  65,
+  68,
+  72,
+  77,
+  79,
+  81,
+  83,
+  86,
+  95,
+  96,
+  99,
+  101,
+  105,
+  107,
+  109,
+  112,
+  114,
+  117,
+  119,
+  123,
+  125,
+  126,
+  128,
+  133,
+  137,
+  139,
+  141,
+  142,
+  147
+ ],
+ "spec": {
+  "altitude_m": [
+   105000.0,
+   135000.0
+  ],
+  "bank_step_deg": 5.0,
+  "crossrange_frac": [
+   -0.7,
+   0.7
+  ],
+  "downrange_frac": [
+   0.1,
+   0.9
+  ],
+  "footprint_dt_s": 1.0,
+  "gamma_deg": [
+   -4.0,
+   -1.5
+  ],
+  "load_limit_g": 4.5,
+  "margin_km": 50.0,
+  "max_candidates": 4096,
+  "max_entry_lat_deg": 30.0,
+  "max_liftup_peak_g": 4.0,
+  "n_bridge": 0,
+  "n_new": 12,
+  "skip_guard_gamma_deg": -4.0,
+  "skip_guard_speed_mps": [
+   7600.0,
+   8600.0
+  ],
+  "sobol_seed": 20261104,
+  "target_lambda_deg": 15.0,
+  "target_phi_deg": 15.0,
+  "velocity_mps": [
+   7200.0,
+   8400.0
+  ]
+ }
+}
