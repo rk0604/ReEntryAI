@@ -174,6 +174,9 @@ BENCH = r"""
 if RUN["benchmark"]:
     log = L.logger("benchmark")
     S0 = S5.gate_s0(CFG, L, None if (L.checks / "S0.done").exists() else need_data(), log)
+    log(f"[benchmark] gate S0 pass={S0.get('pass')}, checksums={S0.get('checksums')}, "
+        f"targets inside the footprint={S0.get('targets_inside')}, "
+        f"feasible at 4.5 g={S0.get('feasible_4p5g_frac')} (01_checks/S0.json)")
     print(json.dumps({k: v for k, v in S0.items() if k not in ("checksum_error",)}, indent=1, default=str)[:2500])
     if S0.get("pass") is False and CFG.gates_stop:
         raise RuntimeError("gate S0 FAILED (01_checks/S0.json): the benchmark is not what the plan froze. Stop and report.")

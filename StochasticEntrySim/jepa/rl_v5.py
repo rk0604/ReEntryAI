@@ -271,22 +271,45 @@ def _write_curve(L, d: Path, curve: Curve, title: str) -> None:
     cols = ["decisions", "update", "sec", "episodes", "ep_return", "success_5km_fast", "miss_km_fast"]
     df = pd.DataFrame(curve.rows) if curve.rows else pd.DataFrame(columns=cols)
     L.write_csv(df, d / "learning_curve.csv")
-    if not curve.rows:
-        return
+    if curve.rows:
+        draw_curves(L, d, df, title)
+
+
+def draw_curves(L, d: Path, df, title: str) -> None:
+    """F_curves.png/.pdf from a learning curve: decisions (PPO, SAC) or DAgger iterations on the x axis."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    xk = "decisions" if "decisions" in df else "iteration"
+    left = "ep_return" if "ep_return" in df else "states" if "states" in df else None
     fig, ax = plt.subplots(1, 2, figsize=(8, 3))
-    ax[0].plot(df.decisions, df.ep_return)
-    ax[0].set_xlabel("decisions")
-    ax[0].set_ylabel("episode return (fast env)")
-    ax[1].plot(df.decisions, df.success_5km_fast)
-    ax[1].set_xlabel("decisions")
+    if left is not None:
+        ax[0].plot(df[xk], df[left], "-o" if xk == "iteration" else "-", ms=3)
+    ax[0].set_xlabel(xk)
+    ax[0].set_ylabel({"ep_return": "episode return (fast env)", "states": "labeled states"}.get(left, ""))
+    ax[1].plot(df[xk], df["success_5km_fast"], "-o" if xk == "iteration" else "-", ms=3)
+    ax[1].set_xlabel(xk)
     ax[1].set_ylabel("success@5km (fast env)")
+    if xk == "iteration":
+        from matplotlib.ticker import MaxNLocator
+        for a in ax:
+            a.xaxis.set_major_locator(MaxNLocator(integer=True))
+        title = f"{title} (DAgger: learner + expert rollouts)"
     fig.suptitle(title)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
     for ext in (".png", ".pdf"):
         L.save_fig(fig, d / f"F_curves{ext}", dpi=200)
     plt.close(fig)
+
+
+def ensure_curves(L, d: Path, title: str) -> None:
+    """Redraw F_curves from learning_curve.csv when the figure is missing (a run finished before it was drawn)."""
+    lc = Path(d) / "learning_curve.csv"
+    if lc.exists() and not (Path(d) / "F_curves.png").exists():
+        import pandas as pd
+        df = pd.read_csv(lc)
+        if len(df) and "success_5km_fast" in df:
+            draw_curves(L, Path(d), df, title)
 
 
 # ============================================================================
@@ -691,17 +714,28 @@ def dagger_train(L, d: Path, cfg: RLCfg, device, label: str, fnpeg_cfg: Optional
         L.atomic_bytes(p, buf.getvalue())
         log(f"  [{label}] iteration {i}: beta {beta:.3f}, {len(O):,} labeled states, learner+expert success@5km "
             f"{s['success_5km_fast']:.3f} ({(time.time() - t0) / 60:.1f} min)")
+        _dagger_curve(L, d, i + 1, label)
         fail_point(stage, i)
     actor, loss = _fit_from_iters(d, cfg.dagger_iters, cfg, dev, label, log)
-    for i in range(cfg.dagger_iters):
-        z = np.load(d / "data" / f"iter_{i:02d}.npz")
-        rows.append({"iteration": i, "beta": float(z["beta"]), "states": int(len(z["obs"])),
-                     "success_5km_fast": float(z["success_5km_fast"]), "miss_km_fast": float(z["miss_km_fast"])})
-    import pandas as pd
-    L.write_csv(pd.DataFrame(rows), d / "learning_curve.csv")
+    rows = _dagger_curve(L, d, cfg.dagger_iters, label)
     save_policy(L, d / "policy.pt", actor, {"label": label, "iterations": cfg.dagger_iters, "fit_loss": loss,
                                             "cfg": asdict(cfg)})
     return {"iterations": cfg.dagger_iters, "states": int(sum(r["states"] for r in rows))}
+
+
+def _dagger_curve(L, d: Path, n_iter: int, label: str) -> List[dict]:
+    """learning_curve.csv and F_curves from the finished iterations (redrawn after every iteration)."""
+    import pandas as pd
+    rows = []
+    for i in range(n_iter):
+        z = np.load(d / "data" / f"iter_{i:02d}.npz")
+        rows.append({"iteration": i, "beta": float(z["beta"]), "states": int(len(z["obs"])),
+                     "success_5km_fast": float(z["success_5km_fast"]), "miss_km_fast": float(z["miss_km_fast"])})
+    df = pd.DataFrame(rows)
+    L.write_csv(df, d / "learning_curve.csv")
+    if len(df):
+        draw_curves(L, d, df, label)
+    return rows
 
 
 def _fit_from_iters(d: Path, n_iter: int, cfg: RLCfg, dev, label: str, log) -> Tuple[Actor, float]:
@@ -772,6 +806,7 @@ def train_rl_dir(L, d: Path, arm: str, cfg: RLCfg, device, fnpeg_cfg: Optional[d
     """Train (or resume, or skip) one RL run into folder d; policy.pt marks it done, run.json describes it."""
     d = Path(d)
     if (d / "policy.pt").exists():
+        ensure_curves(L, d, label or f"{arm} seed {cfg.seed}")
         p = d / "run.json"
         return json.loads(p.read_text()) if p.exists() else {"arm": arm, "seed": cfg.seed}
     L.guard(d).mkdir(parents=True, exist_ok=True)
