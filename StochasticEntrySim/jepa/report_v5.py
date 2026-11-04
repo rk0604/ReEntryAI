@@ -57,8 +57,28 @@ def compact(key: str, df: Optional[pd.DataFrame]):
     return df.head(R4.MAX_ROWS), f"First {R4.MAX_ROWS} of {len(df)} rows; the CSV has all of them."
 
 
-def build_report(L, out_pdf: Optional[str] = None) -> str:
-    """Write the report from the files in L (a study_v5.LayoutV5); returns its path."""
+def _inputs(L) -> list:
+    from jepa import benchmark_v5 as B
+    files = [L.study / "study_config.json", PLAN, Path(__file__), B.BENCH_DIR / "ORB1_spec.json"]
+    files += [p for p in L.analysis.rglob("*") if p.is_file() and "cache" not in p.parts]
+    files += list(L.tuning.glob("*/chosen.json"))
+    return files
+
+
+def is_current(L, pdf: Path) -> bool:
+    """The report is newer than everything it reads (analysis outputs, config, plan, ORB-1 spec, tuning choices)."""
+    try:
+        t = pdf.stat().st_mtime
+    except OSError:
+        return False
+    return all(p.stat().st_mtime <= t for p in _inputs(L) if p.exists())
+
+
+def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
+    """Write the report from the files in L (a study_v5.LayoutV5); returns its path. The study's report is not
+    rebuilt when it is newer than every file it reads (unless force)."""
+    if out_pdf is None and not force and is_current(L, L.report / "SpaceJEPA_v5_report.pdf"):
+        return str(L.report / "SpaceJEPA_v5_report.pdf")
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.units import inch

@@ -551,14 +551,43 @@ def nb_env(root: Path, fx: dict, fail: str = None) -> dict:
     return env
 
 
-def run_nb(root: Path, fx: dict, tag: str, fail: str = None) -> tuple:
+def _newest(root: Path) -> float:
+    m = 0.0
+    for dp, _, fs in os.walk(root):
+        for f in fs:
+            try:
+                m = max(m, os.stat(os.path.join(dp, f)).st_mtime)
+            except OSError:
+                pass
+    return m
+
+
+def run_nb(root: Path, fx: dict, tag: str, fail: str = None, stall_min: float = 25.0) -> tuple:
+    """Execute the notebook with nbconvert (output and errors to nb_runs/<tag>.out/.err). A run that writes nothing
+    under its study folder for stall_min minutes is killed and reported as stalled."""
     out = root.parent / "nb_runs"
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    r = subprocess.run([sys.executable, "-m", "nbconvert", "--to", "notebook", "--execute",
-                        "--ExecutePreprocessor.timeout=-1", "--output-dir", str(out), "--output", f"{tag}.ipynb",
-                        "ReEntryAI_JEPA_v5.ipynb"], env=nb_env(root, fx, fail), capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
+    fo, fe = out / f"{tag}.out", out / f"{tag}.err"
+    with open(fo, "w", encoding="utf-8") as so, open(fe, "w", encoding="utf-8") as se:
+        p = subprocess.Popen([sys.executable, "-m", "nbconvert", "--to", "notebook", "--execute",
+                              "--ExecutePreprocessor.timeout=-1", "--ExecutePreprocessor.startup_timeout=180",
+                              "--output-dir", str(out), "--output", f"{tag}.ipynb", "ReEntryAI_JEPA_v5.ipynb"],
+                             env=nb_env(root, fx, fail), stdout=so, stderr=se)
+        stalled = False
+        while p.poll() is None:
+            try:
+                p.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                if time.time() - max(t0, _newest(root)) > stall_min * 60:
+                    stalled = True
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)] if os.name == "nt"
+                                   else ["kill", "-9", str(p.pid)], capture_output=True)
+                    p.wait()
+    rd = lambda f: f.read_text(encoding="utf-8", errors="replace")
+    r = subprocess.CompletedProcess(p.args, p.returncode, rd(fo), rd(fe) + (" STALLED" if stalled else ""))
+    if stalled:
+        NOTES.setdefault("stalled_runs", []).append(tag)
     return r, time.time() - t0, out / f"{tag}.ipynb"
 
 
@@ -571,18 +600,25 @@ def _nb_text(path: Path) -> str:
                    for o in c.get("outputs", []))
 
 
-def t10_notebook(work: Path, fx: dict) -> Path:
+def t10_notebook(work: Path, fx: dict, keep: bool = False) -> Path:
+    """keep: the smoke study folder exists from an earlier run 1 (same code); only the reruns are checked."""
     section("10. the notebook in smoke mode (first run = the whole smoke study)")
     subprocess.run([sys.executable, "jepa/build_notebook_v5.py"], check=True, capture_output=True)
     root = work / "v5_smoke"
-    if root.exists():
-        shutil.rmtree(root)
     m_in = _mtimes([fx["v3"], fx["v4"], fx["legacy"]])
-    r, t1, out = run_nb(root, fx, "run1")
-    if r.returncode != 0:
-        print(r.stdout[-3000:], r.stderr[-8000:])
-    check("notebook run 1 ends without error", r.returncode == 0, f"({t1 / 60:.1f} min)")
-    NOTES["nb_run1_min"] = round(t1 / 60, 1)
+    if keep and (root / "00_study" / "study_config.json").exists():
+        r, t1, _ = run_nb(root, fx, "run1b")
+        if r.returncode != 0:
+            print(r.stdout[-3000:], r.stderr[-8000:])
+        check("notebook rerun on the kept smoke study ends without error", r.returncode == 0, f"({t1:.0f}s)")
+    else:
+        if root.exists():
+            shutil.rmtree(root)
+        r, t1, out = run_nb(root, fx, "run1")
+        if r.returncode != 0:
+            print(r.stdout[-3000:], r.stderr[-8000:])
+        check("notebook run 1 ends without error", r.returncode == 0, f"({t1 / 60:.1f} min)")
+        NOTES["nb_run1_min"] = round(t1 / 60, 1)
     r, t2, out2 = run_nb(root, fx, "run2")
     check("notebook run 2 ends without error", r.returncode == 0, f"({t2:.0f}s)")
     check("run 2 finds everything done in under a minute", t2 < 60.0, f"({t2:.0f}s)")
@@ -635,10 +671,15 @@ def t9_analysis(root: Path, fx: dict) -> None:
     NOTES["criteria_not_run"] = list(t05[t05.measured == "not run"].id)
     L3 = S4.v3_layout(fx["v3"])
     L4 = S5.v4_layout(fx["v4"])
-    R = A5.analyze(cfg, L, L3, L4, log=lambda *a: None)
-    b = R["boot"]
-    check("bootstrap cache reused on a rerun (no recomputation)", b.computed == 0 and b.reused > 0,
-          f"({b.reused} reused)")
+    try:
+        R = A5.analyze(cfg, L, L3, L4, log=lambda *a: None, force=True)
+        b = R["boot"]
+        check("bootstrap cache reused on a forced rerun (no recomputation)", b.computed == 0 and b.reused > 0,
+              f"({b.reused} reused)")
+        R = A5.analyze(cfg, L, L3, L4, log=lambda *a: None)
+        check("an unforced rerun with unchanged inputs skips the analysis", bool(R.get("skipped")))
+    except Exception as e:
+        check("analysis reruns", False, f"({type(e).__name__}: {e})")
     pdf = L.report / "SpaceJEPA_v5_report.pdf"
     check("report written by the notebook", pdf.exists() and pdf.stat().st_size > 50_000,
           f"({pdf.stat().st_size // 1000 if pdf.exists() else 0} kB)")
@@ -877,7 +918,7 @@ def throughput(root: Path) -> pd.DataFrame:
     return g.round(2)
 
 
-def main(work: Path, workers: int, only=None) -> None:
+def main(work: Path, workers: int, only=None, keep: bool = False) -> None:
     t_all = time.time()
     torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
     fx = {"data": work / "wide_smoke", "v3": work / "v3_smoke", "v4": work / "v4_smoke", "legacy": work / "legacy_v5"}
@@ -912,7 +953,7 @@ def main(work: Path, workers: int, only=None) -> None:
     root = work / "v5_smoke"
     if run(10) or run(9) or run(13) or run(14) or run(15):
         if run(10) or not root.exists():
-            root = t10_notebook(work, fx)
+            root = t10_notebook(work, fx, keep)
         if run(9):
             t9_analysis(root, fx)
         if run(15):
@@ -938,7 +979,7 @@ def main(work: Path, workers: int, only=None) -> None:
 
 if __name__ == "__main__":
     try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
     except (AttributeError, ValueError):
         pass
     if len(sys.argv) > 2 and sys.argv[1] == "--child":
@@ -947,5 +988,6 @@ if __name__ == "__main__":
     ap.add_argument("--work", default=os.environ.get("JEPA_SMOKE_WORK", str(Path(tempfile.gettempdir()) / "jepa_v4_smoke")))
     ap.add_argument("--workers", type=int, default=max(1, min(8, (os.cpu_count() or 2) - 1)))
     ap.add_argument("--only", default="", help="comma-separated check numbers (default: all)")
+    ap.add_argument("--keep", action="store_true", help="check 10 on the existing smoke study (no fresh run 1)")
     a = ap.parse_args()
-    main(Path(a.work), a.workers, {int(x) for x in a.only.split(",") if x} or None)
+    main(Path(a.work), a.workers, {int(x) for x in a.only.split(",") if x} or None, a.keep)

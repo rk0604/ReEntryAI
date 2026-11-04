@@ -20,11 +20,14 @@ model seed s and noise index s; RL arms' seeds are training seeds 0-2 (compariso
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import math
+import os
 import re
 import sys
+import time
 import zlib
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -563,11 +566,68 @@ def _params_of(L, arm: str, seed: int) -> Optional[int]:
 # ============================================================================
 # The analysis
 # ============================================================================
-def analyze(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4=None, log=print) -> dict:
-    """Every table, figure and criterion. Returns a summary dict for the report."""
+TABLES = tuple(f"T{i:02d}" for i in range(1, 13))
+FIGURES = tuple(f"F{i:02d}" for i in range(1, 11))
+
+
+def _stat_rows(paths) -> List[str]:
+    out = []
+    for p in paths:
+        try:
+            st = os.stat(p)
+            out.append(f"{p}|{st.st_size}|{st.st_mtime_ns}")
+        except OSError:
+            pass
+    return out
+
+
+def inputs_fingerprint(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4, df: pd.DataFrame) -> str:
+    """Everything the analysis reads: the flights (ids and outcomes), the gate, tuning, timing, open-loop, policy and
+    inventory files (size and modification time), the frozen config and this module's code."""
+    h = hashlib.sha256()
+    cols = [c for c in ("flight_id", "source", "arm", "miss_km", "peak_g", "outcome") if c in df]
+    h.update(df[cols].sort_values(cols[:2] if len(cols) > 1 else cols).to_csv(index=False).encode())
+    files: List[str] = [str(L.study / "study_config.json"), str(L.study / "legacy_rl_inventory.csv"), __file__]
+    for root in (L.checks, L.tuning, L.open_loop, L.policies, L.models) + tuple(
+            x.open_loop for x in (L3, L4) if x is not None and hasattr(x, "open_loop")):
+        for dp, _dirs, fs in os.walk(root):
+            files += [os.path.join(dp, f) for f in fs if f.endswith((".json", ".csv")) and not f.startswith(".")]
+    h.update("\n".join(sorted(_stat_rows(files))).encode())
+    h.update(json.dumps(dataclasses.asdict(cfg), sort_keys=True, default=str).encode())
+    return h.hexdigest()
+
+
+def _outputs_complete(L: S5.LayoutV5) -> bool:
+    t = {p.stem.split("_")[0] for p in L.tables.glob("T*.csv")}
+    f = {p.stem.split("_")[0] for p in L.figures.glob("F*.png")}
+    return set(TABLES) <= t and set(FIGURES) <= f and (L.analysis / "captions.json").exists()
+
+
+def analyze(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4=None, log=print, force: bool = False) -> dict:
+    """Every table, figure and criterion. Returns a summary dict for the report. Skipped (outputs read back from
+    05_analysis/) when nothing it reads changed since the last complete analysis, unless force."""
     caps = A4.Captions(L)
     boot = A4.Boot(L, cfg.n_boot)
     df = load_flights_v5(cfg, L, L3, L4)
+    fp = inputs_fingerprint(cfg, L, L3, L4, df)
+    fpp = L.analysis / "inputs.json"
+    if not force and fpp.exists() and _outputs_complete(L):
+        try:
+            same = json.loads(fpp.read_text()).get("fingerprint") == fp
+        except (OSError, ValueError):
+            same = False
+        if same:
+            log(f"[analysis] {len(df)} flights; nothing changed since the last analysis (05_analysis/inputs.json)")
+            return {"skipped": True, "n_flights": int(len(df)), "boot": boot,
+                    "T05": pd.read_csv(next(L.tables.glob("T05_*.csv"))),
+                    "figures": {p.stem.split("_")[0]: p for p in sorted(L.figures.glob("F*.png"))}}
+    out = _analyze(cfg, L, L3, L4, log, caps, boot, df)
+    if _outputs_complete(L):
+        L.write_json(fpp, {"fingerprint": fp, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "n_flights": int(len(df))})
+    return out
+
+
+def _analyze(cfg, L, L3, L4, log, caps, boot, df) -> dict:
     main = main_flights(df)
     cases = sorted({int(c["case"]) for c in S5.conditions(cfg, "A256")})
     seeds = list(cfg.seeds)
@@ -868,7 +928,8 @@ def figures(cfg, L, L3, caps, df, main, sc, t04, t06, t12, ol, mech, seeds, rl_s
             if lc.exists():
                 c = pd.read_csv(lc)
                 if len(c) and "success_5km_fast" in c:
-                    x = c["decisions"] if c["decisions"].notna().any() else c.index
+                    x = (c["decisions"] if "decisions" in c and c["decisions"].notna().any()
+                         else c["iteration"] if "iteration" in c else c.index)   # DAgger's curve is per iteration
                     axs[0].plot(x, 100 * c["success_5km_fast"], color=color(arm), lw=1, alpha=0.8,
                                 label=LAB.get(arm, arm) if s == rl_seeds[0] else None)
             e = ecur[ecur.arm.str.startswith(f"{arm}@") & (ecur.seed == s)]
