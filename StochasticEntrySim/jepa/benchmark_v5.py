@@ -652,7 +652,9 @@ def score(flights, by_seed: bool = False):
             ((*k, "all") if isinstance(k, tuple) else (k, "all"), g) for k, g in df.groupby(keys, dropna=False)]:
         n = len(g)
         k10 = int(g["s10"].sum())
-        comp = g["g_duration_compliant"].astype(bool) if "g_duration_compliant" in g else pd.Series([], dtype=bool)
+        # v3/v4 flights have no g-duration column: they count as unknown, not as compliant
+        comp = (g["g_duration_compliant"].dropna().map(lambda v: str(v).lower() in ("true", "1", "1.0"))
+                if "g_duration_compliant" in g else pd.Series([], dtype=bool))
         lo, hi = clopper_pearson(int(comp.sum()), int(len(comp)))
         row = dict(zip(keys + ["group"], gk))
         row.update({

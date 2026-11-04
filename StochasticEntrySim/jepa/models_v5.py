@@ -397,6 +397,7 @@ def train_e3(model: nn.Module, ds_tr, ds_va, cfg: E3TrainCfg, device, L, state_p
     vbs = {T: ds_va.sample((1, cfg.val_rows), T, gv) for _, T in cfg.curriculum}
     hist: Dict[str, list] = {"step": [], "T": [], "sec": [], "lr": [], "state": [], "acc": [], "val": []}
     start, elapsed = 0, 0.0
+    acc0, n_acc0 = {}, 0
     torch.manual_seed(int(seed))
     st = load_state(state_path, log) if state_path else None
     if st is not None:
@@ -404,14 +405,15 @@ def train_e3(model: nn.Module, ds_tr, ds_va, cfg: E3TrainCfg, device, L, state_p
         opt.load_state_dict(st["opt"])
         scaler.load_state_dict(st["scaler"])
         start, hist, elapsed = int(st["step"]), st["hist"], float(st.get("elapsed", 0.0))
+        acc0, n_acc0 = dict(st.get("acc", {})), int(st.get("n_acc", 0))
         set_rng_state(st["rng"], {"gen": gen})
         log(f"  [{label}] resumed at step {start}/{cfg.steps}")
 
     def save(step: int):
         if state_path:
             save_state(L, {"module": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(),
-                           "step": step, "hist": hist, "elapsed": elapsed, "rng": rng_state({"gen": gen}),
-                           "cfg": asdict(cfg)}, state_path)
+                           "step": step, "hist": hist, "elapsed": elapsed, "acc": acc, "n_acc": n_acc,
+                           "rng": rng_state({"gen": gen}), "cfg": asdict(cfg)}, state_path)
 
     def val_at(T: int) -> float:
         model.eval()
@@ -421,8 +423,8 @@ def train_e3(model: nn.Module, ds_tr, ds_va, cfg: E3TrainCfg, device, L, state_p
         return v
 
     params = [p for g in opt.param_groups for p in g["params"]]
-    acc: Dict[str, float] = {}
-    n_acc, t_log, t_save = 0, time.time(), time.time()
+    acc: Dict[str, float] = acc0               # the log window's running sums (saved, so a resume logs the same)
+    n_acc, t_log, t_save = n_acc0, time.time(), time.time()
     model.train()
     for step in range(start, cfg.steps):
         lr = V._lr(step, c2)

@@ -136,7 +136,8 @@ class GuidanceFlight:
     def record(self, law=None) -> dict:
         tel = self.rec.arrays()
         # fly_v3.finish builds a v3 id from load and seed, which guidance arms do not have; the v5 id replaces it
-        shim = {**self.job, "load": self.job.get("load") or "-", "seed": self.job.get("seed") or 0}
+        shim = {**self.job, "load": self.job.get("load") or "-", "seed": self.job.get("seed") or 0,
+                "mppi_rep": self.job.get("mppi_rep") or 0}
         res = F.finish(shim, self.env, self.info, self.cmds, tel, time.time() - self.t0, self.plan_ms)
         res.update({"load": self.job.get("load"), "seed": self.job.get("seed")})
         res.update(result_extras_v5(self.job))

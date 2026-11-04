@@ -12,6 +12,8 @@ The v5 RL baselines (jepa/v5_plan.md section 4.4), in-house torch, resumable (se
                    warm-up on frozen-actor rollouts; budget in decisions and in wall hours
     sac_train      SAC with twin critics and automatic temperature; the replay buffer is written as append-only
                    shards with each checkpoint and reloaded up to its capacity
+    ppo_full_train ppo_matched: PPO in the full simulator (rl_env, 5 s decisions, the same observation and reward),
+                   6,000 episodes, each update a set of complete episodes flown in a process pool
     dagger_train   DAgger with fnpeg as the expert, queried on the learner's own states (the expert's filters
                    run on every flight whoever acts), beta_i = 0.5^i, rollouts per iteration, the aggregated
                    data in data/iter_<i>.npz, supervised fit of the magsign actor (MSE on |a|, BCE on the sign)
@@ -220,11 +222,17 @@ class RLCfg:
     save_every_s: float = 300.0
     save_every_updates: int = 0             # > 0: also every n updates (the smoke test's deterministic resume)
     curve_points: int = 5                   # policy snapshots for the full-simulator learning curve
+    env_pool: int = 2048                    # fast env: episodes drawn (footprints flown) per refill
+    # ppo_matched (PPO in the full simulator, the world models' data budget)
+    full_episodes: int = 6000
+    full_per_update: int = 50               # complete episodes per PPO update (no episode spans a checkpoint)
+    full_workers: int = 0                   # simulator processes (0: every core)
     seed: int = 0
 
 
 def make_env(cfg: RLCfg, seed: int, device, n_envs: Optional[int] = None, fast: Optional[dict] = None):
-    fc = RF.FastEnvCfg(n_envs=int(n_envs or cfg.n_envs), gamma_rl=cfg.gamma, seed=int(seed), **(fast or {}))
+    fc = RF.FastEnvCfg(n_envs=int(n_envs or cfg.n_envs), gamma_rl=cfg.gamma, seed=int(seed),
+                       **{"pool": int(cfg.env_pool), **(fast or {})})
     return RF.FastEntryEnv(fc, device)
 
 
@@ -232,8 +240,15 @@ class Curve:
     """Learning curve rows (written to learning_curve.csv with every checkpoint)."""
 
     def __init__(self, rows=None):
-        self.rows = list(rows or [])
-        self.ret, self.succ, self.miss, self.n = 0.0, 0, 0.0, 0
+        if isinstance(rows, dict):              # a saved state: rows and the running sums of the open window
+            self.rows = list(rows["rows"])
+            self.ret, self.succ, self.miss, self.n = rows["acc"]
+        else:
+            self.rows = list(rows or [])
+            self.ret, self.succ, self.miss, self.n = 0.0, 0, 0.0, 0
+
+    def state(self) -> dict:
+        return {"rows": list(self.rows), "acc": (self.ret, self.succ, self.miss, self.n)}
 
     def add(self, info: dict) -> None:
         d = info["done"]
@@ -253,10 +268,11 @@ class Curve:
 
 def _write_curve(L, d: Path, curve: Curve, title: str) -> None:
     import pandas as pd
+    cols = ["decisions", "update", "sec", "episodes", "ep_return", "success_5km_fast", "miss_km_fast"]
+    df = pd.DataFrame(curve.rows) if curve.rows else pd.DataFrame(columns=cols)
+    L.write_csv(df, d / "learning_curve.csv")
     if not curve.rows:
         return
-    df = pd.DataFrame(curve.rows)
-    L.write_csv(df, d / "learning_curve.csv")
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -304,7 +320,7 @@ def ppo_train(L, d: Path, cfg: RLCfg, device, label: str, actor: Optional[Actor]
     def save():
         save_state(L, {"actor": actor.state_dict(), "critic": vf.state_dict(), "opt": opt.state_dict(),
                        "env": env.get_state(), "step": step, "update": update, "elapsed": elapsed,
-                       "curve": curve.rows, "rng": rng_state({"gen": gen}), "cfg": asdict(cfg)}, d / "train_state.pt")
+                       "curve": curve.state(), "rng": rng_state({"gen": gen}), "cfg": asdict(cfg)}, d / "train_state.pt")
         _write_curve(L, d, curve, label)
 
     while step < cfg.budget_decisions and elapsed + (time.time() - t0) < cfg.budget_hours * 3600:
@@ -362,6 +378,8 @@ def _ppo_update(actor: Actor, vf: nn.Module, opt, cfg: RLCfg, gen, ref: Optional
     """cfg.epochs passes of clipped-ratio PPO (critic only during a warm-up) over one batch of decisions."""
     n = len(b_o)
     mb = min(cfg.minibatch, n)
+    with torch.no_grad():                   # the normalizer moved during the rollout: the ratio starts at 1
+        b_lp = actor.log_prob(b_o, b_raw)
     for _ep in range(cfg.epochs):
         perm = torch.randperm(n, generator=gen, device=b_o.device)
         for i in range(0, n, mb):
@@ -448,7 +466,7 @@ def sac_train(L, d: Path, cfg: RLCfg, device, label: str, log=print, stage: str 
         save_state(L, {"actor": actor.state_dict(), "q1": q1.state_dict(), "q2": q2.state_dict(),
                        "q1t": q1t.state_dict(), "q2t": q2t.state_dict(), "oa": oa.state_dict(), "oq": oq.state_dict(),
                        "oal": oal.state_dict(), "log_alpha": log_alpha.detach().clone(), "env": env.get_state(),
-                       "step": step, "update": update, "elapsed": elapsed, "curve": curve.rows, "n_shard": n_shard,
+                       "step": step, "update": update, "elapsed": elapsed, "curve": curve.state(), "n_shard": n_shard,
                        "rng": rng_state({"gen": gen}), "cfg": asdict(cfg)}, d / "train_state.pt")
         _write_curve(L, d, curve, label)
 
@@ -500,7 +518,7 @@ def sac_train(L, d: Path, cfg: RLCfg, device, label: str, log=print, stage: str 
                                      list(q1t.parameters()) + list(q2t.parameters())):
                         pt.mul_(1 - cfg.tau).add_(cfg.tau * p)
                 update += 1
-        if curve.n >= 4 * N:
+        if curve.n >= N:
             curve.flush(step, update, elapsed + time.time() - t0, alpha=float(log_alpha.exp()))
         _maybe_snapshot(L, d, actor, step, cfg, snaps)
         due = time.time() - t_save > cfg.save_every_s or (cfg.save_every_updates and update > 0
@@ -663,6 +681,7 @@ def dagger_train(L, d: Path, cfg: RLCfg, device, label: str, fnpeg_cfg: Optional
         if i > 0 and (d / "data" / f"env_{i - 1:02d}.pt").exists():
             env.set_state(torch.load(d / "data" / f"env_{i - 1:02d}.pt", map_location="cpu", weights_only=False))
         expert = FastExpert(env, cfg, fnpeg_cfg)
+        gen = torch.Generator(device=dev).manual_seed(cfg.seed * 7919 + 9 + 1000 * i)
         O, A, s = _rollouts(env, expert, actor if i > 0 else None, beta, cfg.dagger_rollouts, gen, dev)
         buf = io.BytesIO()
         torch.save(env.get_state(), buf)
@@ -748,27 +767,222 @@ def bcppo_train(L, d: Path, cfg: RLCfg, device, label: str, fnpeg_cfg: Optional[
 # ============================================================================
 # One RL arm, one seed
 # ============================================================================
-def train_rl_arm(L, arm: str, seed: int, cfg: RLCfg, device, fnpeg_cfg: Optional[dict] = None, log=print) -> dict:
-    d = L.policy_dir(arm, seed)
+def train_rl_dir(L, d: Path, arm: str, cfg: RLCfg, device, fnpeg_cfg: Optional[dict] = None, log=print,
+                 label: Optional[str] = None) -> dict:
+    """Train (or resume, or skip) one RL run into folder d; policy.pt marks it done, run.json describes it."""
+    d = Path(d)
     if (d / "policy.pt").exists():
         p = d / "run.json"
-        return json.loads(p.read_text()) if p.exists() else {"arm": arm, "seed": seed}
+        return json.loads(p.read_text()) if p.exists() else {"arm": arm, "seed": cfg.seed}
     L.guard(d).mkdir(parents=True, exist_ok=True)
-    c = replace(cfg, seed=int(seed))
+    label = label or f"{arm} seed {cfg.seed}"
     t0 = time.time()
     if arm == "dagger_fnpeg":
-        out = dagger_train(L, d, c, device, f"{arm} seed {seed}", fnpeg_cfg, log)
+        out = dagger_train(L, d, cfg, device, label, fnpeg_cfg, log)
     elif arm == "bcppo_fnpeg":
-        out = bcppo_train(L, d, c, device, f"{arm} seed {seed}", fnpeg_cfg, log)
+        out = bcppo_train(L, d, cfg, device, label, fnpeg_cfg, log)
     elif arm == "ppo_hist":
-        out = ppo_train(L, d, c, device, f"{arm} seed {seed}", log=log)
+        out = ppo_train(L, d, cfg, device, label, log=log)
     elif arm == "sac_hist":
-        out = sac_train(L, d, c, device, f"{arm} seed {seed}", log=log)
+        out = sac_train(L, d, cfg, device, label, log=log)
+    elif arm == "ppo_matched":
+        out = ppo_full_train(L, d, cfg, device, label, log=log)
     else:
-        raise ValueError(f"{arm} is not trained in the fast env (ppo_matched trains in the full simulator)")
-    info = {"arm": arm, "seed": int(seed), **out, "wall_s": round(time.time() - t0, 1), "cfg": asdict(c)}
+        raise ValueError(f"unknown RL arm {arm!r}")
+    info = {"arm": arm, "seed": int(cfg.seed), **out, "wall_s": round(time.time() - t0, 1), "cfg": asdict(cfg)}
     L.write_json(d / "run.json", info)
     return info
+
+
+def train_rl_arm(L, arm: str, seed: int, cfg: RLCfg, device, fnpeg_cfg: Optional[dict] = None, log=print) -> dict:
+    return train_rl_dir(L, L.policy_dir(arm, seed), arm, replace(cfg, seed=int(seed)), device, fnpeg_cfg, log)
+
+
+# ============================================================================
+# PPO in the full simulator (ppo_matched): the world models' data budget, 6,000 episodes
+# ============================================================================
+def full_episode_specs(n: int, seed: int) -> List[dict]:
+    """n training episodes drawn as the fast env draws them (entry, truth parameters, target on the footprint)."""
+    from jepa.data import R_EARTH
+    env = RF.FastEntryEnv(RF.FastEnvCfg(n_envs=1, pool=max(64, min(2048, n)), seed=int(seed)))
+    out: List[dict] = []
+    while len(out) < n:
+        P = env._pool
+        for i in range(len(P["x0"])):
+            x = [float(v) for v in P["x0"][i]]
+            out.append({"ic": {"altitude_m": x[0] - R_EARTH, "phi_deg": math.degrees(x[1]),
+                               "lambda_deg": math.degrees(x[2]), "velocity_mps": x[3],
+                               "gamma_deg": math.degrees(x[4]), "chi_deg": math.degrees(x[5])},
+                        "domain": dict(zip(("density_scale", "lift_scale", "mass_scale"),
+                                           [float(v) for v in P["dom"][i]])),
+                        "target_phi": float(P["phi_t"][i]), "target_lam": float(P["lam_t"][i])})
+        env._refill()
+    return out[:n]
+
+
+def target_config_file(phi_rad: float, lam_rad: float) -> str:
+    """configs/default.json with the mission target moved, as a local cache file (never under configs/)."""
+    import tempfile
+    import zlib
+    key = f"{phi_rad:.12f}_{lam_rad:.12f}"
+    d = Path(tempfile.gettempdir()) / "jepa_v5_targets"
+    path = d / f"t_{zlib.crc32(key.encode()):08x}.json"
+    if not path.exists():
+        from jepa.benchmark_v5 import SIM_DIR
+        cfg = json.loads((SIM_DIR / "configs" / "default.json").read_text())
+        cfg["mission"]["target_phi_deg"] = math.degrees(phi_rad)
+        cfg["mission"]["target_lambda_deg"] = math.degrees(lam_rad)
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(cfg))
+        os.replace(tmp, path)
+    return str(path)
+
+
+def _full_episode(arg) -> dict:
+    """One training episode in the full simulator (rl_env), 5 s decisions, the fast env's reward."""
+    hp, state, spec, seed, fast_cfg = arg
+    torch.set_num_threads(1)
+    import rl_env
+    from jepa.data import G0, SIGMA_MAX_RAD, apply_domain, physical_state
+    from jepa.fly_v3 import great_circle_km
+    actor = Actor(**hp)
+    actor.load_state_dict(state)
+    actor.eval()
+    env = rl_env.OrionEntryEnv(config_path=target_config_file(spec["target_phi"], spec["target_lam"]),
+                               controller_mode="policy", dispersion=False, max_episode_steps=1400,
+                               fast_atmosphere=True)
+    apply_domain(env.params, spec["domain"])
+    env.reset(seed=0, options={"ic_override": spec["ic"]})
+    c = RF.FastEnvCfg(**fast_cfg)
+    fo = RF.FullObs()
+    gen = torch.Generator().manual_seed(int(seed))
+    rtg = lambda: great_circle_km(float(env.x[1]), float(env.x[2]), spec["target_phi"], spec["target_lam"])
+    O, RAW, LP, R = [], [], [], []
+    u_prev, done, info = 0.0, False, {}
+    while not done:
+        o = fo(env, physical_state(env))
+        with torch.no_grad():
+            a, raw, lp = actor.sample(o[None], gen)
+        a0 = float(a[0])
+        cmd = a0 * SIGMA_MAX_RAD
+        phi0 = -rtg()
+        gmax = 0.0
+        for _ in range(int(c.dt_s)):
+            _, _, term, trunc, info = env.step(np.array([a0], dtype=np.float32))
+            y = physical_state(env)
+            gmax = max(gmax, math.hypot(float(y[8]), float(y[9])) / G0)
+            if term or trunc:
+                done = True
+                break
+        crossed = done and str(info.get("outcome")) == "drogue"
+        r = -c.w_smooth_km_per_rad * abs(cmd - u_prev) - c.w_g_km * max(0.0, gmax - c.g_limit) ** 2
+        if not crossed:
+            r -= c.w_gamma_km_per_deg2 * max(0.0, abs(math.degrees(float(env.x[4]))) - c.gamma_limit_deg) ** 2
+        if done:
+            r += -rtg() - (0.0 if crossed else c.nocross_km)
+        if c.shaping:
+            r += c.gamma_rl * (0.0 if done else -rtg()) - phi0
+        O.append(o)
+        RAW.append(raw[0])
+        LP.append(lp[0])
+        R.append(r * c.reward_scale)
+        u_prev = cmd
+    miss = rtg()
+    return {"obs": torch.stack(O), "raw": torch.stack(RAW), "lp": torch.stack(LP),
+            "r": torch.tensor(R, dtype=torch.float32), "miss_km": miss, "crossed": bool(crossed),
+            "success_5km": bool(crossed and miss < 5.0), "ep_return": float(sum(R)), "outcome": str(info.get("outcome"))}
+
+
+def ppo_full_train(L, d: Path, cfg: RLCfg, device, label: str, log=print, stage: str = "rl_train") -> dict:
+    """
+    PPO in the full simulator for cfg.full_episodes episodes. Every update collects cfg.full_per_update complete
+    episodes (in a process pool, each with its own noise stream), so a checkpoint never cuts an episode and a
+    resumed run continues exactly. Resumable from d/train_state.pt; writes d/policy.pt.
+    """
+    import multiprocessing as mp
+    import zlib
+    dev = torch.device(device)
+    torch.manual_seed(cfg.seed)
+    actor = Actor(hidden=cfg.hidden, kind="gauss").to(dev)
+    vf = critic(hidden=cfg.hidden).to(dev)
+    opt = torch.optim.Adam(list(actor.parameters()) + list(vf.parameters()), lr=cfg.lr, eps=1e-5)
+    gen = torch.Generator(device=dev).manual_seed(cfg.seed * 7 + 13)
+    specs = full_episode_specs(cfg.full_episodes, cfg.seed + 5000)
+    curve, step, update, n_ep, elapsed = Curve(), 0, 0, 0, 0.0
+    st = load_state(d / "train_state.pt", log)
+    if st is not None:
+        actor.load_state_dict(st["actor"])
+        vf.load_state_dict(st["critic"])
+        opt.load_state_dict(st["opt"])
+        step, update, n_ep, elapsed, curve = st["step"], st["update"], st["episodes"], st["elapsed"], Curve(st["curve"])
+        set_rng_state(st["rng"], {"gen": gen})
+        log(f"  [{label}] resumed at update {update} ({n_ep} episodes)")
+    fast_cfg = asdict(RF.FastEnvCfg(n_envs=1, gamma_rl=cfg.gamma))
+    workers = int(cfg.full_workers or os.cpu_count() or 1)
+    pool = mp.get_context("spawn").Pool(workers) if workers > 1 else None
+    t_save, t0 = time.time(), time.time()
+
+    def save():
+        save_state(L, {"actor": actor.state_dict(), "critic": vf.state_dict(), "opt": opt.state_dict(),
+                       "step": step, "update": update, "episodes": n_ep, "elapsed": elapsed, "curve": curve.state(),
+                       "rng": rng_state({"gen": gen}), "cfg": asdict(cfg)}, d / "train_state.pt")
+        _write_curve(L, d, curve, label)
+
+    try:
+        while n_ep < cfg.full_episodes and elapsed + (time.time() - t0) < cfg.budget_hours * 3600:
+            batch = specs[n_ep:n_ep + cfg.full_per_update]
+            sd = {k: v.detach().cpu() for k, v in actor.state_dict().items()}
+            args = [(actor.hparams, sd, sp, zlib.crc32(f"ppo_matched|{cfg.seed}|{n_ep + i}".encode()), fast_cfg)
+                    for i, sp in enumerate(batch)]
+            res = pool.map(_full_episode, args) if pool is not None else [_full_episode(a) for a in args]
+            O = torch.cat([r["obs"] for r in res]).to(dev)
+            actor.norm.update(O)
+            ADV, RET = [], []
+            with torch.no_grad():
+                for r in res:
+                    v = vf(actor.norm(r["obs"].to(dev))).squeeze(-1)
+                    rr = r["r"].to(dev)
+                    adv = torch.zeros_like(rr)
+                    last = torch.zeros((), device=dev)
+                    for k in reversed(range(len(rr))):
+                        nxt = v[k + 1] if k + 1 < len(rr) else torch.zeros((), device=dev)
+                        delta = rr[k] + cfg.gamma * nxt - v[k]
+                        last = delta + cfg.gamma * cfg.gae_lambda * last
+                        adv[k] = last
+                    ADV.append(adv)
+                    RET.append(adv + v)
+            _ppo_update(actor, vf, opt, cfg, gen, None, False, O, torch.cat([r["raw"] for r in res]).to(dev),
+                        torch.cat([r["lp"] for r in res]).to(dev), torch.cat(ADV), torch.cat(RET))
+            n_ep += len(batch)
+            step += int(len(O))
+            update += 1
+            for r in res:
+                curve.ret += r["ep_return"]
+                curve.succ += int(r["success_5km"])
+                curve.miss += min(r["miss_km"], 5000.0)
+                curve.n += 1
+            curve.flush(step, update, elapsed + time.time() - t0, episodes=n_ep)
+            rw = curve.rows[-1]
+            log(f"  [{label}] update {update}: {n_ep}/{cfg.full_episodes} episodes, return {rw['ep_return']:.3f} "
+                f"success@5km {rw['success_5km_fast']:.3f} ({(elapsed + time.time() - t0) / 60:.1f} min)")
+            due = time.time() - t_save > cfg.save_every_s or (cfg.save_every_updates and update % cfg.save_every_updates == 0)
+            if due:
+                elapsed += time.time() - t0
+                t0 = time.time()
+                save()
+                t_save = time.time()
+                fail_point(stage, update)
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
+    elapsed += time.time() - t0
+    t0 = time.time()
+    save()
+    save_policy(L, d / "policy.pt", actor, {"label": label, "decisions": step, "updates": update, "episodes": n_ep,
+                                            "train_s": round(elapsed, 1), "cfg": asdict(cfg)})
+    return {"decisions": step, "updates": update, "episodes": n_ep, "train_s": round(elapsed, 1)}
 
 
 @torch.no_grad()
@@ -784,6 +998,42 @@ def fast_success(policy: Actor, n_episodes: int = 512, seed: int = 12345, device
             succ += int(info["success_5km"][done].sum())
             miss += info["miss_km"][done].cpu().tolist()
     return {"episodes": n, "success_5km_fast": succ / n, "miss_km_fast_median": float(np.median(miss))}
+
+
+def fast_success_on(policy: Actor, conds: Sequence[dict], device="cpu") -> dict:
+    """
+    success@5km of a policy in the fast env on given conditions (entry state, truth parameters and the target of
+    each condition's config): the fast side of the fast-vs-full gap on the same cases as the full-simulator flights.
+    """
+    sim = Path(__file__).resolve().parents[1]
+    n = len(conds)
+    env = RF.FastEntryEnv(RF.FastEnvCfg(n_envs=n, seed=0, pool=n), device)
+    f64 = dict(dtype=torch.float64, device=env.dev)
+    x0 = env._x_from_ic([c["ic"] for c in conds])
+    dom = torch.as_tensor([[c["domain"]["density_scale"], c["domain"]["lift_scale"], c["domain"]["mass_scale"]]
+                           for c in conds], **f64)
+    tg = []
+    for c in conds:
+        m = json.loads((sim / (c.get("config_path") or "configs/default.json")).read_text())["mission"]
+        tg.append([math.radians(m["target_phi_deg"]), math.radians(m["target_lambda_deg"])])
+    tg = torch.as_tensor(tg, **f64)
+    env._pool = {"x0": x0, "S_ref": env.area0 * dom[:, 0], "mass": env.mass0 * dom[:, 2], "ls": dom[:, 1],
+                 "phi_t": tg[:, 0], "lam_t": tg[:, 1], "dom": dom}
+    env._pool_i = 0
+    env.reset_rows(torch.arange(n, device=env.dev))
+    obs = env.obs()
+    first = np.zeros(n, dtype=bool)
+    succ, miss = np.zeros(n, dtype=bool), np.full(n, np.nan)
+    with torch.no_grad():
+        while not first.all():
+            obs, _, done, info = env.step(policy.deterministic(obs.to(device)))
+            d = done.cpu().numpy() & ~first
+            if d.any():
+                succ[d] = info["success_5km"].cpu().numpy()[d]
+                miss[d] = info["miss_km"].cpu().numpy()[d]
+                first |= d
+    return {"n": n, "success_5km_fast": float(succ.mean()), "miss_km_fast_median": float(np.nanmedian(miss)),
+            "success_by_case": succ.astype(int).tolist()}
 
 
 # ============================================================================
