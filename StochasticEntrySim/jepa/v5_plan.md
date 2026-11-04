@@ -664,10 +664,272 @@ wide dataset, `v3_smoke/`, `v4_smoke/`; build them with `smoke_v4.py` first if t
 
 ## 14. Implementation notes
 
-(empty until built)
+Built 2026-11-03/04 on branch `space-jepa5` (commits 981c7c1 and the one that adds this section).
+Everything below is a choice the plan left open; forced changes are in §15.
+
+**Benchmark (`configs/benchmark_v5/`, `jepa/benchmark_v5.py`).**
+
+* ORB-1 footprint (S0, nominal EI, full simulator, constant command): 0° bank lands at 3,379.2 km
+  (peak 2.46 g, 749 s); 90° bank ends at 2,273.3 km by the simulator's |cos γ| < 0.05 gate (peak 9.4 g,
+  438 s), used as the near edge. Targets at 25/50/75 %: **2,549.8, 2,826.2, 3,102.7 km** (rounded to
+  0.1 km; `orb1_target{0,1,2}.json`).
+* Feasibility (constant bank, true parameters): 1,002/1,002, 999/999 and 999/999 per target (S0's
+  ≥ 97 % holds). At ≤ 4.5 g with constant bank (`feasible_4p5g`; the largest constant bank under
+  4.5 g is about 60°): **only 27/1,002 for target 0**, 999/999 for targets 1 and 2. Whether the arms reach target 0
+  under 4.5 g with their modulated bank histories is part of what ORB-1 measures; the 4.5 g
+  constant-bank flag is stored per case and not used as a filter. **Open for the user** (see the
+  building session's summary): keep target 0 as is, or move it.
+* ORB-1 truth knobs: drag ∝ ρ·S·C_D and lift ∝ ρ·S·C_L map exactly onto `data.apply_domain`
+  (`density_scale = ρ·c_D`, `lift_scale = c_L/c_D`, `mass_scale = m`); smoke check 1 proves it on the
+  simulator's own aero (100 draws, relative error < 1e-12).
+* Draw order per case: FPA, azimuth, speed, mass, density, C_D, C_L, each a 3σ-truncated normal by
+  rejection, one `default_rng(20261103)` stream; case i uses training seed i mod 5.
+* DEV48: `testset_v3`'s candidate filter, Sobol seed 20261104, A256's Sobol indices skipped, 12 cases ×
+  4 atmospheres. Files are written with `%.6f` floats and LF line endings (`.gitattributes -text`), so
+  the SHA-256 sums hold on Windows and Linux checkouts.
+
+**FNPEG (`jepa/guidance_fnpeg.py`).** Lu (2014) as in the module docstring. Choices:
+
+* Predictor: `physics_v4`'s longitudinal port of the simulator (non-rotating Earth, the simulator's
+  atmosphere table and trim schedule), RK4 at `dt_s = 2 s` (tuned in {1, 2}), float64 numpy,
+  vectorized over every prediction of a corrector round across flights; the bank follows the profile
+  through the 20°/s rate limit inside the prediction.
+* σ profile: constant (σ_f = σ0) by default; linear in energy when tuning draws a σ_f.
+* `Vf = 150 m/s` until `03_tuning/fnpeg/vf.json` (median drogue speed of DEV48 classical flights)
+  replaces it; tuning reads it before drawing configurations.
+* Lateral deadband `1° + 5.2e-4 °/(m/s) · V` (1° at rest, 5° at 7,700 m/s), tuned.
+* Load relief: Lu's Eqs. 36–41 inside every prediction and once on navigation data; δ = 0.02, k0 = 100
+  (nondimensional), amax 4.5 g with a 0.1 g margin.
+* Filters: fading memory, β = 0.9 at 1 Hz, on from 0.05 g; `fnpeg_oracle` gets the true K_D, K_L.
+* Guidance cycle 1 Hz while the aerodynamic acceleration ≥ 1.52 m/s² (Lu), command held below it and
+  for the last 10 s of predicted time to go.
+* Corrector: Newton with a finite-difference first step (1°), secant after, step halving (≤ 5), at most 8
+  iterations, stop on |z| ≤ 50 m or Eq. 23 with ε = 5 km²/rad.
+
+**PredGuid (`jepa/guidance_predguid.py`).** Bairstow (2006) App. B, every Table B.4/B.7 constant except:
+`GMAX = 4.5 g`; vehicle constants from our capsule (LAD = 0.28, C_D estimate 1.55, mass and area);
+non-rotating Earth (WIE = 0). Guidance cycle 2 s (Apollo). Final-phase design (§5.5) per flight from
+its own entry state with nominal parameters (A256/DEV48) or from ORB-1's nominal EI (ORB-1, the
+mission's preflight design), cached per (IC, target, config). LOD by root finding (Bairstow's fixed
+0.6·LAD available as `lod_fixed_frac`). Up-control: low-loft variant (B.50–B.53).
+
+**Tuning ranges (§4.5; random search, seed 20261104, configuration 0 = the defaults).**
+
+| Method | Ranges |
+|---|---|
+| FNPEG (24) | σ_f: none (25 %) or U(20°, 80°); deadband c0 U(0.5°, 3°), c1 U(2e-4, 1e-3) °/(m/s); δ U(0.01, 0.04); k0 logU(50, 200); β U(0.8, 0.97); RK4 step {1, 2} s |
+| PredGuid (24) | LATBIAS U(0.2, 0.8); KLAT logU(0.006, 0.025); KA U(45, 85); Q7F U(3, 9); Q19 U(0.1, 0.4); overcontrol U(2, 6); K_ρ filter gain U(0.02, 0.10); GMAX U(4.2, 4.5) g |
+| ppo_hist (6) | lr logU(1e-4, 1e-3); n_steps {32, 64, 128}; entropy {0, 1e-3, 1e-2}; GAE λ U(0.9, 0.98); clip {0.1, 0.2, 0.3} |
+| bcppo_fnpeg (4) | lr logU(1e-5, 1e-4); KL coefficient logU(0.01, 1); critic warm-up {10, 20, 50} updates |
+| dagger_fnpeg (4) | lr logU(1e-4, 3e-3); epochs {20, 30, 50}; hidden {256², 512²} |
+| sac_hist (4, Tier 2) | lr logU(1e-4, 1e-3); τ {0.005, 0.01}; batch {512, 1024, 2048} |
+
+Objective as §4.5 (success@5km, then mean log miss, mean peak g ≤ 4.6 g; if none qualifies, the
+lowest mean peak g). RL tuning runs at 10 % of the budget on the fast env and is scored by DEV48
+full-simulator flights; RL tuning starts only once FNPEG is chosen (the expert of two methods).
+Untuned guidance flights are never written as test flights (`untuned` jobs wait).
+
+**E3 models (`jepa/models_v5.py`).** Each arm's width is the one whose parameter count is closest to
+R0's (bisection): R0 has 2,454,531 parameters; `mlp_direct` 4 hidden layers of width 831 over the flattened 120 s window (2,454,781, +0.01 %), `gru_direct` 2-layer GRU, hidden 449 (2,454,690, +0.01 %), `gru_pi` 2-layer GRU, hidden 441, with v2's state-aware PI prober (hidden 128) (2,455,767, +0.05 %), `r0_nojepa` = R0 (2,454,531). Training: R0's recipe (36,000 steps, batch 256, AdamW lr 6e-4 → 2e-5
+cosine, 1,000 warm-up, weight decay 0.05, clip 1, curriculum 24/48/96 steps at 0/20/50 %, AMP), free-running
+rollouts (no teacher forcing), loss = the prober's pseudo-Huber state loss + v2's force term at weight 1 (PI
+models: the force vector; direct models: its magnitude, the g-load the planner uses); learning rate ×
+{1, 0.3, 3} chosen on seed 0 by a 10 % pilot's validation open-loop state loss (horizon 96). `r0_nojepa` =
+R0's architecture exactly (WorldModelV2 + PIProberV2, one member) trained on the prober's state loss only:
+no latent prediction loss, no SIGReg; saved as a v2 checkpoint, flown by v4's V2 adapter.
+
+**RL (`jepa/rl_v5.py`, `jepa/rlenv_fast_v5.py`).**
+
+* Fast env: `physics_v4`'s truth model, float64, 5 s decisions in (2, 2, 1) s Euler substeps, bit-exact
+  to `rollout_physics` (smoke check 6). Targets on each episode's own footprint (15–85 % of the
+  90°-to-0° range, ±60 km crossrange). The observation's heat-rate margin uses Sutton–Graves only (the
+  full simulator's interval bound adds a radiative term; the fast-vs-full gap is reported per arm).
+* Reward: MPPI's full realized cost including its |γ| > 82° penalty (2 km/deg²) and −3,000 km for a
+  flight that never reaches the drogue altitude, × 0.01, plus Φ = −range-to-go shaping.
+* Policy: MLP 256-256 with a running observation normalizer. DAgger and BC → PPO: "magsign" head
+  (|σ| Gaussian on a sigmoid mean, sign Bernoulli), so reversals are not averaged away; PPO: Gaussian on
+  σ (tanh MLP); SAC: tanh-squashed Gaussian (ReLU MLP).
+* DAgger expert = FNPEG on the fast env's flights at 5 s decisions, filters at β^5.
+* `ppo_matched`: PPO in the full simulator, complete episodes per update (50), the world models' 6,000
+  episodes.
+* Fast-env evaluation (`fast_eval.json`): the training distribution (2,048 episodes) and the A256 cases
+  in the fast env, for R-gap.
+
+**Analysis (`jepa/analyze_v5.py`).** v4's hierarchical bootstrap (seeds, then cases) and cache; R0's
+flights are v4's (E0b-corrected); R-each pairs RL seeds 0–2 with R0 seeds 0–2; Holm as §8; `met`
+requires p_Holm < 0.05 and the seed rule; J-mech uses 300 s to go (the longest available if 300 s is
+missing). ORB-1 Q1/Q2 per arm with Clopper–Pearson (90 %), Q3 by a stratified paired bootstrap over
+cases. Landing errors are drawn in the nominal entry frame (downrange/crossrange of the nominal EI).
+
+**Throughput (smoke).** Measured on this laptop's CPU (12 logical cores) in two smoke studies: the
+first (check 10's study) while four smoke processes ran in parallel, the second (check 14's study,
+same jobs) with two. Both are pessimistic, and smoke models are tiny, so the E3/v2 rows say nothing
+about full-size GPU cost. Colab's real rates are measured by the status cell on the first 20 flights
+of each arm type.
+
+| Arm type | Smoke flights (1st / 2nd study) | Wall s per flight, median (1st / 2nd) | ms per decision in the flight, median (1st / 2nd) |
+|---|---|---|---|
+| classical | 5 / 5 | 166 / 153 | 325 / 298 |
+| FNPEG (batches of 4) | 23 / 17 | 300 / 255 | 163 / 115 |
+| PredGuid (batches of 4) | 19 / 17 | 96 / 85 | 1.0 / 0.56 |
+| MPPI + filtered physics (32 samples, smoke) | 17 / 17 | 350 / 390 | 371 / 315 |
+| MPPI + v2 (tiny, smoke) | 33 / 33 | 270 / 185 | 162 / 146 |
+| MPPI + E3 models (tiny, smoke) | 48 / 48 | 257 / 91 | 101 / 52 |
+| RL policy (new arms) | 45 / 45 | 96 / 55 | 1.6 / 0.69 |
+| legacy RL (SB3, 1 Hz) | 10 / 10 | 40 / 41 | 1.6 / 1.2 |
+
+Single flight, single thread (`01_checks/compute_per_decision.csv`, smoke): FNPEG 630 ms median per
+decision (p99 1,132), PredGuid 1.5 ms, classical 393 ms, RL policies 0.2–0.3 ms.
+
+FNPEG's cost is Python/numpy overhead in the RK4 predictor (thousands of small array operations per
+corrector round), so it falls per flight when flights are batched (`guidance_batch = 16` in the study);
+the fast env runs about 26,000 environment-steps/s on the CPU with 1,000 environments. DAgger and BC
+with the FNPEG expert dominate the RL smoke time: the expert labels every visited state.
+
+**Smoke test output** (`python jepa/smoke_v5.py`, 2026-11-04). The checks ran as several
+`--only` invocations in parallel on the laptop (checks 1–4, 7, 8, 11 in one; 5, 6 in one; the notebook
+study with 9, 10, 13, 15 in one; 14 in one), and checks 10, 11 and 15 again after their fixes. Each
+line below is the latest result of its check; the 12 checks (bit-exact resume) are inside 5, 6 and 14.
+
+```
+1. suites
+  [PASS] frozen suites verify against SHA256SUMS (10 files)
+  [PASS] ORB-1 regenerated (first 12 cases, footprints flown again) == the frozen ORB1.csv bytes (35s)
+  [PASS] DEV48 regenerated == the frozen DEV48.csv bytes (102s)
+  [PASS] a changed benchmark file fails the checksum
+  [PASS] ORB-1 knobs reproduce the dispersed drag and lift (100 draws, simulator aero) (max relative error 4.4e-16)
+
+2. FNPEG
+  [PASS] predictor = truth: lands < 1 km (misses [0.505, 0.759] km, 824s for 4 flights)
+  [PASS] batched == unbatched (results and telemetry bit-identical)
+  [PASS] load relief at amax 3 g keeps the peak under 3.15 g (peak 3.13 g, miss 0.43 km)
+  [PASS] filters converge to the true drag scale (within 3%, 150 s after 0.05 g; gate V3's rule) (K_D 1.1200 vs true 1.1200)
+
+3. PredGuid
+  [PASS] phase sequences logged and starting with the initial roll (case 30: initial_roll-ballistic-final; case 51: initial_roll-ballistic-final; misses [1.95, 0.91] km, 107s)
+  [PASS] final-phase reference and gain design reproducible (1575.5 km ref)
+
+4. mppi_filtered frozen == mppi_nominal; v5 runner == run_lockstep_v4 (E0)
+  [PASS] mppi_filtered (filters frozen at 1) == mppi_nominal (2/2 flights identical)
+  [PASS] v5 runner == run_lockstep_v4 (physics_nominal) (2/2 flights identical)
+  [PASS] v5 runner == run_lockstep_v4 (v2) (2/2 flights identical)
+  [PASS] E0 gate passes (997s)
+
+5. E3 models: full size, a few steps, save, resume (12: bit-exact; 13: truncated train state)
+  [PASS] every E3 model at full size within ±10% of R0's parameters (R0 2,454,531; mlp_direct 2,454,781 (+0.01%), gru_direct 2,454,690 (+0.01%), gru_pi 2,455,767 (+0.05%), r0_nojepa 2,454,531 (+0.00%))
+  [PASS] 12. mlp_direct: killed after the step-3 checkpoint, resumed == uninterrupted (weights True, history True; 25s per run)
+  [PASS] 12. gru_direct: killed after the step-3 checkpoint, resumed == uninterrupted (weights True, history True; 22s per run)
+  [PASS] 12. gru_pi: killed after the step-3 checkpoint, resumed == uninterrupted (weights True, history True; 27s per run)
+  [PASS] 12. r0_nojepa: killed after the step-3 checkpoint, resumed == uninterrupted (weights True, history True; 12s per run)
+  [PASS] 13. truncated newest train state: resumes from .prev (logged) and ends identical (weights True, history True)
+
+6. fast env and RL methods (12: checkpoint/resume bit-exact)
+  [PASS] fast env == physics_v4.rollout_physics for the same commands (max |diff| 0.0e+00)
+  [PASS] a random policy runs 10,000 batched steps (0.4s, 26033 steps/s on the CPU, 0 episodes ended)
+  [PASS] 12. ppo_hist: runs, checkpoints, killed and resumed == uninterrupted (weights True, optimizer True, curve True; 10s per run)
+  [PASS] 12. sac_hist: runs, checkpoints, killed and resumed == uninterrupted (weights True, optimizer True, curve True; 26s per run)
+  [PASS] 12. SAC replay buffer saved as append-only shards (4 shards)
+  [PASS] 12. dagger_fnpeg: runs, checkpoints, killed and resumed == uninterrupted (weights True, optimizer True, curve True; 170s per run)
+  [PASS] 12. bcppo_fnpeg: runs, checkpoints, killed and resumed == uninterrupted (weights True, optimizer True, curve True; 138s per run)
+  [PASS] ppo_matched: runs, checkpoints, killed and resumed == uninterrupted (weights True, optimizer True, curve True; 72s per run)
+
+7. legacy RL
+  [PASS] the dummy SB3 zip is found by the inventory (and the checkpoint listed) (3 rows: {'final model': 1, 'checkpoints': 1, 'not found': 1})
+  [PASS] the legacy policy is flown with its own settings (1 Hz, rl_env's observation) (['HELD256', 'HELD256'], misses [357.3, 592.4] km)
+
+8. job queue
+  [PASS] finished flight skipped, deleted flight re-flown
+  [PASS] ORB-1 stopping rule from files: 1 miss > 10 km keeps the arm, 2 stop it (eligible; stopped: 2 flights of earlier blocks missed 10 km (failed Q1))
+  [PASS] ORB-1 block 2 waits until block 1 is complete (waits for 3 flights of earlier blocks)
+
+9. analysis and report on the smoke data
+  [PASS] every table T01-T12 (missing [])
+  [PASS] every figure F01-F10 as PNG and PDF (missing [])
+  [PASS] every table and figure has a caption and a data source
+  [PASS] criteria table complete (G1-G7, J-each/equiv/mech, R-each/imit/gap, Q1-Q3) (32 rows; missing []; not run: ['G7a', 'G7b', 'G7c'])
+  [PASS] bootstrap cache reused on a forced rerun (no recomputation) (120 reused)
+  [PASS] an unforced rerun with unchanged inputs skips the analysis
+  [PASS] report written by the notebook (1448 kB)
+  [PASS] report builds with matplotlib's DejaVu (no system fonts)
+
+10. v5 refuses to write under the v3, v4, data and legacy RL folders
+  [PASS] write into the data folder refused
+  [PASS] write into the v3 folder refused
+  [PASS] write into the v4 folder refused
+  [PASS] write into the legacy folder refused
+  [PASS] write to outside every folder refused
+  [PASS] write to a path escaping the v5 folder refused
+  [PASS] write to a Windows extended-length path inside v3 refused
+  [PASS] a flight id escaping the results folder refused
+  [PASS] an extended-length path inside the v5 folder is accepted (Windows guard fix)
+
+10. the notebook in smoke mode (first run = the whole smoke study)
+  [PASS] notebook run 1 ends without error (109.3 min)
+  [PASS] notebook run 2 ends without error (36s)
+  [PASS] run 2 finds everything done in under a minute (36s)
+  [PASS] run 2: no flight flown, no model trained (9 queues checked)
+  [PASS] v3, v4 and legacy folders untouched by the whole smoke study
+
+10. the notebook in smoke mode, rerun on the same study after the check 15 fixes (--keep)
+  [PASS] notebook rerun on the kept smoke study ends without error (56s)
+  [PASS] notebook run 2 ends without error (57s)
+  [PASS] run 2 finds everything done in under a minute (57s)
+  [PASS] run 2: no flight flown, no model trained (9 queues checked)
+  [PASS] v3, v4 and legacy folders untouched by the whole smoke study
+
+11. v3 and v4 code, plans and notebooks unchanged
+  [PASS] v3/v4 modules, plans, simulator and the v4 notebook identical to the v4 commit (changed: [])
+  [PASS] the v4 notebook builder still writes the committed notebook byte for byte
+  [PASS] the v3 builder reproduces the cells of the 5 committed v3 notebooks (differ: []; saved from Colab by the user, checked by git diff only: ['ReEntryAI_JEPA_v3_3_analyze.ipynb'])
+
+13. interrupted writes: Setup repairs each case and the rerun ends with the same outputs
+  [PASS] repair: stale .tmp deleted, corrupt flight JSON deleted, .done with a missing artifact removed ({'tmp_deleted': 1, 'json_deleted': 1, 'done_removed': 1, 'files_seen': 777, 'sec': 0.2})
+  [PASS] the rerun re-flies the corrupt flight, recomputes E0, and every flight equals the untouched run's (200/200 identical, 620s; differing [])
+
+14. simulated disconnects in the notebook's long stages, then an unchanged rerun
+  [FAIL] each forced failure stopped the run (simulated disconnect) ([('cpu_flights:3', True, 186), ('rl_train:1', False, 1139) <- hung launch, killed by hand, ('mppi_flights:2', True, 4652), ('e3_train:4', True, 1221), ('mppi_flights:1', True, 383), ('rl_train:1', True, 1674), ('cpu_flights:2', True, 434)])
+  [PASS] the unchanged rerun completes (16.9 min)
+  [PASS] finished flights keep their modification times (187 flights before the rerun)
+  [PASS] every flight equals the uninterrupted run's (bit-exact on CPU) (200/200 identical; differing []; only in one run [])
+  [PASS] every trained model and policy equals the uninterrupted run's (bit-exact on CPU) (19/19 identical; differing [])
+
+15. outputs in the smoke study folder
+  [PASS] status.json, status_history.csv, README, frozen config, captions, report, inventory, timing (missing [])
+  [PASS] status history appended by every run (8 rows)
+  [PASS] a log per stage in 00_study/logs/ (missing [])
+  [PASS] curves of every trained model and policy (missing [])
+  [PASS] tables and figures (PNG and PDF) on disk (14 tables, (10, 10) figures)
+
+75 PASS, 1 FAIL
+```
+
+The one FAIL is the second of check 14's seven launches (`rl_train:1`, right after the `cpu_flights:3`
+launch): it never started a kernel and sat for 19 min until it was killed by hand, so its forced failure
+never fired. The other six forced failures stopped the notebook where intended, and the unchanged rerun
+after them completed and matched the uninterrupted study bit for bit (200/200 flights, 19/19 models),
+so resume is unaffected. The cause was not found: later kernel kills, including one with a live CPU pool
+(`cpu_flights:2`), did not hang. The harness now gives the kernel a 180 s start timeout and kills a
+launch that writes nothing for 25 min (recorded in `notes.stalled_runs`). A rerun
+of the same two launches on a fresh study with the final harness (2026-11-04) did not hang: both forced
+failures fired (49 s and 1,280 s), with no stall.
 
 ---
 
 ## 15. Deviations
 
-(none yet)
+* **2026-11-03, FNPEG and PredGuid: wings level when |γ| > 30°.** The simulator ends a flight when
+  |cos γ| < 0.05 (γ steeper than about 87°). Late in a flight both published laws can still command
+  large banks while the path steepens, and the flight then ends at that gate short of the drogue
+  altitude. The classical controller already has this override (`gamma_safe`), so both laws get the same
+  rule: σ = 0 once |γ| > 30° (`gamma_safe_deg = 30`, in flight and inside both predictors and
+  PredGuid's reference trajectory). It acts only in the steep terminal descent; `None` turns it off.
+* **2026-11-03, PredGuid: `VFINAL` = 29,000 fps (Bairstow: 25,000 fps).** At 0.05 g Apollo's initial-roll
+  logic (B.18) sends an entry still faster than `VFINAL` into Huntest, the lunar-return lofting logic, and
+  a slower one straight to the final phase. Our entries start at 24,400-27,600 fps (A256) and at
+  25,011 fps (ORB-1's 7,623.5 m/s), so with Bairstow's value the branch would flip from case to case
+  across the middle of both suites. With 29,000 fps every LEO entry flies initial roll → final, the
+  branch Apollo's guidance takes for entries below lunar-return speed (Putnam).
+* **2026-11-04, smoke check 11 (not a study change).** The committed `ReEntryAI_JEPA_v3_3_analyze.ipynb`
+  is the copy the user saved from Colab (commit c747b92, "Created using Colab", an extra `%pip install`
+  cell), so the v3 builder cannot reproduce it cell for cell. The check compares it by `git diff`
+  against the v4 commit (unchanged) and rebuilds the other four v3 notebooks exactly.
