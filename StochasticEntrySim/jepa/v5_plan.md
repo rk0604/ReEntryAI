@@ -41,7 +41,7 @@ their code and conventions (v4 §11) unless this file says otherwise.
 |---|---|---|---|
 | D1 | Compute tier to build and run (§4.9) | **decided by the user (2026-11-03): Tier 1 (core) first, Tier 2 only after the user has read Tier 1's results.** The notebook's default settings run Tier 1 only | (rejected: a leaner Tier 1) |
 | D2 | Bank authority for the published guidance laws | 90° (the same handle every learned controller has); 180° versions as exploratory arms | 180° as primary (unfair to the learned arms, whose training data never exceeds 90°) |
-| D3 | Standard scenario ORB-1 (§3.2) | Lu (2014) CEV orbital entry state, adapted (γ0 = −1.40°, targets at 25/50/75% of footprint), Bairstow (2006) dispersions, Orion EM-1 accuracy requirement | Lu's exact 3,769 km range (infeasible in our simulator at a 90° bank limit, see §1.3) |
+| D3 | Standard scenario ORB-1 (§3.2) | Lu (2014) CEV orbital entry state, adapted (γ0 = −1.40°, targets at 25/50/75% of footprint), Bairstow (2006) dispersions, Orion EM-1 accuracy requirement. **Target 0 kept by the user (2026-11-04)** although only 27/1,002 cases reach it at constant bank under 4.5 g (§14) | Lu's exact 3,769 km range (infeasible in our simulator at a 90° bank limit, see §1.3) |
 | D4 | EI speed dispersion for ORB-1 | 15 m/s (3σ), our choice: no published LEO value was found | another value the user has a source for |
 | D5 | Density-shear suite (needs a simulator hook) | out | in, as Tier 3, with an explicit `configs/`-free hook |
 
@@ -677,8 +677,8 @@ Everything below is a choice the plan left open; forced changes are in §15.
   ≥ 97 % holds). At ≤ 4.5 g with constant bank (`feasible_4p5g`; the largest constant bank under
   4.5 g is about 60°): **only 27/1,002 for target 0**, 999/999 for targets 1 and 2. Whether the arms reach target 0
   under 4.5 g with their modulated bank histories is part of what ORB-1 measures; the 4.5 g
-  constant-bank flag is stored per case and not used as a filter. **Open for the user** (see the
-  building session's summary): keep target 0 as is, or move it.
+  constant-bank flag is stored per case and not used as a filter. **User decision 2026-11-04: keep
+  target 0 as frozen** (the benchmark files and checksums are unchanged).
 * ORB-1 truth knobs: drag ∝ ρ·S·C_D and lift ∝ ρ·S·C_L map exactly onto `data.apply_domain`
   (`density_scale = ρ·c_D`, `lift_scale = c_L/c_D`, `mass_scale = m`); smoke check 1 proves it on the
   simulator's own aero (100 draws, relative error < 1e-12).
