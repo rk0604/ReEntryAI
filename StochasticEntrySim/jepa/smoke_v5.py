@@ -499,6 +499,30 @@ def t8_queue(tmp: Path, L3) -> None:
     Lw = S5.LayoutV5(tmp / "orb_wait").make()
     ok, why = S5.orb1_eligible_files(c3, Lw, L3, "predguid", 1, by_block)
     check("ORB-1 block 2 waits until block 1 is complete", not ok and "waits" in why, f"({why})")
+    # tuning round 2: drawn only once round 1 is scored, around its best, inside the ranges, the same on a rerun
+    full = S5.StudyConfigV5()
+    Lt = S5.LayoutV5(tmp / "tune_plan").make()
+    n1, n2 = full.tune_n, full.tune_refine_n
+    before = S5.guidance_tune_plan(full, Lt, "fnpeg", S5.FNPEG_SPACE)
+    for j, _rnd, c in before:
+        Lt.write_json(Lt.tuning / "fnpeg" / f"config_{j:02d}.json",
+                      {"method": "fnpeg", "config_index": j, "config": dict(c), "sampled": c,
+                       "score": {"success_5km": 0.9 if j == 7 else 0.5, "mean_log_miss": 0.0, "mean_peak_g": 4.0}})
+    after = S5.guidance_tune_plan(full, Lt, "fnpeg", S5.FNPEG_SPACE)
+    again = S5.guidance_tune_plan(full, Lt, "fnpeg", S5.FNPEG_SPACE)
+    doc = json.loads((Lt.tuning / "fnpeg" / "refine.json").read_text())
+    best = before[7][2]
+    near = all(abs(c["deadband_c0_deg"] - best["deadband_c0_deg"]) <= 0.25 * 2.5 + 1e-9 and 0.5 <= c["deadband_c0_deg"] <= 3.0
+               and c["dt_s"] in (1.0, 2.0) for _, r, c in after if r == 2)
+    check("tuning round 2: drawn once round 1 is scored, around its best, recorded, identical on a rerun",
+          len(before) == n1 and len(after) == n1 + n2 and after == again and doc["center_config_index"] == 7 and near,
+          f"({len(before)} then {len(after)} configurations; center = configuration {doc['center_config_index']})")
+    st = full.stages()
+    gj = S5.gate_jobs(full, Lt)
+    check("Tier 1 flies the 180° and oracle arms; gates V1-V4 fly DEV48 only; RL tuning uses 12 configurations",
+          st["explore"] and not st["ORB1_more"] and {j["suite"] for v in gj.values() for j in v} == {"DEV48"}
+          and len(gj["V1"]) == 12 and all(v == 12 for v in full.rl_tune_n.values()),
+          f"({len(gj['V1'])} V1 flights on {sorted({j['suite'] for j in gj['V1']})})")
 
 
 # ============================================================================
@@ -663,19 +687,29 @@ def t9_analysis(root: Path, fx: dict) -> None:
     t05 = pd.read_csv(next(L.tables.glob("T05_*.csv")))
     ids = ["G1", "G2", "G3", "G4", "G5", "G6", "G7a", "G7b", "G7c", "J-mlp_direct", "J-gru_direct", "J-gru_pi",
            "J-r0_nojepa", "J-equiv", "J-mech", "R-dagger_fnpeg", "R-bcppo_fnpeg", "R-ppo_hist", "R-imit", "R-gap",
-           "Q3a", "Q3b"]
+           "Q3a", "Q3b", "Q3a-sens", "Q3b-sens"]
     check("criteria table complete (G1-G7, J-each/equiv/mech, R-each/imit/gap, Q1-Q3)",
           set(ids) <= set(t05.id) and t05.id.str.startswith("Q1-").any() and t05.id.str.startswith("Q2-").any(),
           f"({len(t05)} rows; missing {sorted(set(ids) - set(t05.id))}; not run: "
           f"{list(t05[t05.measured == 'not run'].id)})")
     NOTES["criteria_not_run"] = list(t05[t05.measured == "not run"].id)
+    pend = list(t05[t05.status == "pending"].id) if "status" in t05 else ["no status column"]
+    check("every criterion has a status; on the complete smoke study only Q1 can be pending (too few cases)",
+          "status" in t05 and set(t05.status) <= {"met", "not met", "pending", "estimate", "not run"}
+          and all(str(x).startswith("Q1-") for x in pend), f"(pending: {pend})")
+    t04 = pd.read_csv(next(L.tables.glob("T04_*.csv")))
+    pooled = t04[t04.atmosphere == "all"]
+    check("paired-flight counts and clustered-case intervals in T04; Q3 sensitivity table T08b",
+          {"n_pairs", "n_expected", "complete", "ci_lo_clustered", "ci_hi_clustered"} <= set(t04.columns)
+          and bool(pooled.complete.all()) and pooled.ci_lo_clustered.notna().any() and any(L.tables.glob("T08b_*.csv")),
+          f"({len(pooled)} pooled comparisons, {int(pooled.complete.sum())} complete)")
     L3 = S4.v3_layout(fx["v3"])
     L4 = S5.v4_layout(fx["v4"])
     try:
         R = A5.analyze(cfg, L, L3, L4, log=lambda *a: None, force=True)
-        b = R["boot"]
-        check("bootstrap cache reused on a forced rerun (no recomputation)", b.computed == 0 and b.reused > 0,
-              f"({b.reused} reused)")
+        b, c = R["boot"], R["boot_clustered"]
+        check("bootstrap cache reused on a forced rerun (no recomputation)", b.computed == 0 and b.reused > 0
+              and c.computed == 0 and c.reused > 0, f"({b.reused} + {c.reused} clustered reused)")
         R = A5.analyze(cfg, L, L3, L4, log=lambda *a: None)
         check("an unforced rerun with unchanged inputs skips the analysis", bool(R.get("skipped")))
     except Exception as e:
@@ -696,6 +730,25 @@ def t9_analysis(root: Path, fx: dict) -> None:
     finally:
         R2.FONT_DIR = old
     check("report builds with matplotlib's DejaVu (no system fonts)", ok)
+    # an incomplete arm gets no verdict: remove one FNPEG flight from a copy and analyze it
+    c = root.parent / "v5_smoke_pending"
+    if c.exists():
+        shutil.rmtree(c)
+    shutil.copytree(root, c)
+    try:
+        Lc = S5.LayoutV5(c, read_only=[fx["v3"], fx["v4"], fx["legacy"], fx["data"]])
+        sorted((Lc.flights / "results" / "A256" / "fnpeg").rglob("*.json"))[0].unlink()
+        t = A5.analyze(cfg, Lc, L3, L4, log=lambda *a: None, force=True)["T05"].set_index("id")
+        pdf2 = Path(R5.build_report(Lc, out_pdf=str(Lc.report / "pending.pdf")))
+        check("a criterion with a missing flight is pending (no verdict, numbers marked provisional); others decided",
+              t.status["G1"] == "pending" and pd.isna(t.met["G1"]) and "PROVISIONAL" in t.measured["G1"]
+              and t.n_pairs["G1"] < t.n_expected["G1"] and t.status["G2"] != "pending" and pdf2.stat().st_size > 50_000,
+              f"(G1: {int(t.n_pairs['G1'])} of {int(t.n_expected['G1'])} paired flights, status {t.status['G1']}; "
+              f"G2: {t.status['G2']})")
+    except Exception as e:
+        check("a criterion with a missing flight is pending", False, f"({type(e).__name__}: {e})")
+    finally:
+        shutil.rmtree(c, ignore_errors=True)
 
 
 def _flights(root: Path) -> pd.DataFrame:
@@ -853,13 +906,29 @@ def t15_outputs(root: Path) -> None:
     check("status history appended by every run", len(hist) >= 4, f"({len(hist)} rows)")
     logs = {p.stem for p in L.logs.glob("*.log")}
     want = {"setup", "benchmark", "gates", "tuning", "A256", "ORB1", "E3_train", "E3_fly", "E4_train", "E4_fly",
-            "open_loop", "analysis"}
+            "explore", "open_loop", "analysis"}
     check("a log per stage in 00_study/logs/", want <= logs, f"(missing {sorted(want - logs)})")
     curves = [L.model_dir(a, s) / "F_curves.png" for a in cfg.e3_arms for s in cfg.seeds] + \
         [L.policy_dir(a, s) / "F_curves.png" for a in S5.RL_TIER1 for s in cfg.rl_seeds] + \
         [L.policy_dir(a, s) / "learning_curve.csv" for a in S5.RL_TIER1 for s in cfg.rl_seeds]
     miss = [str(p.relative_to(root)) for p in curves if not p.exists()]
     check("curves of every trained model and policy", not miss, f"(missing {miss[:5]})")
+    res = L.flights / "results"
+    g_dev = sorted(p.name for p in (res / "DEV48").glob("gate_*")) if (res / "DEV48").exists() else []
+    g_test = sorted(p.name for p in (res / "A256").glob("gate_*")) if (res / "A256").exists() else []
+    check("gate V1-V4 flights are on the dev suite, none on a test suite", bool(g_dev) and not g_test,
+          f"(DEV48: {g_dev}; A256: {g_test})")
+    tn = {}
+    for m in ("fnpeg", "predguid"):
+        d = L.tuning / m
+        ch = json.loads((d / "chosen.json").read_text()) if (d / "chosen.json").exists() else {}
+        cs = pd.read_csv(d / "configs.csv") if (d / "configs.csv").exists() else pd.DataFrame(columns=["round"])
+        tn[m] = ((d / "refine.json").exists(), ch.get("n_configs"), sorted(cs["round"].unique().tolist()))
+    want_n = cfg.tune_n + cfg.tune_refine_n
+    check("tuning: round 2 recorded (refine.json) and both rounds scored before the choice",
+          all(v == (True, want_n, [1, 2]) for v in tn.values()), f"({tn})")
+    ex = sorted(p.name for p in (res / "A256").glob("*") if p.name in S5.EXPLORE_ARMS) if (res / "A256").exists() else []
+    check("the 180° and oracle arms flew in Tier 1", ex == sorted(S5.EXPLORE_ARMS), f"({ex})")
     tabs = len(list(L.tables.glob("T*.csv")))
     figs = len(list(L.figures.glob("F*.png"))), len(list(L.figures.glob("F*.pdf")))
     check("tables and figures (PNG and PDF) on disk", tabs >= 12 and min(figs) >= 10, f"({tabs} tables, {figs} figures)")

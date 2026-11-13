@@ -18,7 +18,8 @@ The v5 study's plumbing (jepa/v5_plan.md sections 3, 4, 9).
                        lockstep shards; every flight is written the moment it lands, finished flights are skipped
     gates              S0, V1-V4, E0 (01_checks/<gate>.json and <gate>.done)
     tuning             DEV48 only (section 4.5): Vf from classical, random search for FNPEG and PredGuid
-                       (03_tuning/<method>/config_<j>.json), RL configurations at a reduced budget
+                       (03_tuning/<method>/config_<j>.json), a second round around each law's best
+                       (refine.json), RL configurations at a reduced budget
     train_e3_stage, train_rl_stage, open_loop_stage
                        wrappers around models_v5 and rl_v5 (resumable, done markers ckpt.pt / policy.pt)
     legacy_inventory   MyDrive/ReEntryAI/{models,checkpoints,data} -> 00_study/legacy_rl_inventory.csv
@@ -99,17 +100,20 @@ class StudyConfigV5:
     # ---- guidance laws: the settings before tuning (FNPEGConfig / PredGuidConfig overrides) ----
     fnpeg: dict = field(default_factory=dict)
     predguid: dict = field(default_factory=dict)
-    tune_n: int = 24                                    # configurations per guidance law (config 0 = defaults)
+    tune_n: int = 24                                    # round 1: configurations per guidance law (config 0 = defaults)
+    tune_refine_n: int = 12                             # round 2: more configurations around round 1's best (section 15)
+    tune_refine_shrink: float = 0.25                    # round 2 draws within +-this fraction of each range's width
     tune_seed: int = 20261104
     tune_peak_g_max: float = 4.6
-    rl_tune_n: dict = field(default_factory=lambda: {"dagger_fnpeg": 4, "bcppo_fnpeg": 4, "ppo_hist": 6,
-                                                     "sac_hist": 4})
+    rl_tune_n: dict = field(default_factory=lambda: {"dagger_fnpeg": 12, "bcppo_fnpeg": 12, "ppo_hist": 12,
+                                                     "sac_hist": 12})       # the plan's cap (section 4.5)
     rl_tune_frac: float = 0.1                           # budget fraction of an RL tuning run
     # ---- gates (section 4.0) ----
-    gate_cases: Tuple[int, ...] = tuple(range(0, 64, 4))
+    gate_suite: str = "DEV48"                           # V1-V4 fly the dev suite, never a test case (section 15)
+    gate_cases: Optional[Tuple[int, ...]] = None        # None: every case of the gate suite this config flies (12)
     gates_stop: bool = True                             # a failed gate stops the notebook (smoke: reported only)
     v1_miss_km: float = 2.0
-    v1_min_frac: float = 15 / 16
+    v1_min_frac: float = 11 / 12
     v1_iter_max: int = 6
     v1_iter_frac: float = 0.99
     v2_amax_g: float = 3.0
@@ -121,7 +125,7 @@ class StudyConfigV5:
     v3_tol: float = 0.03
     v3_after_s: float = 150.0
     v4_miss_km: float = 3.5
-    v4_min_frac: float = 15 / 16
+    v4_min_frac: float = 11 / 12
     e0_conditions: Tuple[Tuple[int, str], ...] = ((0, "nominal"), (16, "nominal"), (40, "mismatch_high"))
     e0_samples: int = 32
     s0_feasible_min: float = 0.97
@@ -169,9 +173,9 @@ class StudyConfigV5:
                   critic_warmup_updates=1)
         return StudyConfigV5(
             mode="smoke", seeds=v3.seeds, rl_seeds=(0,), a256_cases=v3.cases, dev48_cases=(0,), orb1_per_block=1,
-            n_episodes=v3.n_episodes, tune_n=2, rl_tune_n={"dagger_fnpeg": 1, "bcppo_fnpeg": 1, "ppo_hist": 2,
-                                                           "sac_hist": 1},
-            rl_tune_frac=0.5, gate_cases=v3.cases, gates_stop=False, v2_sweep_g=(2.7,), v2_sweep_n=1, v3_n_cases=1,
+            n_episodes=v3.n_episodes, tune_n=2, tune_refine_n=1,
+            rl_tune_n={"dagger_fnpeg": 1, "bcppo_fnpeg": 1, "ppo_hist": 2, "sac_hist": 1},
+            rl_tune_frac=0.5, gates_stop=False, v2_sweep_g=(2.7,), v2_sweep_n=1, v3_n_cases=1,
             e0_conditions=((0, "nominal"), (16, "mismatch_high")), e0_samples=16,
             e3_train=dict(_e3_default(), steps=8, batch=8, warmup=2, curriculum=((0.0, 8), (0.5, 16)), log_every=4,
                           save_every_s=30.0, amp=False, val_rows=8),
@@ -195,7 +199,7 @@ class StudyConfigV5:
         t2 = self.tier >= 2
         return {"benchmark": True, "legacy": True, "gates": True, "tuning": True, "A256": True, "ORB1_block1": True,
                 "E3_train": True, "E3_fly": True, "E4_train": True, "E4_fly": True, "ORB1_more": t2,
-                "tier2_rl": t2, "explore": t2, "open_loop": True, "timing": True, "analysis": True, "report": True}
+                "tier2_rl": t2, "explore": True, "open_loop": True, "timing": True, "analysis": True, "report": True}
 
 
 def git_commit() -> str:
@@ -399,7 +403,11 @@ def freeze_config_v5(cfg: StudyConfigV5, L: LayoutV5, inputs: Optional[dict] = N
         diff = {k: (have["config"].get(k), v) for k, v in want.items()
                 if k not in RUNTIME_KEYS and have["config"].get(k) != v}
         if diff:
-            raise ValueError(f"settings differ from the frozen {path}: {diff}. Use a new study folder.")
+            raise ValueError(
+                f"settings differ from the frozen {path}: {diff}. This study folder was started with the code of git "
+                f"commit {str(have.get('git_commit', '?'))[:10]} ({have.get('created', '?')}); flights under two sets "
+                "of settings must not mix. Either continue it with that commit (git checkout it in the Setup cell), "
+                "or move the old folder away and start a new one with the current settings.")
         return have
     doc = {"config": want, "git_commit": _GIT.get(), "created": time.strftime("%Y-%m-%d %H:%M:%S"),
            "environment": S.environment_info(), "inputs": inputs or {}, "benchmark_sha256": B.verify()}
@@ -688,6 +696,7 @@ def jobs_e4(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, arms: Sequence[str]) 
 
 
 def jobs_explore(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout) -> List[dict]:
+    """The laws as published (|sigma| <= 180 deg) and FNPEG's ceiling on A256: Tier 1 since 2026-11-11 (section 15)."""
     conds = conditions(cfg, "A256")
     return [arm_job(cfg, L, L3, c, a, "explore") for a in EXPLORE_ARMS for c in conds]
 
@@ -1002,9 +1011,11 @@ def gate_s0(cfg: StudyConfigV5, L: LayoutV5, data: Optional[dict], log=print) ->
 
 
 def gate_jobs(cfg: StudyConfigV5, L: LayoutV5) -> Dict[str, List[dict]]:
-    """The flights of V1-V4 (V2's depend on V1's realized peaks)."""
-    conds = {(int(c["case"]), c["atmosphere"]): c for c in conditions(cfg, "A256")}
-    cases = [k for k in cfg.gate_cases if (k, "nominal") in conds]
+    """The flights of V1-V4 (V2's depend on V1's realized peaks), on the dev suite: a failed gate leads to a fix,
+    and a fix must not be informed by test cases (section 15, 2026-11-11; before: 16 A256 cases)."""
+    conds = {(int(c["case"]), c["atmosphere"]): c for c in conditions(cfg, cfg.gate_suite)}
+    every = sorted({k for k, a in conds if a == "nominal"})
+    cases = [k for k in (every if cfg.gate_cases is None else cfg.gate_cases) if (k, "nominal") in conds]
     fn = dict(cfg.fnpeg)                                   # the defaults: gates run before tuning
     out = {"V1": [guidance_job(conds[(k, "nominal")], "gate_V1_fnpeg", "gates", "fnpeg",
                                dict(fn, oracle=True, filters=False, load_relief=False)) for k in cases]}
@@ -1213,6 +1224,66 @@ def sample_configs(space: dict, n: int, seed: int) -> List[dict]:
     return out
 
 
+def refine_configs(space: dict, center: dict, n: int, seed: int, shrink: float) -> List[dict]:
+    """Round 2 of the guidance tuning: n configurations around `center` (round 1's best). A numeric setting is drawn
+    uniformly (in log space for a log range) within +-shrink of its range's width around the center's value, clipped
+    to the range; a choice keeps the center's value with probability 1/2 and is redrawn otherwise; sigma_f keeps
+    None with probability 1/2 when the center has None."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(max(0, n)):
+        c = {}
+        for k, spec in space.items():
+            kind, v0 = spec[0], center.get(k)
+            if kind in ("uniform", "loguniform") or (kind == "none_or_uniform" and v0 is not None):
+                f = math.log if kind == "loguniform" else float
+                a, b = f(spec[1]), f(spec[2])
+                x = min(max(f(float(v0)), a), b)
+                u = float(rng.uniform(max(a, x - shrink * (b - a)), min(b, x + shrink * (b - a))))
+                c[k] = math.exp(u) if kind == "loguniform" else u
+            elif kind == "none_or_uniform":
+                c[k] = None if rng.uniform() < 0.5 else float(rng.uniform(spec[1], spec[2]))
+            elif kind == "choice":
+                keep = rng.uniform() < 0.5 and v0 in spec[1]
+                c[k] = v0 if keep else spec[1][int(rng.integers(len(spec[1])))]
+        out.append(c)
+    return out
+
+
+def _law_defaults(method: str) -> dict:
+    if method == "fnpeg":
+        from jepa.guidance_fnpeg import FNPEGConfig
+        return asdict(FNPEGConfig())
+    from jepa.guidance_predguid import PredGuidConfig
+    return asdict(PredGuidConfig())
+
+
+def guidance_tune_plan(cfg: StudyConfigV5, L: LayoutV5, m: str, space: dict) -> List[Tuple[int, int, dict]]:
+    """(configuration index, round, sampled settings) of a guidance law's tuning. Round 1: cfg.tune_n random
+    configurations (0 = the defaults). Round 2: cfg.tune_refine_n more around round 1's best, drawn once round 1 is
+    scored and recorded in 03_tuning/<m>/refine.json (the center and every draw), so a resumed run flies the same."""
+    n1, n2 = int(cfg.tune_n), int(cfg.tune_refine_n)
+    seed = cfg.tune_seed + (0 if m == "fnpeg" else 1)
+    plan = [(j, 1, c) for j, c in enumerate(sample_configs(space, n1, seed))]
+    if n2 <= 0:
+        return plan
+    rp = L.tuning / m / "refine.json"
+    if rp.exists():
+        doc = json.loads(rp.read_text())
+    else:
+        files = [L.tuning / m / f"config_{j:02d}.json" for j in range(n1)]
+        if not all(f.exists() for f in files):
+            return plan
+        best = _choose([json.loads(f.read_text()) for f in files], cfg.tune_peak_g_max)
+        d = _law_defaults(m)
+        center = {k: best["config"].get(k, d.get(k)) for k in space}
+        doc = {"method": m, "center_config_index": best["config_index"], "center": center,
+               "shrink": cfg.tune_refine_shrink, "seed": seed + 100,
+               "configs": refine_configs(space, center, n2, seed + 100, cfg.tune_refine_shrink)}
+        L.write_json(rp, doc)
+    return plan + [(n1 + i, 2, c) for i, c in enumerate(doc["configs"])]
+
+
 def _score_dev(rs: List[dict]) -> dict:
     land = np.array([r["outcome"] == "drogue" for r in rs])
     miss = np.array([float(r["miss_km"]) for r in rs])
@@ -1249,32 +1320,37 @@ def tune_vf(cfg: StudyConfigV5, L: LayoutV5, workers: int, log=print) -> Optiona
 
 
 def tune_guidance(cfg: StudyConfigV5, L: LayoutV5, workers: int, log=print) -> Dict[str, dict]:
-    """Random search for FNPEG and PredGuid on DEV48 (cached per configuration), then the choice."""
+    """Random search for FNPEG and PredGuid on DEV48 (cached per configuration), a second round around each law's
+    best, then the choice over both rounds."""
     vf = tune_vf(cfg, L, workers, log)
     if vf is None:
         return {}
     out = {}
     spaces = {"fnpeg": (FNPEG_SPACE, dict(cfg.fnpeg, vf_mps=vf)), "predguid": (PREDGUID_SPACE, dict(cfg.predguid))}
     dev = conditions(cfg, "DEV48")
-    jobs, plan = [], {}
-    for m, (space, base) in spaces.items():
-        if (L.tuning / m / "chosen.json").exists():
-            continue
-        for j, c in enumerate(sample_configs(space, cfg.tune_n, cfg.tune_seed + (0 if m == "fnpeg" else 1))):
-            if (L.tuning / m / f"config_{j:02d}.json").exists():
+    for _pass in (1, 2):                                   # round 2's draws exist once round 1 is scored
+        jobs, plan = [], {}
+        for m, (space, base) in spaces.items():
+            if (L.tuning / m / "chosen.json").exists():
                 continue
-            full = dict(base, **c)
-            js = [guidance_job(cd, f"tune_{m}_c{j:02d}", "tuning", m, full) for cd in dev]
-            plan[(m, j)] = (full, c, js)
-            jobs += js
-    run_cpu(cfg, jobs, L, workers, log, "tuning")
-    for (m, j), (full, c, js) in plan.items():
-        rs = _results(L, js)
-        if len(rs) == len(js):
-            L.write_json(L.tuning / m / f"config_{j:02d}.json", {"method": m, "config_index": j, "config": full,
-                                                                "sampled": c, "score": _score_dev(rs)})
+            for j, rnd, c in guidance_tune_plan(cfg, L, m, space):
+                if (L.tuning / m / f"config_{j:02d}.json").exists():
+                    continue
+                full = dict(base, **c)
+                js = [guidance_job(cd, f"tune_{m}_c{j:02d}", "tuning", m, full) for cd in dev]
+                plan[(m, j)] = (full, c, js, rnd)
+                jobs += js
+        if not jobs:
+            continue
+        run_cpu(cfg, jobs, L, workers, log, "tuning")
+        for (m, j), (full, c, js, rnd) in plan.items():
+            rs = _results(L, js)
+            if len(rs) == len(js):
+                L.write_json(L.tuning / m / f"config_{j:02d}.json", {"method": m, "config_index": j, "round": rnd,
+                                                                    "config": full, "sampled": c,
+                                                                    "score": _score_dev(rs)})
     for m in spaces:
-        out[m] = _choose_method(cfg, L, m, cfg.tune_n, log)
+        out[m] = _choose_method(cfg, L, m, int(cfg.tune_n) + max(0, int(cfg.tune_refine_n)), log)
     return out
 
 
@@ -1292,7 +1368,7 @@ def _choose_method(cfg, L, m: str, n: int, log=print) -> Optional[dict]:
                                                 f"{cfg.tune_peak_g_max} g (DEV48)"}
     L.write_json(p, doc)
     import pandas as pd
-    L.write_csv(pd.DataFrame([{"config_index": r["config_index"], **r["score"],
+    L.write_csv(pd.DataFrame([{"config_index": r["config_index"], "round": r.get("round", 1), **r["score"],
                                **{f"cfg_{k}": v for k, v in (r.get("sampled") or {}).items()}} for r in rows]),
                 L.tuning / m / "configs.csv")
     log(f"[tuning] {m}: config {best['config_index']} chosen ({best['score']})")
@@ -1489,14 +1565,13 @@ def all_stage_jobs(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, log=lambda *a:
     t2 = cfg.tier >= 2
     rl = list(RL_TIER1) + (list(RL_TIER2) if t2 else [])
     J = {"A256": jobs_a256(cfg, L, L3), "ORB1_block1": orb1_jobs(cfg, L, L3, ORB1_ARMS, [0], "ORB1", log),
-         "E3": jobs_e3(cfg, L, L3), "E4": jobs_e4(cfg, L, L3, rl)}
+         "E3": jobs_e3(cfg, L, L3), "E4": jobs_e4(cfg, L, L3, rl), "explore": jobs_explore(cfg, L, L3)}
     fin = legacy_finals(L)
     if fin:
         J["legacy"] = legacy_jobs(cfg, L, fin)
     if t2:
         J["ORB1_more"] = orb1_jobs(cfg, L, L3, ORB1_ARMS, [1, 2], "ORB1", log)
         J["ORB1_extra"] = orb1_jobs(cfg, L, L3, ["mppi_truth"] + best_arms(cfg, L, L3), [0], "ORB1", log)
-        J["explore"] = jobs_explore(cfg, L, L3)
     return J
 
 

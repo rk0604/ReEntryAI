@@ -1,7 +1,8 @@
 # SpaceJEPA v5: strong baselines and a standard benchmark (plan and implementation brief)
 
-Branch: `space-jepa5` (from `space-jepa4`). Status: **specified, not built; waiting for the user's review
-(§0.2).** Written 2026-11-03, before any v4 result was analyzed, so nothing here was chosen after
+Branch: `space-jepa5` (from `space-jepa4`). Status: **built and smoke-tested (§14); revised
+2026-11-11 after a pre-run review of what a reviewer would object to (§15 lists every change, §16 the
+limitations that remain); the user runs it on Colab.** Written 2026-11-03, before any v4 result was analyzed, so nothing here was chosen after
 seeing v4 numbers. This file is the preregistration of experiment 5 and the brief for whoever builds
 it. The v1/v2 design is in `jepa/PLAN.md`, v3 in `jepa/v3_plan.md`, v4 in `jepa/v4_plan.md`; v5 reuses
 their code and conventions (v4 §11) unless this file says otherwise.
@@ -217,10 +218,10 @@ once per condition and are broadcast across seeds (as `analyze_v3.cube`).
 | Gate | What | Pass condition |
 |---|---|---|
 | S0 benchmark | build/verify the suites; ORB-1 footprint in the full simulator (90° and 0° constant bank from the nominal EI) defines the three target ranges; then the suite is frozen | checksums match; every target range strictly inside the nominal footprint; ≥ 97% of ORB-1 cases feasible under their true parameters; the longest nominal ORB-1 flight is shorter than MPPI's horizon (188 × 5 s = 940 s); nominal ORB-1 trajectories stay inside the training split's feature ranges |
-| V1 FNPEG verification | on 16 A256 cases, nominal air, predictor = true parameters, no load limit | miss < 2 km in ≥ 15 of 16 (Lu reports < 1 km in his own simulator; ours adds roll dynamics the predictor does not model), Newton iteration converges in ≤ 6 iterations per cycle in ≥ 99% of cycles |
-| V2 load relief | same 16 cases, amax = 3.0 g, cases whose unconstrained peak exceeds 3.5 g | realized peak ≤ amax + 0.15 g and miss < 2 km where feasible; as amax drops below feasibility the miss grows gradually (Lu Fig. 17), checked on 2 cases at 2.7/2.5/2.3 g |
-| V3 filters | thin (×0.88) and dense (×1.12) air, 8 cases each | the filter's drag ratio K_D is within 3% of the true scale by 150 s after the 0.05 g point |
-| V4 PredGuid verification | 16 A256 cases, nominal air, nominal model | miss < 3.5 km in ≥ 15 of 16 (Bairstow's Monte Carlo bound); the phase sequence is logged and sensible (initial roll → final for these ranges) |
+| V1 FNPEG verification | on the 12 DEV48 cases, nominal air, predictor = true parameters, no load limit (changed 2026-11-11, §15: was 16 A256 cases; a gate must not look at test cases) | miss < 2 km in ≥ 11 of 12 (was 15 of 16; Lu reports < 1 km in his own simulator; ours adds roll dynamics the predictor does not model), Newton iteration converges in ≤ 6 iterations per cycle in ≥ 99% of cycles |
+| V2 load relief | same 12 cases, amax = 3.0 g, cases whose unconstrained peak exceeds 3.5 g | realized peak ≤ amax + 0.15 g and miss < 2 km where feasible; as amax drops below feasibility the miss grows gradually (Lu Fig. 17), checked on 2 cases at 2.7/2.5/2.3 g |
+| V3 filters | thin (×0.88) and dense (×1.12) air, the first 8 DEV48 cases each | the filter's drag ratio K_D is within 3% of the true scale by 150 s after the 0.05 g point |
+| V4 PredGuid verification | the 12 DEV48 cases, nominal air, nominal model | miss < 3.5 km in ≥ 11 of 12 (was 15 of 16; Bairstow's Monte Carlo bound); the phase sequence is logged and sensible (initial roll → final for these ranges) |
 | E0 runner | v5 runner vs `run_lockstep_v4` on CPU, v2 and physics adapters, 3 flights | bit-identical |
 
 v4's E0b (statistical re-fly of v3) already covers GPU nondeterminism; v5 cites v4's floor.
@@ -328,6 +329,10 @@ RL method. Random search from documented ranges, seed fixed. The chosen configur
 configurations and their DEV48 scores go to `03_tuning/` and §14. MPPI and the world models are **not**
 tuned (they were designed in v1–v3).
 
+**Changed 2026-11-11 (§15):** each guidance law gets a second round of 12 configurations drawn around its
+round-1 best (36 in total, same objective, the choice is made over both rounds), and every RL method
+uses the full 12 configurations. More tuning for the baselines only; nothing else is tuned.
+
 ### 4.6 Legacy RL inventory (first stage of the notebook)
 
 List `MyDrive/ReEntryAI/{models,checkpoints,data}` and the W&B project if a key is set, write
@@ -353,8 +358,8 @@ first 20 flights and prints projected hours and Colab units (at the runtime's ra
 
 | Tier | Contents | Flights (new) | Training |
 |---|---|---|---|
-| 1 | gates, legacy RL eval, tuning (2 × 24 × 48 guidance flights + RL tuning), the A256 arms of §4.1–4.3 except the exploratory ones, `dagger_fnpeg`, `bcppo_fnpeg`, `ppo_hist` (3 seeds each), ORB-1 block 1 for `classical`, `fnpeg`, `predguid`, `mppi_filtered`, `v2single` | ≈ 21,000 (≈ 6,000 of them cheap policy flights) | 20 dynamics models + 9 RL runs |
-| 2 | ORB-1 blocks 2–3 (eligible arms only), ORB-1 block 1 for the non-JEPA and RL arm with the highest A256 success@5km (descriptive), `sac_hist`, `ppo_matched`, `mppi_truth` on ORB-1, the exploratory arms | ≈ 5,000–9,000 | 6 RL runs |
+| 1 | gates, legacy RL eval, tuning (2 × 24 × 48 guidance flights + RL tuning), the A256 arms of §4.1–4.3 except the exploratory ones, `dagger_fnpeg`, `bcppo_fnpeg`, `ppo_hist` (3 seeds each), ORB-1 block 1 for `classical`, `fnpeg`, `predguid`, `mppi_filtered`, `v2single`; since 2026-11-11 (§15) also `fnpeg_180`, `predguid_180`, `fnpeg_oracle` on A256 and the larger tuning budget (2 × 36 × 48 guidance flights, 12 RL configurations per method) | ≈ 23,000 (≈ 7,000 of them cheap policy flights) | 20 dynamics models + 9 RL runs (+ 36 RL tuning runs at 10% budget) |
+| 2 | ORB-1 blocks 2–3 (eligible arms only), ORB-1 block 1 for the non-JEPA and RL arm with the highest A256 success@5km (descriptive), `sac_hist`, `ppo_matched`, `mppi_truth` on ORB-1 | ≈ 4,000–8,000 | 6 RL runs |
 | 3 | density-shear suite (D5) | decided with the user | none |
 
 For scale: v4 is ~27,700 flights plus 70 trainings. `classical` costs ~90 CPU-seconds per flight (v3:
@@ -390,6 +395,14 @@ heat load, RCS fuel, reversals, planning ms), plus:
   blocks; Q1 uses exact Clopper–Pearson; Q3 uses block 1 paired by case.
 * RL arms: seeds 0–2; "holds in a seed" needs 3 of 3.
 * Every estimate is reported with its interval, including failures. Secondary metrics are exploratory.
+* Added 2026-11-11 (§15), no criterion changed:
+  * **Verdicts need complete data.** The analysis runs on every "Run all". A pass/fail criterion is decided
+    only when every paired flight of both arms exists; before that its status is "pending" and its numbers
+    are marked provisional. Q1: an arm passes when its bound is reached, fails at 2 misses (the stopping
+    rule), and is "pending" otherwise (too few flights for the bound, as in Tier 1).
+  * **Clustered sensitivity.** A256's 256 conditions come from 64 entry cases. Next to every pooled
+    interval the report gives the interval with each entry case resampled together with its four
+    atmospheres, and flags a "met" verdict that this interval does not support.
 
 ---
 
@@ -444,6 +457,12 @@ heat load, RCS fuel, reversals, planning ms), plus:
 | Q1 | accuracy requirement, per arm | requirement LCB ≥ 0.99865 over the flights the arm flew (descriptive pass/fail, no p-value) |
 | Q2 | crew g limits, per arm | fraction of g-duration-compliant flights with a Clopper–Pearson interval (descriptive) |
 | Q3 | v2 vs the published laws on the standard scenario (Holm over 2) | success@5km `v2single − fnpeg` and `v2single − predguid` on block 1, > 0 with 95% CI excluding 0 and Holm p < 0.05 |
+
+Added 2026-11-11 (§15), estimates only (table T08b): Q3 again (a) on the load-feasible cases (the frozen
+`feasible_4p5g` flag: all of targets 1 and 2, 27 of target 0's 1,002), (b) with success counted only when
+the flight also kept peak g ≤ 4.6 g, and (c) per target. Target 0 is mostly unreachable within 4.5 g, so
+there a law that enforces the limit gives up range and a soft limit can be exceeded; these rows show
+whether the pooled Q3 is driven by that. Every table also reports success@5km within the load limit.
 
 ### 8.5 RQ5
 
@@ -556,10 +575,11 @@ Naming as v3/v4 (`T##_*.csv`, `F##_*.png`, `captions.json`). Minimum set:
 | T02 | T01 on feasible conditions only |
 | T03 | gates S0, V1–V4, E0 |
 | T04 | RQ1 paired differences (G1–G7) per atmosphere and pooled |
-| T05 | criteria table (every G, J, R, Q) with value, CI, Holm p, met |
+| T05 | criteria table (every G, J, R, Q) with value, CI, Holm p, met, status (met / not met / pending / estimate / not run), paired flights present and expected, clustered interval |
 | T06 | RQ2: paired log miss vs R0, open-loop errors, parameter counts |
 | T07 | RQ3: RL arms, success, miss, fast-vs-full gap, training budget used |
 | T08 | RQ4: ORB-1 per arm: blocks flown, success@2/5/10km, requirement LCB, g compliance, per target range |
+| T08b | RQ4: Q3 and its sensitivity analyses (load-feasible cases, within the load limit, per target) |
 | T09 | RQ5: compute per decision and parameters |
 | T10 | tuning appendix (DEV48) |
 | T11 | legacy RL inventory and re-evaluation |
@@ -575,8 +595,9 @@ Naming as v3/v4 (`T##_*.csv`, `F##_*.png`, `captions.json`). Minimum set:
 | F10 | example trajectories and bank histories: `fnpeg`, `predguid`, `v2single` on the same 3 conditions |
 
 Report as v4 (`report_v4.py` pattern: reads only these files). Sections: summary callout, RQ1–RQ5,
-benchmark datasheet, methods (incl. the exact FNPEG and PredGuid settings), deviations (§15),
-appendix with every table.
+benchmark datasheet, methods (incl. the exact FNPEG and PredGuid settings), limitations (§16),
+deviations (§15), appendix with every table. While any criterion is pending the summary says
+"provisional report".
 
 ---
 
@@ -913,6 +934,27 @@ launch that writes nothing for 25 min (recorded in `notes.stalled_runs`). A reru
 of the same two launches on a fresh study with the final harness (2026-11-04) did not hang: both forced
 failures fired (49 s and 1,280 s), with no stall.
 
+**Revision of 2026-11-11 (pre-run review; the reasons are in §15).**
+
+* Gates: `gate_suite = "DEV48"`, every DEV48 case (12); V1 and V4 need 11 of 12. E0 (runner equivalence,
+  v2 and physics adapters, no baseline) still uses three A256 conditions.
+* Tier 1 now flies `fnpeg_180`, `predguid_180` and `fnpeg_oracle` on A256 (768 flights, stage `explore`).
+* Guidance tuning round 2 (`tune_refine_n = 12`, `tune_refine_shrink = 0.25`): once round 1's 24
+  configurations are scored, 12 more are drawn around its best: a numeric setting uniformly (in log space
+  for a log range) within ±25% of its range's width around the best value, clipped to the range; a choice
+  keeps the best value with probability 1/2; σ_f keeps "none" with probability 1/2 if the best has none.
+  Seed `tune_seed + 100` (+1 for PredGuid). The center and the draws are written to
+  `03_tuning/<law>/refine.json` before any round-2 flight, so a resumed run flies the same configurations;
+  `configs.csv` has a `round` column. RL: `rl_tune_n = 12` for every method.
+* "Within the load limit" = peak g ≤ 4.6 g (`benchmark_v5.LOAD_OK_G`: the 4.5 g limit plus the 0.1 g margin
+  G3 and the tuning objective already use); column `success_5km_load` in T01, T02 and T08.
+* T02 (feasible only) on ORB-1 now uses the suite's `feasible_4p5g` flag, as its caption always said (the
+  flight files carry the no-load-cap flag, which is true for every case).
+* Clustered bootstrap: `analyze_v5.ClusterBoot`, v4's bootstrap with one case draw shared by the four
+  atmospheres; cached like the others. On synthetic data with a case effect shared across atmospheres its
+  interval is about twice as wide; without one the two agree.
+* G6 is "pending" until V1–V4 have all been evaluated (before: an empty gate list counted as passed).
+
 ---
 
 ## 15. Deviations
@@ -933,3 +975,66 @@ failures fired (49 s and 1,280 s), with no stall.
   is the copy the user saved from Colab (commit c747b92, "Created using Colab", an extra `%pip install`
   cell), so the v3 builder cannot reproduce it cell for cell. The check compares it by `git diff`
   against the v4 commit (unchanged) and rebuilds the other four v3 notebooks exactly.
+* **2026-11-11, pre-run review.** The session that built v5 reviewed it as a referee would and the user
+  approved seven changes. No v5 test flight had been reported when they were made. A study folder started
+  with the earlier settings is refused by the frozen-config check (`00_study/study_config.json`), so
+  flights under old and new settings cannot mix. The changes:
+* **2026-11-11, gates V1–V4 fly DEV48, not A256 (§4.0).** A failed gate stops the notebook and leads to a
+  fix of the baseline; with 16 of the 64 A256 cases in the gates, that fix would have been informed by
+  test cases. Now 12 DEV48 cases in nominal air (V3: 8 in thin and 8 in dense air), 11 of 12 to pass.
+* **2026-11-11, `fnpeg_180`, `predguid_180`, `fnpeg_oracle` moved from Tier 2 to Tier 1 (D1's tier
+  contents, §4.9).** The laws were published with a 180° bank range; with only the 90° versions flown by
+  default, the baselines could be called handicapped. They stay exploratory (G7: estimates, no criterion).
+* **2026-11-11, more tuning for the baselines (§4.5).** Guidance laws: 36 configurations instead of at
+  most 24 (a second round of 12 around the best of the first). RL: 12 per method (the plan's cap; the
+  build had used 4 to 6). v2 was designed over three studies, so the baselines' budget was the weak side.
+* **2026-11-11, analysis additions; no criterion changed (§6, §8.4).** (1) A verdict is given only on
+  complete data ("pending" before); for Q1 an arm with fewer than 2 misses and too few flights for the
+  bound is "pending" instead of "not met". (2) Clustered-case intervals next to every pooled A256
+  interval. (3) Q3 also on the load-feasible cases, within the load limit, and per target (T08b), because
+  only 27 of 1,002 target-0 cases are reachable within 4.5 g at a constant bank. (4) A limitations
+  section (§16) printed in the report.
+
+---
+
+## 16. Limitations
+
+Stated on 2026-11-11, before any v5 result. The report prints this section.
+
+**The model errors are simple.** Every test condition changes the truth by constant multipliers on
+density, lift and mass (A256's four atmospheres, ORB-1's dispersions). FNPEG's two filters estimate
+exactly that, and its predictor uses the simulator's own atmosphere table and aerodynamic model. The
+classical laws are therefore tested in their best case. v5 does not test density errors that vary with
+altitude, winds, Mach-dependent aerodynamic errors, navigation errors or sensor noise, and its results
+do not carry over to them (the density-shear suite, D5, is out of scope).
+
+**ORB-1 is an adaptation, not a published benchmark.** The entry state is Lu's and the dispersions are
+Bairstow's, but the Earth does not rotate, the bank is capped at 90°, and the flight-path angle, the
+three target ranges and the speed dispersion are ours. Its numbers cannot be compared with published
+Monte Carlo results, and Q1 applies Orion's requirement to our simulator, not to Orion.
+
+**Target 0 mixes accuracy and load.** Only 27 of its 1,002 cases are reachable within 4.5 g at a constant
+bank. A law that enforces the limit gives up range there; MPPI's limit is soft and can be exceeded. The
+pooled ORB-1 results include target 0; T08b and the "within the load limit" columns separate the two.
+
+**Half the bank range.** Every controller is limited to 90° because the learned controllers were trained
+that way. FNPEG and PredGuid were designed for 180°. The 180° versions fly as exploratory arms (G7), not
+as the primary comparison.
+
+**Unequal tuning history.** v2 and its planner were designed over three studies, and A256 is the test
+set v3 and v4 already reported on. The baselines are tuned on DEV48 only (12 entry cases, 36
+configurations per guidance law, 12 per RL method). ORB-1 is new to every arm.
+
+**A256 has 64 entry cases.** Its 256 conditions reuse them in four atmospheres. The pre-registered
+bootstrap treats the conditions as independent; the clustered intervals show how much that matters.
+
+**RQ2's key arm changes two things.** `r0_nojepa` removes the JEPA losses and also trains end to end
+instead of in two stages, and each non-JEPA model's learning rate is picked from three values on one
+seed. A difference between it and R0 cannot be assigned to the objective alone.
+
+**RL trains in a simplified simulator.** The policies learn in the fast environment (the physics port)
+and are tested in the full simulator, with three seeds per method; the gap is reported per arm. PPO in
+the full simulator is Tier 2 and limited to 6,000 episodes.
+
+**Compute numbers describe these implementations.** FNPEG's predictor is Python and numpy, the learned
+models run on a GPU. The table compares what was run here, not flight software.

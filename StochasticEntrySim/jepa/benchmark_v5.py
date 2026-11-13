@@ -57,6 +57,7 @@ FT = 0.3048
 # NASA-STD-3000 duration-based g limits, deconditioned, ill or injured crew (Bairstow 2006 Table D.3).
 NASA_STD_3000_DECONDITIONED = ((0.5, 14.0), (8.0, 10.0), (30.0, 7.8), (100.0, 4.0), (1000.0, 4.0))
 EM1_REQUIREMENT = 0.99865          # P(miss <= 10 km), McNamara & Braun AAS 14-094, 3-sigma
+LOAD_OK_G = 4.6                    # "within the load limit": peak g <= the 4.5 g limit + 0.1 g (G3's and tuning's margin)
 EM1_CONFIDENCE = 0.90
 TRAIN_DOMAIN = {"density_scale": (0.70, 1.30), "lift_scale": (0.70, 1.30), "mass_scale": (0.90, 1.10)}
 
@@ -646,6 +647,8 @@ def score(flights, by_seed: bool = False):
     for r in (2, 5, 10, 25):
         df[f"s{r}"] = landed & (df["miss_km"] <= r if r == 10 else df["miss_km"] < r)
     df["log_miss"] = np.log(np.maximum(df["miss_km"].astype(float), 0.01))
+    # success@5km that also kept the load limit: a soft-limited controller cannot buy accuracy with g (section 15)
+    df["s5load"] = df["s5"] & (pd.to_numeric(df["peak_g"], errors="coerce") <= LOAD_OK_G)
     keys = ["suite", "arm"] + (["seed"] if by_seed else [])
     rows = []
     for gk, g in list(df.groupby(keys + ["group"], dropna=False)) + [
@@ -658,7 +661,8 @@ def score(flights, by_seed: bool = False):
         lo, hi = clopper_pearson(int(comp.sum()), int(len(comp)))
         row = dict(zip(keys + ["group"], gk))
         row.update({
-            "n": n, "success_2km": g["s2"].mean(), "success_5km": g["s5"].mean(), "success_10km": g["s10"].mean(),
+            "n": n, "success_2km": g["s2"].mean(), "success_5km": g["s5"].mean(),
+            "success_5km_load": g["s5load"].mean(), "success_10km": g["s10"].mean(),
             "success_25km": g["s25"].mean(), "mean_log_miss": g["log_miss"].mean(),
             "median_miss_km": g["miss_km"].median(), "p95_miss_km": g["miss_km"].quantile(0.95),
             "landed_frac": landed.loc[g.index].mean(), "peak_g_mean": g["peak_g"].mean(), "peak_g_max": g["peak_g"].max(),

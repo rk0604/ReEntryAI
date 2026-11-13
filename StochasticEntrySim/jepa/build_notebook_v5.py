@@ -47,9 +47,15 @@ remains and skip.
 
 **Tiers (decision D1).** `TIER = 1` (default) runs the gates, legacy RL re-evaluation, tuning, the A256
 arms (FNPEG, PredGuid, MPPI + filtered physics, v2 at FNPEG's load), ORB-1 block 1, the four non-JEPA
-models and three RL baselines. `TIER = 2` (after reading Tier 1's results) adds ORB-1 blocks 2–3 for the
-arms still eligible, `mppi_truth` and the best non-JEPA and RL arms on ORB-1, SAC, PPO in the full
-simulator, and the exploratory arms. Everything is built and smoke-tested either way.
+models, three RL baselines, and the exploratory arms (FNPEG and PredGuid with the published 180° bank
+range, FNPEG with the true parameters). `TIER = 2` (after reading Tier 1's results) adds ORB-1 blocks 2–3
+for the arms still eligible, `mppi_truth` and the best non-JEPA and RL arms on ORB-1, SAC, and PPO in the
+full simulator. Everything is built and smoke-tested either way.
+
+**Reading results before the run is finished.** The analysis and the report run on every Run all. A
+criterion gets a verdict only when every paired flight of both arms exists; until then it is **pending**
+and the report says "provisional". What v5 does not test is listed in the report's Limitations section
+(`jepa/v5_plan.md` §16).
 
 | | Question | Experiment |
 |---|---|---|
@@ -284,6 +290,9 @@ if RUN["ORB1_more"]:
     extra = ["mppi_truth"] + S5.best_arms(CFG, L, L3)
     S5.run_jobs(CFG, S5.orb1_jobs(CFG, L, L3, extra, [0], "ORB1", log), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU,
                 log, "ORB-1 block 1 extra")
+"""
+
+EXPLORE = r"""
 if RUN["explore"]:
     log = L.logger("explore")
     S5.run_jobs(CFG, S5.jobs_explore(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "exploratory")
@@ -305,7 +314,10 @@ if RUN["analysis"]:
     t0 = time.time()
     R = A5.analyze(CFG, L, L3, L4, log=L.logger("analysis"))
     pd.set_option("display.max_colwidth", 140)
-    display(R["T05"][["id", "question", "measured", "p_holm", "met"]])
+    display(R["T05"][["id", "question", "measured", "p_holm", "status"]])
+    PENDING = R["T05"][R["T05"].status == "pending"].id.tolist()
+    if PENDING:
+        print(f"PROVISIONAL: {len(PENDING)} criteria are pending (flights still missing): {', '.join(PENDING)}")
     for k in ("F01", "F02", "F03", "F06"):
         if k in R.get("figures", {}):
             display(Image(str(R["figures"][k])))
@@ -369,19 +381,21 @@ README's numbers) and on A256 (out of its training distribution). A missing fold
     ("md", r"""
 ## 5. Gates V1–V4 and E0
 
-V1: FNPEG with the true parameters lands within 2 km on ≥ 15 of 16 cases, Newton converging in ≤ 6 iterations in
-≥ 99% of cycles. V2: load relief at 3 g. V3: the fading-memory filters reach the true drag scale within 3% by 150 s
-after 0.05 g. V4: PredGuid within 3.5 km on ≥ 15 of 16. E0: the v5 runner equals `run_lockstep_v4` bit for bit.
-**A failed gate stops the notebook** (no test flight may run on it). Passed gates are skipped.
+The gates fly the dev suite (the 12 DEV48 cases), never a test case. V1: FNPEG with the true parameters lands
+within 2 km on ≥ 11 of 12 cases, Newton converging in ≤ 6 iterations in ≥ 99% of cycles. V2: load relief at 3 g.
+V3: the fading-memory filters reach the true drag scale within 3% by 150 s after 0.05 g. V4: PredGuid within 3.5 km
+on ≥ 11 of 12. E0: the v5 runner equals `run_lockstep_v4` bit for bit. **A failed gate stops the notebook** (no
+test flight may run on it). Passed gates are skipped.
 """),
     ("code", GATES),
     ("md", r"""
 ## 6. Tuning (DEV48 only, frozen before any test flight)
 
-Vf from the DEV48 classical flights, then random search: ≤ 24 configurations each for FNPEG and PredGuid
-(configuration 0 = the defaults), ≤ 12 per RL method at a reduced budget. Objective: success@5km, then mean log
-miss, subject to mean peak g ≤ 4.6 g. Each configuration's DEV48 score is saved as `03_tuning/<method>/config_<j>.json`
-when its flights are done; `chosen.json` freezes the choice. Test flights of a method wait until it is chosen.
+Vf from the DEV48 classical flights, then random search: 24 configurations each for FNPEG and PredGuid
+(configuration 0 = the defaults), then 12 more around each law's best (`refine.json` records them), and 12 per RL
+method at a reduced budget. Objective: success@5km, then mean log miss, subject to mean peak g ≤ 4.6 g. Each
+configuration's DEV48 score is saved as `03_tuning/<method>/config_<j>.json` when its flights are done;
+`chosen.json` freezes the choice. Test flights of a method wait until it is chosen.
 """),
     ("code", TUNING),
     ("md", r"""
@@ -430,11 +444,18 @@ snapshots on the DEV48 learning-curve cases.
 """),
     ("code", E4_FLY),
     ("md", r"""
-## 13. Tier 2: ORB-1 blocks 2–3, extra ORB-1 arms, exploratory arms
+## 13. Exploratory arms: the laws as published, and FNPEG's ceiling
+
+`fnpeg_180` and `predguid_180` (the same tuned laws with the published 180° bank range instead of the 90° every
+learned controller has) and `fnpeg_oracle` (FNPEG's predictor given the true parameters) on A256: what the 90°
+handle costs the published laws, and how far FNPEG is from its own ceiling (G7, estimates). CPU only.
+"""),
+    ("code", EXPLORE),
+    ("md", r"""
+## 13b. Tier 2: ORB-1 blocks 2–3 and extra ORB-1 arms
 
 Blocks 2 and 3 for the arms still eligible (fewer than 2 misses beyond 10 km in the blocks before; recomputed from
-Drive), `mppi_truth` and the best non-JEPA and RL arms on block 1, and `fnpeg_180`, `predguid_180`,
-`fnpeg_oracle` on A256. Off in Tier 1.
+Drive), and `mppi_truth` and the best non-JEPA and RL arms on block 1. Off in Tier 1.
 """),
     ("code", ORB1_MORE),
     ("md", r"""
@@ -449,14 +470,15 @@ Footprint error of each E3 model and seed on the test split from 400 to 50 s to 
 
 RQ5's timing table (one flight per arm, single CPU thread and GPU), then every table T01–T12, figure F01–F10 (PNG
 and PDF, 200 dpi), `captions.json` and the criteria (G1–G7, J, R, Q). Bootstrap results are cached by comparison
-and input hash. Runs on any runtime and reports whatever exists.
+and input hash. Runs on any runtime and reports whatever exists: a criterion whose flights are not all there is
+shown as **pending** with provisional numbers, never as met or not met.
 """),
     ("code", ANALYSIS),
     ("md", r"""
 ## 16. Report
 
 `06_report/SpaceJEPA_v5_report.pdf` (summary, criteria, RQ1–RQ5, benchmark datasheet, methods with the chosen
-FNPEG and PredGuid settings, deviations from `v5_plan.md` §15, every table), the status file, and
+FNPEG and PredGuid settings, limitations from `v5_plan.md` §16, deviations from §15, every table), the status file, and
 `00_study/README.md`. Rebuilt every run.
 """),
     ("code", REPORT),

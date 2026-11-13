@@ -6,8 +6,9 @@ jepa/report_v5.py
 and the plan's section 15 (deviations); no number is typed in. Building blocks as v4 (results_pdf_v3.Doc,
 make_report_v2._fonts).
 
-Sections: summary callout, criteria, RQ1-RQ5, benchmark datasheet, methods (with the exact FNPEG and PredGuid
-settings), deviations, appendix with every table and any figure not shown above.
+Sections: summary callout (marked provisional while any criterion waits for flights), criteria, RQ1-RQ5, benchmark
+datasheet, methods (with the exact FNPEG and PredGuid settings), limitations (the plan's section 16), deviations
+(section 15), appendix with every table and any figure not shown above.
 
     python jepa/report_v5.py <v5 study folder>
 """
@@ -37,13 +38,45 @@ ATM_LAB = R4.ATM_LAB
 _csv, _f = R4._csv, R4._f
 
 
-def deviations_text() -> str:
+def plan_section(number: int, title: str) -> str:
+    """The body of a numbered section of v5_plan.md (up to the next "## " heading or a rule line)."""
     try:
         txt = PLAN.read_text(encoding="utf-8")
     except OSError:
         return "(v5_plan.md not found)"
-    m = re.search(r"^## 15\. Deviations\s*$(.*)", txt, flags=re.M | re.S)
-    return m.group(1).strip() if m else "(no section 15 in v5_plan.md)"
+    m = re.search(rf"^## {number}\. {re.escape(title)}[^\n]*\n(.*?)(?=^## |^---\s*$|\Z)", txt, flags=re.M | re.S)
+    return m.group(1).strip() if m else f"(no section {number} in v5_plan.md)"
+
+
+def deviations_text() -> str:
+    return plan_section(15, "Deviations")
+
+
+def limitations_text() -> str:
+    return plan_section(16, "Limitations")
+
+
+def _paragraphs(text: str) -> list:
+    """Blank-line separated paragraphs and "* " bullets of a plan section, each joined to one line and turned
+    into reportlab markup (bold, no backticks, no bullet star)."""
+    parts = re.split(r"\n\s*\n|\n(?=\* )", text)
+    out = []
+    for x in parts:
+        x = re.sub(r"\s*\n\s*", " ", x.strip())
+        if not x:
+            continue
+        x = escape(re.sub(r"^\* ", "", x)).replace("`", "")
+        out.append(re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", x))
+    return out
+
+
+def _status(r) -> str:
+    """met / not met / pending / estimate / not run of a T05 row (tables written before the status column: from met)."""
+    st = str(getattr(r, "status", "") or "")
+    if st and st != "nan":
+        return st
+    m = str(getattr(r, "met", ""))
+    return "estimate" if m in ("None", "nan", "") else ("met" if m.lower() == "true" else "not met")
 
 
 def compact(key: str, df: Optional[pd.DataFrame]):
@@ -116,22 +149,37 @@ def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
             lines.append(f"<b>ORB-1 {escape(str(r.arm))}</b>: {int(r.n)} flights (blocks {r.blocks_flown}), success@10km "
                          f"{100 * r.success_10km:.2f}%, requirement LCB {r.requirement_lcb:.4f} "
                          f"({'met' if str(r.requirement_met).lower() == 'true' else 'not met'})")
+    pending = []
     if t05 is not None and len(t05):
-        test = t05[t05.met.notna() & (t05.met.astype(str) != "")]
-        met = test[test.met.astype(str).str.lower() == "true"]
-        lines.append(f"<b>Criteria met: {len(met)} of {len(test)}</b> pass/fail criteria: "
-                     f"{', '.join(met.id.astype(str)) or 'none'}.")
+        st = [_status(r) for r in t05.itertuples()]
+        ids = t05.id.astype(str).tolist()
+        met = [i for i, x in zip(ids, st) if x == "met"]
+        decided = [i for i, x in zip(ids, st) if x in ("met", "not met")]
+        pending = [i for i, x in zip(ids, st) if x == "pending"]
+        lines.append(f"<b>Criteria met: {len(met)} of {len(decided)}</b> decided pass/fail criteria: "
+                     f"{', '.join(met) or 'none'}."
+                     + (f" <b>{len(pending)} pending</b> (flights still missing): {', '.join(pending)}." if pending else ""))
+    if pending:
+        lines.insert(0, "<b>PROVISIONAL REPORT.</b> Some arms are not fully flown. A criterion is decided only when every "
+                        "paired flight of both arms exists; until then its numbers are provisional and it has no verdict.")
     d.callout("The numbers (read from 05_analysis/tables)", lines or ["No analysis tables yet."],
               R2.TINT_YELLOW, colors.HexColor("#eda100"))
     if t05 is not None and len(t05):
         d.h2("Pre-registered criteria (v5_plan.md section 8, fixed before any v5 flight)")
         rows = [["#", "Question", "Measured", "p (Holm)", "Met"]]
+        word = {"met": "yes", "not met": "<b>no</b>", "pending": "<b>pending</b>", "estimate": "estimate",
+                "not run": "not run"}
         for r in t05.itertuples():
-            met = "estimate" if str(r.met) in ("None", "nan", "") else ("yes" if str(r.met).lower() == "true" else "<b>no</b>")
+            met = word.get(_status(r), _status(r))
             if str(getattr(r, "valid", "")).lower() == "false":
                 met += " (invalid: G3)"
+            if _status(r) == "met" and str(getattr(r, "clustered_excludes_0", "")).lower() == "false":
+                met += " (not with clustered cases)"
             rows.append([escape(str(r.id)), escape(str(r.question)), escape(str(r.measured)), _f(r.p_holm, "{:.3g}"), met])
         d.table(rows, [0.8, 1.8, 3.1, 0.6, 0.6])
+        d.note("Met: yes / no are decided on complete data only; pending = flights still missing (numbers provisional); "
+               "estimate = reported with its interval, no pass/fail. \"Cases clustered across atmospheres\" is the "
+               "sensitivity interval that resamples each entry case together with its four atmospheres.")
 
     def fig(k):
         if k in Fg:
@@ -168,8 +216,10 @@ def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
     d.p("Published dispersions (Bairstow Table C.1, entry speed per D4), three target ranges inside the nominal "
         "footprint, a sequential stopping rule over three blocks of 1,000 cases. Q1 is the accuracy requirement "
         "(one-sided 90% lower bound on P(miss ≤ 10 km) ≥ 0.99865), Q2 crew g-duration limits, Q3 v2 against the "
-        "published laws on block 1.")
-    fig("F06"), fig("F07"), fig("F08"), tab("T08")
+        "published laws on block 1. Target 0 is reachable within 4.5 g at a constant bank in few cases, so a law that "
+        "enforces the limit gives up range there while a soft limit can be exceeded: Q3 is therefore also shown on "
+        "the load-feasible cases, with success counted only within the load limit, and per target (T08b).")
+    fig("F06"), fig("F07"), fig("F08"), tab("T08"), tab("T08b")
     d.h1("RQ5. Compute per decision")
     tab("T09")
     d.h1("Success against the threshold")
@@ -203,7 +253,12 @@ def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
         "(common random numbers). Deterministic arms are broadcast over seeds; RL comparisons pair seeds 0–2.",
         f"<b>Uncertainty</b>: hierarchical bootstrap, {cfg.get('n_boot')} resamples (seeds, then cases within each "
         "atmosphere), 95% percentile intervals (90% for TOST); ORB-1: cases resampled within training-seed strata; "
-        "per-seed exact McNemar and sign tests; Holm within each family.",
+        "per-seed exact McNemar and sign tests; Holm within each family. Sensitivity: the same bootstrap with each "
+        "entry case resampled together with its four atmospheres (the 256 conditions come from 64 entry cases).",
+        "<b>Within the load limit</b>: success@5km and peak g ≤ 4.6 (the 4.5 g limit plus the 0.1 g margin of G3 and of "
+        "the tuning objective).",
+        "<b>Verdicts</b>: a pass/fail criterion is decided only when every paired flight of both arms exists; before "
+        "that it is pending.",
         "<b>FNPEG settings (chosen on DEV48)</b>: " + escape(json.dumps(tuned.get("fnpeg", {}).get("config", "defaults"),
                                                                          default=str)),
         "<b>PredGuid settings (chosen on DEV48)</b>: " + escape(json.dumps(tuned.get("predguid", {}).get("config", "defaults"),
@@ -211,9 +266,12 @@ def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
         "<b>Planner</b>: MPPI as in v3 (256 samples, 6 knots, 30° noise, 4 iterations at entry then 1, horizon 188 "
         "steps of 5 s, soft g limit 50 km per g² above the limit).",
     ])
+    d.h1("Limitations (v5_plan.md section 16)")
+    for para in _paragraphs(limitations_text()):
+        d.p(para)
     d.h1("Deviations (v5_plan.md section 15)")
-    for para in [p for p in deviations_text().split("\n\n") if p.strip()]:
-        d.p(escape(para.strip()))
+    for para in _paragraphs(deviations_text()):
+        d.p(para)
     d.add(PageBreak())
     d.h1("Appendix: every table")
     for k, p in T.items():

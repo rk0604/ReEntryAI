@@ -9,11 +9,15 @@ tables (T01-T12, CSV) and figures (F01-F10, PNG and PDF at 200 dpi) with caption
     cube, comp        A256 paired comparisons with analyze_v4.Boot (hierarchical bootstrap: seeds, then cases within
                       atmospheres; cached in 05_analysis/cache/ by comparison and input hash)
     orb_paired        ORB-1 paired comparisons: each case one unit, cases resampled within training-seed strata
-    criteria          G1-G7, J-each / J-equiv / J-mech, R-each / R-imit / R-gap, Q1-Q3 (T05)
+    criteria          G1-G7, J-each / J-equiv / J-mech, R-each / R-imit / R-gap, Q1-Q3 (T05); a pass/fail criterion
+                      is decided only when every paired flight of both arms exists (status "pending" before that)
+    ClusterBoot       sensitivity analysis: the same bootstrap with each entry case resampled together with its four
+                      atmospheres (the pooled A256 intervals treat the 256 conditions as independent)
     analyze           the tables, the figures, the criteria; returns a summary for the report
 
 Definitions (section 5): success@5km / @2km = outcome drogue and miss < 5 / 2 km; success@10km = drogue and
-miss <= 10 km; log miss = ln(max(miss, 0.01 km)). Deterministic arms (classical, fnpeg, predguid, their
+miss <= 10 km; success@5km within the load limit = success@5km and peak g <= 4.6 (benchmark_v5.LOAD_OK_G);
+log miss = ln(max(miss, 0.01 km)). Deterministic arms (classical, fnpeg, predguid, their
 exploratory variants, legacy RL) fly once per condition and are broadcast over seeds; MPPI arms' "seed s" is
 model seed s and noise index s; RL arms' seeds are training seeds 0-2 (comparisons with them pair seeds 0-2).
 """
@@ -163,6 +167,7 @@ def load_flights_v5(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4=None
     df["success_5km"] = landed & (df.miss_km < 5.0)
     df["success_10km"] = landed & (df.miss_km <= 10.0)
     df["success_25km"] = landed & (df.miss_km < 25.0)
+    df["success_5km_load"] = df.success_5km & (df.peak_g <= B.LOAD_OK_G)
     df["log_miss"] = np.log(df.miss_km.clip(lower=cfg.log_miss_floor_km))
     df["block"] = pd.to_numeric(df.get("block"), errors="coerce")
     df["target_index"] = pd.to_numeric(df.get("target_index"), errors="coerce")
@@ -174,7 +179,12 @@ def load_flights_v5(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4=None
     df = df[keep].copy()
     is_a = df.suite == "A256"
     feas = df.get("feasible", pd.Series(np.nan, index=df.index)).map(lambda v: np.nan if pd.isna(v) else _b(v))
+    feas = feas.astype(object)                           # bool / None / NaN (all-NaN would be float: no v5 flight yet)
     feas[is_a] = [a256.get((c, a)) for c, a in zip(df.case[is_a], df.atmosphere[is_a])]
+    # ORB-1: feasible = the frozen suite's 4.5 g constant-bank flag (the flight files carry the no-load-cap flag)
+    orb45 = {int(c["case"]): bool(c.get("feasible_4p5g")) for c in S5.conditions(cfg, "ORB1")}
+    is_o = df.suite == "ORB1"
+    feas[is_o] = [orb45.get(int(c)) for c in df.case[is_o]]
     df["feasible"] = feas.astype(object)
     return df.reset_index(drop=True)
 
@@ -207,11 +217,62 @@ def present(df: pd.DataFrame, al: tuple, suite: str = "A256") -> bool:
     return bool(((df.arm == al[0]) & (df.load == al[1]) & (df.suite == suite)).any())
 
 
-class Comparer:
-    """Paired A256 comparisons A - B, pooled and per atmosphere, with per-seed tests (analyze_v4's scheme)."""
+class ClusterBoot(A4.Boot):
+    """analyze_v4.Boot with one case draw shared by every atmosphere: an entry case is resampled together with its
+    four atmospheres (one cluster). The pre-registered bootstrap draws cases independently in each atmosphere, which
+    treats the 256 conditions as independent although they come from 64 entry cases; this is its sensitivity
+    analysis (v5_plan.md section 15, 2026-11-11). Same cache folder, keys suffixed."""
 
-    def __init__(self, df, boot: A4.Boot, cases):
-        self.df, self.boot, self.cases = df, boot, cases
+    def __call__(self, key, cubes, fn, atm=None, stream=None):
+        return super().__call__(key + "|clustered", cubes, fn, atm, stream)
+
+    def run(self, cubes, fn, atm, seed):
+        S_ = max(X.shape[0] for X in cubes)
+        Xs = [np.repeat(X, S_, 0) if X.shape[0] == 1 else X for X in cubes]
+        if atm is not None:
+            Xs = [X[:, atm:atm + 1] for X in Xs]
+        A, C = Xs[0].shape[1:]
+        f = A4.FNS[fn]
+        with np.errstate(all="ignore"):
+            point = float(f([X[None] for X in Xs])[0])
+        rng = np.random.default_rng(seed)
+        vals = []
+        for b0 in range(0, self.n_boot, 1000):
+            nb = min(1000, self.n_boot - b0)
+            si = rng.integers(0, S_, (nb, S_))
+            ci = np.broadcast_to(rng.integers(0, C, (nb, 1, C)), (nb, A, C))      # the same cases in every atmosphere
+            ix = (si[:, :, None, None], np.arange(A)[None, None, :, None], ci[:, None, :, :])
+            with np.errstate(all="ignore"):
+                vals.append(f([X[ix] for X in Xs]))
+        d = np.concatenate(vals)
+        d = d[np.isfinite(d)]
+        if not len(d):
+            return {"diff": point, "ci_lo": np.nan, "ci_hi": np.nan, "ci90_lo": np.nan, "ci90_hi": np.nan,
+                    "p_boot": np.nan, "n_boot_ok": 0}
+        lo, hi = np.percentile(d, [2.5, 97.5])
+        lo90, hi90 = np.percentile(d, [5.0, 95.0])
+        p_ = min(1.0, 2 * min((d <= 0).mean(), (d >= 0).mean()))
+        return {"diff": point, "ci_lo": float(lo), "ci_hi": float(hi), "ci90_lo": float(lo90), "ci90_hi": float(hi90),
+                "p_boot": float(max(p_, 1.0 / len(d))), "n_boot_ok": int(len(d))}
+
+
+def n_pairs(XA: np.ndarray, XB: np.ndarray, atm: Optional[int] = None) -> Tuple[int, int]:
+    """(conditions flown by both arms, conditions expected) of two [seeds | 1, atmospheres, cases] cubes."""
+    S_ = max(XA.shape[0], XB.shape[0])
+    A_ = np.broadcast_to(XA, (S_,) + XA.shape[1:])
+    B_ = np.broadcast_to(XB, (S_,) + XB.shape[1:])
+    if atm is not None:
+        A_, B_ = A_[:, atm], B_[:, atm]
+    ok = np.isfinite(A_) & np.isfinite(B_)
+    return int(ok.sum()), int(ok.size)
+
+
+class Comparer:
+    """Paired A256 comparisons A - B, pooled and per atmosphere, with per-seed tests (analyze_v4's scheme), the
+    number of paired flights present and expected, and (pooled) the clustered-case interval."""
+
+    def __init__(self, df, boot: A4.Boot, cases, cboot: Optional[A4.Boot] = None):
+        self.df, self.boot, self.cases, self.cboot = df, boot, cases, cboot
 
     def __call__(self, name: str, a: tuple, b: tuple, metric: str, seeds: Sequence[int]) -> List[dict]:
         if not (present(self.df, a) and present(self.df, b)):
@@ -226,9 +287,15 @@ class Comparer:
         for i, t in [(None, "all")] + list(enumerate(ATM)):
             r = self.boot(f"v5|{name}|{a}|{b}|{metric}|{list(seeds)}", [XA, XB], fn, i)
             r = {k: (v * scale if k in ("diff", "ci_lo", "ci_hi", "ci90_lo", "ci90_hi") else v) for k, v in r.items()}
+            have, want = n_pairs(XA, XB, i)
             row = {"id": name, "a": label(*a), "b": label(*b), "a_key": key_of(*a), "b_key": key_of(*b),
-                   "metric": metric, "atmosphere": t, **r}
+                   "metric": metric, "atmosphere": t, **r, "n_pairs": have, "n_expected": want,
+                   "complete": bool(have == want)}
             if t == "all":
+                if self.cboot is not None:
+                    rc = self.cboot(f"v5|{name}|{a}|{b}|{metric}|{list(seeds)}", [XA, XB], fn, None)
+                    row.update({"ci_lo_clustered": rc["ci_lo"] * scale, "ci_hi_clustered": rc["ci_hi"] * scale,
+                                "p_boot_clustered": rc["p_boot"]})
                 k, n = A4._holds(ps, np.sign(r["diff"]) if np.isfinite(r["diff"]) and r["diff"] != 0 else 1.0)
                 row.update({"seeds_holding": k, "n_seeds": n,
                             "per_seed": json.dumps([round(float(p["diff"]), 4) for p in ps])})
@@ -316,12 +383,33 @@ def orb1_telemetry(L, df_orb: pd.DataFrame) -> pd.DataFrame:
 # ============================================================================
 # Criteria (T05)
 # ============================================================================
+def _n(r) -> Tuple[int, int, bool]:
+    """(paired flights present, expected, complete) of a comparison row."""
+    n = int(r["n_pairs"]) if r is not None and "n_pairs" in r and np.isfinite(r["n_pairs"]) else 0
+    e = int(r["n_expected"]) if r is not None and "n_expected" in r and np.isfinite(r["n_expected"]) else 0
+    return n, e, bool(e > 0 and n == e)
+
+
+def _prov(r) -> str:
+    n, e, done = _n(r)
+    return "" if done else f"PROVISIONAL ({n} of {e} paired flights): "
+
+
 def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_seeds) -> pd.DataFrame:
+    """T05. A pass/fail criterion is decided only on complete data: until every paired flight of both arms exists
+    its status is "pending", `met` stays empty and the measured text is marked PROVISIONAL (the analysis runs on
+    every "Run all", so without this a half-flown arm would show a verdict)."""
     rows = []
 
-    def row(id_, fam, q, measured, met, value=np.nan, ci=(np.nan, np.nan), p=None, holding=None, valid=None):
+    def row(id_, fam, q, measured, met, value=np.nan, ci=(np.nan, np.nan), p=None, holding=None, valid=None,
+            status=None, r=None, pairs=None):
+        n, e = pairs if pairs is not None else (_n(r)[:2] if r is not None else (np.nan, np.nan))
+        clo = float(r.get("ci_lo_clustered", np.nan)) if r is not None else np.nan
+        chi = float(r.get("ci_hi_clustered", np.nan)) if r is not None else np.nan
         rows.append({"id": id_, "family": fam, "question": q, "measured": measured, "value": value, "ci_lo": ci[0],
-                     "ci_hi": ci[1], "p": p, "p_holm": None, "seeds_holding": holding, "met": met, "valid": valid})
+                     "ci_hi": ci[1], "p": p, "p_holm": None, "seeds_holding": holding, "met": met, "valid": valid,
+                     "status": status, "n_pairs": n, "n_expected": e, "ci_lo_clustered": clo, "ci_hi_clustered": chi,
+                     "clustered_excludes_0": bool(clo > 0 or chi < 0) if np.isfinite(clo) and np.isfinite(chi) else None})
 
     def per_atm(t, id_, metric="success5", fmt="{:+.1f}"):
         return ", ".join(f"{ATM_LAB[a]} {fmt.format(r['diff'])} [{fmt.format(r['ci_lo'])}, {fmt.format(r['ci_hi'])}]"
@@ -331,49 +419,65 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
         return (f"success@5km {r['diff']:+.1f} {unit} [{r['ci_lo']:+.1f}, {r['ci_hi']:+.1f}], holds in "
                 f"{int(r['seeds_holding'])}/{int(r['n_seeds'])} seeds")
 
+    def clu(r, fmt="{:+.1f}"):
+        lo, hi = r.get("ci_lo_clustered", np.nan), r.get("ci_hi_clustered", np.nan)
+        return (f"; cases clustered across atmospheres [{fmt.format(lo)}, {fmt.format(hi)}]"
+                if np.isfinite(lo) and np.isfinite(hi) else "")
+
     # ---- RQ1 ----
     for id_, q in (("G1", "Does v2 beat FNPEG? (v2single − fnpeg)"), ("G2", "Does v2 beat PredGuid? (v2single − predguid)"),
                    ("G4", "Does v2 beat FNPEG at FNPEG's own load? (v2single@fnpeg_matched − fnpeg)"),
                    ("G5", "Does the learned model beat explicit estimation? (v2single − mppi_filtered)")):
         r = _get(t04, id_)
         if r is None:
-            row(id_, "RQ1", q, "not run", False)
+            row(id_, "RQ1", q, "not run", None, status="not run")
             continue
+        done = _n(r)[2]
         worse = [a for a in ATM if (x := _get(t04, id_, "success5", a)) is not None and x["ci_hi"] < 0]
         need = 4 if int(r["n_seeds"]) >= 5 else max(1, int(r["n_seeds"]) - 1)
-        met = bool(r["diff"] > 0 and r["ci_lo"] > 0 and int(r["seeds_holding"]) >= need and not worse)
-        row(id_, "RQ1", q, s5_text(r) + "; " + per_atm(t04, id_) + (f"; B significantly better in {worse}" if worse else ""),
-            met, r["diff"], (r["ci_lo"], r["ci_hi"]), r["p_boot"], f"{int(r['seeds_holding'])}/{int(r['n_seeds'])}")
-    # G3: validity of the load comparison
+        met = bool(r["diff"] > 0 and r["ci_lo"] > 0 and int(r["seeds_holding"]) >= need and not worse) if done else None
+        row(id_, "RQ1", q, _prov(r) + s5_text(r) + clu(r) + "; " + per_atm(t04, id_)
+            + (f"; B significantly better in {worse}" if worse else ""),
+            met, r["diff"], (r["ci_lo"], r["ci_hi"]), r["p_boot"], f"{int(r['seeds_holding'])}/{int(r['n_seeds'])}",
+            status=None if done else "pending", r=r)
+    # G3: validity of the load comparison (decided with G4's flights)
     a = df[df.suite == "A256"]
     pk = {k: a[a.key == k].groupby("atmosphere").peak_g.mean() for k in ("fnpeg", "v2single@fnpeg_matched")}
+    g4 = _get(t04, "G4")
+    g4_done = _n(g4)[2]
+    q3_ = "Is the load comparison valid? (fnpeg mean peak g ≤ 4.6 g; matched arm ≤ fnpeg + 0.1 g, per atmosphere)"
     if len(pk["fnpeg"]) and len(pk["v2single@fnpeg_matched"]):
         f_ok = bool((pk["fnpeg"] <= cfg.tune_peak_g_max + 1e-9).all())
         m_ok = all(pk["v2single@fnpeg_matched"].get(t, np.inf) <= pk["fnpeg"].get(t, -np.inf) + 0.1 for t in pk["fnpeg"].index)
-        row("G3", "RQ1", "Is the load comparison valid? (fnpeg mean peak g ≤ 4.6 g; matched arm ≤ fnpeg + 0.1 g, per atmosphere)",
-            "; ".join(f"{ATM_LAB[t]}: fnpeg {pk['fnpeg'][t]:.2f} g, matched {pk['v2single@fnpeg_matched'].get(t, np.nan):.2f} g"
-                      for t in pk["fnpeg"].index), f_ok and m_ok)
+        row("G3", "RQ1", q3_, (_prov(g4) if not g4_done else "") + "; ".join(
+            f"{ATM_LAB[t]}: fnpeg {pk['fnpeg'][t]:.2f} g, matched {pk['v2single@fnpeg_matched'].get(t, np.nan):.2f} g"
+            for t in pk["fnpeg"].index), (f_ok and m_ok) if g4_done else None, status=None if g4_done else "pending")
     else:
-        row("G3", "RQ1", "Is the load comparison valid?", "not run", False)
+        row("G3", "RQ1", q3_, "not run", None, status="not run")
     g3 = rows[-1]["met"]
     for r_ in rows:
         if r_["id"] == "G4":
-            r_["valid"] = bool(g3)
+            r_["valid"] = None if g3 is None else bool(g3)
     # G6: competence
     gp = {k: v.get("pass") for k, v in gates.items()}
-    parts = [f"gates {', '.join(f'{k} {_pass(v)}' for k, v in gp.items())}"]
+    vs = ("V1", "V2", "V3", "V4")
+    g_done = all(gp.get(k) is not None for k in vs)
+    parts = [f"gates {', '.join(f'{k} {_pass(gp.get(k))}' for k in list(vs) + [k for k in gp if k not in vs])}"]
     for id_ in ("G6a", "G6b"):
         r = _get(t04, id_)
         if r is not None:
-            parts.append(f"{r['a']} − classical: {per_atm(t04, id_)}")
+            parts.append(f"{_prov(r)}{r['a']} − classical: {per_atm(t04, id_)}")
     row("G6", "RQ1", "Are the baselines competent? (V1-V4 passed; fnpeg and predguid vs classical per atmosphere)",
-        "; ".join(parts), all(v is True for k, v in gp.items() if k in ("V1", "V2", "V3", "V4")))
+        "; ".join(parts), all(gp.get(k) is True for k in vs) if g_done else None, status=None if g_done else "pending")
     for id_, q in (("G7a", "What does the 90° handle cost FNPEG? (fnpeg_180 − fnpeg, exploratory)"),
                    ("G7b", "What does the 90° handle cost PredGuid? (predguid_180 − predguid, exploratory)"),
                    ("G7c", "How far is FNPEG from its own ceiling? (fnpeg_oracle − fnpeg, exploratory)")):
         r = _get(t04, id_)
-        row(id_, "RQ1", q, "not run" if r is None else f"success@5km {r['diff']:+.1f} pp [{r['ci_lo']:+.1f}, "
-            f"{r['ci_hi']:+.1f}]; {per_atm(t04, id_)}", None, *(() if r is None else (r["diff"], (r["ci_lo"], r["ci_hi"]))))
+        if r is None:
+            row(id_, "RQ1", q, "not run", None, status="not run")
+        else:
+            row(id_, "RQ1", q, f"{_prov(r)}success@5km {r['diff']:+.1f} pp [{r['ci_lo']:+.1f}, {r['ci_hi']:+.1f}]"
+                f"{clu(r)}; {per_atm(t04, id_)}", None, r["diff"], (r["ci_lo"], r["ci_hi"]), r=r)
     _holm(rows, ("G1", "G2", "G4", "G5"))
 
     # ---- RQ2 ----
@@ -383,32 +487,37 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
         r = _get(t06, id_, "log_miss")
         q = f"Does R0 beat {arm}? (paired log miss {arm} − R0)"
         if r is None:
-            row(id_, "RQ2", q, "not run", False)
+            row(id_, "RQ2", q, "not run", None, status="not run")
             continue
+        done = _n(r)[2]
         need = 4 if int(r["n_seeds"]) >= 5 else max(1, int(r["n_seeds"]) - 1)
-        met = bool(r["diff"] > 0 and r["ci_lo"] > 0 and int(r["seeds_holding"]) >= need)
-        row(id_, "RQ2", q, f"mean paired log miss {r['diff']:+.3f} [{r['ci_lo']:+.3f}, {r['ci_hi']:+.3f}] "
-            f"(miss ratio ×{math.exp(r['diff']):.2f}), holds in {int(r['seeds_holding'])}/{int(r['n_seeds'])} seeds; "
-            + per_atm(t06, id_, "log_miss", "{:+.3f}"), met, r["diff"], (r["ci_lo"], r["ci_hi"]), r["p_boot"],
-            f"{int(r['seeds_holding'])}/{int(r['n_seeds'])}")
+        met = bool(r["diff"] > 0 and r["ci_lo"] > 0 and int(r["seeds_holding"]) >= need) if done else None
+        row(id_, "RQ2", q, f"{_prov(r)}mean paired log miss {r['diff']:+.3f} [{r['ci_lo']:+.3f}, {r['ci_hi']:+.3f}] "
+            f"(miss ratio ×{math.exp(r['diff']):.2f}), holds in {int(r['seeds_holding'])}/{int(r['n_seeds'])} seeds"
+            + clu(r, "{:+.3f}") + "; " + per_atm(t06, id_, "log_miss", "{:+.3f}"), met, r["diff"],
+            (r["ci_lo"], r["ci_hi"]), r["p_boot"], f"{int(r['seeds_holding'])}/{int(r['n_seeds'])}",
+            status=None if done else "pending", r=r)
         jr.append(id_)
     _holm(rows, jr)
     r = _get(t06, "J-r0_nojepa", "log_miss")
     if r is not None:
+        done = _n(r)[2]
         eq = bool(-cfg.equiv_log < r["ci90_lo"] and r["ci90_hi"] < cfg.equiv_log)
-        each = next((x["met"] and (x["p_holm"] or 1) < 0.05 for x in rows if x["id"] == "J-r0_nojepa"), False)
+        each = next((x["met"] is True for x in rows if x["id"] == "J-r0_nojepa"), False)
         ans = "the JEPA objective matters (R0 better)" if each else ("equivalent: the objective does not matter" if eq
                                                                       else "inconclusive")
         row("J-equiv", "RQ2", f"Is r0_nojepa equivalent to R0? (90% CI inside ±{cfg.equiv_log})",
-            f"90% CI [{r['ci90_lo']:+.3f}, {r['ci90_hi']:+.3f}]: {ans}", eq, r["diff"], (r["ci90_lo"], r["ci90_hi"]))
+            f"{_prov(r)}90% CI [{r['ci90_lo']:+.3f}, {r['ci90_hi']:+.3f}]: {ans}", eq if done else None, r["diff"],
+            (r["ci90_lo"], r["ci90_hi"]), status=None if done else "pending", pairs=_n(r)[:2])
     else:
-        row("J-equiv", "RQ2", "Is r0_nojepa equivalent to R0?", "not run", False)
+        row("J-equiv", "RQ2", "Is r0_nojepa equivalent to R0?", "not run", None, status="not run")
     if mech.get("rho") is not None:
         row("J-mech", "RQ2", f"Does open-loop error at {mech['ttg_s']:.0f} s predict closed-loop log miss? (Spearman ρ "
             f"across {mech['n_models']} models)", f"ρ = {mech['rho']:+.2f} [{mech['ci_lo']:+.2f}, {mech['ci_hi']:+.2f}]",
             None, mech["rho"], (mech["ci_lo"], mech["ci_hi"]))
     else:
-        row("J-mech", "RQ2", "Does open-loop error predict closed-loop log miss?", "fewer than 3 models with both", None)
+        row("J-mech", "RQ2", "Does open-loop error predict closed-loop log miss?", "fewer than 3 models with both", None,
+            status="not run")
 
     # ---- RQ3 ----
     rr = []
@@ -417,31 +526,43 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
         r = _get(t07, id_)
         if r is None:
             if arm in S5.RL_TIER1:
-                row(id_, "RQ3", f"Does v2 beat {arm}?", "not run", False)
+                row(id_, "RQ3", f"Does v2 beat {arm}?", "not run", None, status="not run")
             continue
         n = int(r["n_seeds"])
-        met = bool(r["diff"] > 0 and r["ci_lo"] > 0 and int(r["seeds_holding"]) >= n)
+        done = _n(r)[2]
+        met = bool(r["diff"] > 0 and r["ci_lo"] > 0 and int(r["seeds_holding"]) >= n) if done else None
         row(id_, "RQ3" if arm in S5.RL_TIER1 else "RQ3 (Tier 2, outside the Holm family)",
-            f"Does v2 beat {arm}? (v2single − {arm}, seeds {list(rl_seeds)})", s5_text(r), met, r["diff"],
-            (r["ci_lo"], r["ci_hi"]), r["p_boot"], f"{int(r['seeds_holding'])}/{n}")
+            f"Does v2 beat {arm}? (v2single − {arm}, seeds {list(rl_seeds)})", _prov(r) + s5_text(r) + clu(r), met,
+            r["diff"], (r["ci_lo"], r["ci_hi"]), r["p_boot"], f"{int(r['seeds_holding'])}/{n}",
+            status=None if done else "pending", r=r)
         if arm in S5.RL_TIER1:
             rr.append(id_)
     _holm(rows, rr)
     r = _get(t07, "R-imit")
-    row("R-imit", "RQ3", "Imitation gap (dagger_fnpeg − fnpeg, estimate)", "not run" if r is None else
-        f"success@5km {r['diff']:+.1f} pp [{r['ci_lo']:+.1f}, {r['ci_hi']:+.1f}]", None,
-        *(() if r is None else (r["diff"], (r["ci_lo"], r["ci_hi"]))))
+    if r is None:
+        row("R-imit", "RQ3", "Imitation gap (dagger_fnpeg − fnpeg, estimate)", "not run", None, status="not run")
+    else:
+        row("R-imit", "RQ3", "Imitation gap (dagger_fnpeg − fnpeg, estimate)", f"{_prov(r)}success@5km {r['diff']:+.1f} pp "
+            f"[{r['ci_lo']:+.1f}, {r['ci_hi']:+.1f}]{clu(r)}", None, r["diff"], (r["ci_lo"], r["ci_hi"]), r=r)
     gaps = t07.attrs.get("gaps", {}) if t07 is not None else {}
     row("R-gap", "RQ3", "Sim-to-sim gap (success@5km fast env − full simulator, same policy and A256 cases)",
-        "; ".join(f"{a} {v:+.1f} pp" for a, v in gaps.items()) or "not run", None)
+        "; ".join(f"{a} {v:+.1f} pp" for a, v in gaps.items()) or "not run", None,
+        status=None if gaps else "not run")
 
     # ---- RQ4 ----
+    n_total, n_b1 = int(orb.get("n_total") or 0), int(orb.get("n_block1") or 0)
     sc = orb.get("score")
     if sc is not None and len(sc):
         for r in sc[sc.group == "all"].itertuples():
+            # met needs the bound; a fail is final at 2 misses (the stopping rule ends the arm); otherwise the arm
+            # has not flown enough cases to decide (blocks 2 and 3 are Tier 2)
+            nm = int(r.n_miss_10km)
+            met = True if bool(r.requirement_met) else (False if nm >= 2 else None)
             row(f"Q1-{r.arm}", "RQ4", f"Does {r.arm} meet the accuracy requirement? (P(miss ≤ 10 km) LCB ≥ "
-                f"{B.EM1_REQUIREMENT})", f"{int(r.n)} flights, {int(r.n_miss_10km)} beyond 10 km, LCB {r.requirement_lcb:.5f}",
-                bool(r.requirement_met), r.requirement_lcb)
+                f"{B.EM1_REQUIREMENT})", f"{int(r.n)} of {n_total} cases flown, {nm} beyond 10 km, LCB "
+                f"{r.requirement_lcb:.5f}" + ("" if met is not None else " (too few flights to decide; blocks 2–3 are "
+                                              "Tier 2)"), met, r.requirement_lcb,
+                status=None if met is not None else "pending", pairs=(int(r.n), n_total))
         for r in sc[sc.group == "all"].itertuples():
             row(f"Q2-{r.arm}", "RQ4", f"Does {r.arm} respect the crew g-duration limits? (descriptive)",
                 f"{100 * r.g_compliant_frac:.1f}% of flights compliant [{100 * r.g_compliant_lo:.1f}, "
@@ -452,13 +573,26 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
         r = orb.get(id_)
         q = f"Does v2 beat {other} on ORB-1 block 1? (v2single − {other})"
         if not r or not r.get("n"):
-            row(id_, "RQ4", q, "not run", False)
+            row(id_, "RQ4", q, "not run", None, status="not run")
             continue
-        met = bool(r["diff"] > 0 and r["ci_lo"] > 0)
-        row(id_, "RQ4", q, f"success@5km {100 * r['diff']:+.1f} pp [{100 * r['ci_lo']:+.1f}, {100 * r['ci_hi']:+.1f}] "
-            f"over {r['n']} cases", met, 100 * r["diff"], (100 * r["ci_lo"], 100 * r["ci_hi"]), r["p_boot"])
+        done = n_b1 > 0 and int(r["n"]) == n_b1
+        met = bool(r["diff"] > 0 and r["ci_lo"] > 0) if done else None
+        row(id_, "RQ4", q, ("" if done else f"PROVISIONAL ({int(r['n'])} of {n_b1} block-1 cases): ")
+            + f"success@5km {100 * r['diff']:+.1f} pp [{100 * r['ci_lo']:+.1f}, {100 * r['ci_hi']:+.1f}] "
+            f"over {r['n']} cases", met, 100 * r["diff"], (100 * r["ci_lo"], 100 * r["ci_hi"]), r["p_boot"],
+            status=None if done else "pending", pairs=(int(r["n"]), n_b1))
         q3.append(id_)
     _holm(rows, q3)
+    for id_, other in (("Q3a", "fnpeg"), ("Q3b", "predguid")):
+        ss = (orb.get("sens") or {}).get(id_) or []
+        txt = "; ".join(f"{x['subset']}: {x['diff_pp']:+.1f} pp [{x['ci_lo_pp']:+.1f}, {x['ci_hi_pp']:+.1f}] (n {x['n']})"
+                        for x in ss)
+        row(f"{id_}-sens", "RQ4", f"Is {id_} driven by target 0 or by the load limit? (v2single − {other}; "
+            "sensitivity estimates, T08b)", txt or "not run", None, status=None if ss else "not run")
+
+    for r_ in rows:
+        if r_["status"] is None:
+            r_["status"] = "estimate" if r_["met"] is None else ("met" if r_["met"] else "not met")
     return pd.DataFrame(rows)
 
 
@@ -608,6 +742,7 @@ def analyze(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4=None, log=pr
     05_analysis/) when nothing it reads changed since the last complete analysis, unless force."""
     caps = A4.Captions(L)
     boot = A4.Boot(L, cfg.n_boot)
+    cboot = ClusterBoot(L, cfg.n_boot)
     df = load_flights_v5(cfg, L, L3, L4)
     fp = inputs_fingerprint(cfg, L, L3, L4, df)
     fpp = L.analysis / "inputs.json"
@@ -618,22 +753,23 @@ def analyze(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4=None, log=pr
             same = False
         if same:
             log(f"[analysis] {len(df)} flights; nothing changed since the last analysis (05_analysis/inputs.json)")
-            return {"skipped": True, "n_flights": int(len(df)), "boot": boot,
+            return {"skipped": True, "n_flights": int(len(df)), "boot": boot, "boot_clustered": cboot,
                     "T05": pd.read_csv(next(L.tables.glob("T05_*.csv"))),
                     "figures": {p.stem.split("_")[0]: p for p in sorted(L.figures.glob("F*.png"))}}
-    out = _analyze(cfg, L, L3, L4, log, caps, boot, df)
+    out = _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot)
     if _outputs_complete(L):
         L.write_json(fpp, {"fingerprint": fp, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "n_flights": int(len(df))})
     return out
 
 
-def _analyze(cfg, L, L3, L4, log, caps, boot, df) -> dict:
+def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
     main = main_flights(df)
     cases = sorted({int(c["case"]) for c in S5.conditions(cfg, "A256")})
     seeds = list(cfg.seeds)
     rl_seeds = list(cfg.rl_seeds)
-    comp = Comparer(main, boot, cases)
+    comp = Comparer(main, boot, cases, cboot)
     out: Dict[str, object] = {"n_flights": int(len(df)), "n_v5_flights": int((df.source == "v5").sum()), "boot": boot,
+                              "boot_clustered": cboot,
                               "seeds": seeds}
     data = "04_flights/flights.csv (+ the v3 and v4 folders' flights, read only)"
 
@@ -648,7 +784,8 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df) -> dict:
         sc = sc.merge(spread, on=["suite", "arm", "group"], how="left")
     _table(L, caps, sc.round(5), "T01_metrics_by_arm",
            "Every section-5 metric per arm × suite × atmosphere (A256, DEV48 excluded) or target range (ORB-1), plus the "
-           "arm's pooled row (group all): success at 2/5/10/25 km, mean log miss, median and p95 miss, peak g, heat, RCS, "
+           "arm's pooled row (group all): success at 2/5/10/25 km, success@5km within the load limit (peak g ≤ "
+           f"{B.LOAD_OK_G:g}), mean log miss, median and p95 miss, peak g, heat, RCS, "
            "reversals, planning ms, authority saturation, the ORB-1 requirement LCB and g-duration compliance with its "
            "Clopper–Pearson interval; seed min/max of success@5km for seeded arms. v3 and v4 arms included.", data)
     fe = main[main.feasible.map(lambda v: v is True or _b(v))]
@@ -672,7 +809,9 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df) -> dict:
            "RQ1 at 4.5 g: paired differences A − B, pooled and per atmosphere, with 95% and 90% hierarchical-bootstrap "
            f"intervals ({cfg.n_boot} resamples: seeds, then cases within each atmosphere), bootstrap p, and the seeds "
            "where the pooled effect holds. success5 in percentage points; log_miss = mean paired difference of ln(miss). "
-           "G1/G2/G4/G5 are the Holm family; G6 the competence check; G7 exploratory.", data)
+           "G1/G2/G4/G5 are the Holm family; G6 the competence check; G7 exploratory. n_pairs / n_expected = conditions "
+           "flown by both arms / in the design (a criterion is decided only when they are equal). ci_*_clustered: the "
+           "same bootstrap with each entry case resampled together with its four atmospheres (sensitivity analysis).", data)
     out["T04"] = t04
 
     # ---- T06 RQ2 ----
@@ -738,7 +877,9 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df) -> dict:
     out["T07"] = t07
 
     # ---- T08 RQ4 ----
-    orb = {}
+    oc = S5.conditions(cfg, "ORB1")
+    orb = {"n_total": len(oc), "n_block1": sum(1 for c in oc if int(c["block"]) == 0)}
+    sens: List[dict] = []
     od = main[main.suite == "ORB1"]
     if len(od):
         s8 = B.score(od.assign(arm=od.key))
@@ -746,18 +887,44 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df) -> dict:
         s8["blocks_flown"] = s8.arm.map(blocks)
         orb["score"] = s8
         b1 = od[od.block == 0]
-        piv = b1.pivot_table(index="case", columns="key", values="success_5km", aggfunc="first")
-        strata = (piv.index.to_numpy() % len(cfg.seeds))
+        feas = b1.feasible.map(lambda v: v is True or _b(v))
+        subsets = [("pooled (pre-registered)", "success_5km", None),
+                   ("load-feasible cases (4.5 g at constant bank)", "success_5km", feas),
+                   (f"within 5 km and peak g <= {B.LOAD_OK_G:g}", "success_5km_load", None)]
+        subsets += [(f"target {t} only", "success_5km", b1.target_index == t)
+                    for t in sorted(b1.target_index.dropna().astype(int).unique())]
         for id_, other in (("Q3a", "fnpeg"), ("Q3b", "predguid")):
-            if "v2single" in piv and other in piv:
-                orb[id_] = orb_paired(L, f"v5|{id_}|orb1_block1", piv["v2single"].astype(float).to_numpy(),
-                                      piv[other].astype(float).to_numpy(), strata, cfg.n_boot)
+            for k, (name, col, mask) in enumerate(subsets):
+                d = b1 if mask is None else b1[mask]
+                piv = d.pivot_table(index="case", columns="key", values=col, aggfunc="first") if len(d) else {}
+                if "v2single" not in piv or other not in piv:
+                    continue
+                a_, b_ = piv["v2single"].astype(float).to_numpy(), piv[other].astype(float).to_numpy()
+                r = orb_paired(L, f"v5|{id_}|orb1_block1" + ("" if k == 0 else f"|{name}"), a_, b_,
+                               piv.index.to_numpy() % len(cfg.seeds), cfg.n_boot)
+                if k == 0:
+                    orb[id_] = r                         # the pre-registered Q3: every block-1 case, success@5km
+                ok = np.isfinite(a_) & np.isfinite(b_)
+                sens.append({"id": id_, "comparison": f"v2single − {other}", "subset": name, "metric": col,
+                             "n": r["n"], "v2single_%": 100 * a_[ok].mean() if ok.any() else np.nan,
+                             "other_%": 100 * b_[ok].mean() if ok.any() else np.nan, "diff_pp": 100 * r["diff"],
+                             "ci_lo_pp": 100 * r["ci_lo"], "ci_hi_pp": 100 * r["ci_hi"], "p_boot": r["p_boot"]})
+        orb["sens"] = {i: [x for x in sens if x["id"] == i and x["subset"] != subsets[0][0]] for i in ("Q3a", "Q3b")}
     else:
         s8 = pd.DataFrame()
     _table(L, caps, s8.round(5), "T08_rq4_orb1",
            "RQ4, ORB-1: per arm and target range (and pooled): blocks flown (sequential stopping rule), success at "
-           f"2/5/10 km, the one-sided 90% Clopper–Pearson lower bound on P(miss ≤ 10 km) against {B.EM1_REQUIREMENT}, "
+           f"2/5/10 km, success@5km within the load limit (peak g ≤ {B.LOAD_OK_G:g}), the one-sided 90% Clopper–Pearson lower bound on P(miss ≤ 10 km) against {B.EM1_REQUIREMENT}, "
            "g-duration compliance (NASA-STD-3000 deconditioned crew) with its interval.", data)
+    t08b = pd.DataFrame(sens, columns=["id", "comparison", "subset", "metric", "n", "v2single_%", "other_%", "diff_pp",
+                                       "ci_lo_pp", "ci_hi_pp", "p_boot"])
+    _table(L, caps, t08b.round(5), "T08b_rq4_q3_sensitivity",
+           "RQ4, Q3 on ORB-1 block 1 and its sensitivity analyses (v5_plan.md section 15, 2026-11-11): the "
+           "pre-registered pooled comparison; the cases whose target is reachable within 4.5 g at a constant bank "
+           "(all of targets 1 and 2, few of target 0); success counted only when the flight also kept peak g ≤ "
+           f"{B.LOAD_OK_G:g}; and each target alone. Paired by case, cases resampled within training-seed strata; "
+           "estimates with 95% intervals, no pass/fail. Target 0 is mostly unreachable under 4.5 g, so a controller "
+           "that enforces the limit gives up range there and one with a soft limit can exceed it.", data)
     if any(k in orb for k in ("Q3a", "Q3b")):
         out["Q3"] = {k: orb[k] for k in ("Q3a", "Q3b") if k in orb}
 
@@ -765,7 +932,10 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df) -> dict:
     t05 = criteria(cfg, main, t04, t06, t07, mech, orb, gates, seeds, rl_seeds)
     _table(L, caps, t05, "T05_criteria", "Pre-registered criteria (v5_plan.md section 8): measured value, interval, "
            "bootstrap p, Holm-adjusted p within each family (RQ1: G1, G2, G4, G5; RQ2: the four J-each; RQ3: the Tier 1 "
-           "R-each; RQ4: Q3a, Q3b), seeds holding, met (blank = an estimate, not pass/fail), valid (G4 needs G3).",
+           "R-each; RQ4: Q3a, Q3b), seeds holding, met (blank = not decided), valid (G4 needs G3). status: met / not met "
+           "(decided on complete data), pending (flights still missing: n_pairs of n_expected; the measured text is "
+           "PROVISIONAL), estimate (no pass/fail), not run. ci_*_clustered: the interval with each entry case "
+           "resampled together with its four atmospheres; clustered_excludes_0 tells whether the verdict survives it.",
            "05_analysis/tables/T04, T06, T07, T08")
     out["T05"] = t05
 
@@ -811,7 +981,11 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df) -> dict:
         log(f"[analysis] figures failed: {type(e).__name__}: {e}")
         raise
     out["captions"] = caps.d
-    log(f"[analysis] {len(df)} flights; bootstrap: {boot.computed} computed, {boot.reused} reused from cache")
+    log(f"[analysis] {len(df)} flights; bootstrap: {boot.computed} computed, {boot.reused} reused from cache"
+        + (f"; clustered: {cboot.computed} computed, {cboot.reused} reused" if cboot is not None else ""))
+    pend = t05[t05.status == "pending"].id.tolist() if len(t05) else []
+    if pend:
+        log(f"[analysis] PROVISIONAL: {len(pend)} criteria wait for flights ({', '.join(pend)})")
     return out
 
 
