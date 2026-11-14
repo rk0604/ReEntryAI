@@ -716,12 +716,18 @@ def _stat_rows(paths) -> List[str]:
 
 
 def inputs_fingerprint(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4, df: pd.DataFrame) -> str:
-    """Everything the analysis reads: the flights (ids and outcomes), the gate, tuning, timing, open-loop, policy and
-    inventory files (size and modification time), the frozen config and this module's code."""
+    """Everything the analysis reads: the flights (ids and outcomes), the gate, tuning, timing, open-loop and policy
+    files (size and modification time), the frozen config and the legacy inventory (their content: the inventory is
+    rewritten by every run, and a new timestamp on the same content must not redo the analysis), this module's code."""
     h = hashlib.sha256()
     cols = [c for c in ("flight_id", "source", "arm", "miss_km", "peak_g", "outcome") if c in df]
     h.update(df[cols].sort_values(cols[:2] if len(cols) > 1 else cols).to_csv(index=False).encode())
-    files: List[str] = [str(L.study / "study_config.json"), str(L.study / "legacy_rl_inventory.csv"), __file__]
+    for q in (L.study / "study_config.json", L.study / "legacy_rl_inventory.csv"):
+        try:
+            h.update(q.name.encode() + hashlib.sha256(q.read_bytes()).digest())
+        except OSError:
+            h.update(q.name.encode() + b"missing")
+    files: List[str] = [__file__]
     for root in (L.checks, L.tuning, L.open_loop, L.policies, L.models) + tuple(
             x.open_loop for x in (L3, L4) if x is not None and hasattr(x, "open_loop")):
         for dp, _dirs, fs in os.walk(root):

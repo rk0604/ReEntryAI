@@ -1043,7 +1043,7 @@ def gates(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, workers: int = 1, log=p
         run_cpu(cfg, [j for v in js.values() for j in v], L, workers, log, "gates")
     js = gate_jobs(cfg, L)
     out["V1"] = _gate_v1(cfg, L, js["V1"])
-    out["V2"] = _gate_v2(cfg, L, js.get("V2", []))
+    out["V2"] = _gate_v2(cfg, L, js.get("V2", []), js["V1"])
     out["V3"] = _gate_v3(cfg, L, js["V3"])
     out["V4"] = _gate_v4(cfg, L, js["V4"])
     out["E0"] = gate_e0(cfg, L, L3, log)
@@ -1070,7 +1070,35 @@ def _gate_v1(cfg, L, jobs) -> dict:
                                  "per_flight_iter_le6": it_frac})
 
 
-def _gate_v2(cfg, L, jobs) -> dict:
+# Gate V2's rule for "the limit was infeasible on this flight" (section 15, 2026-11-14): the law had no authority
+# left when the load peaked. Constants of the gate's definition, written into V2.json (not study settings).
+V2_SAT_S = 20.0            # the command was full lift-up for this long before the peak load ...
+V2_SAT_DEG = 1.0           # ... to within this bank angle, with the relief active the whole time
+V2_MIN_DROP_G = 0.05       # and the relief lowered the peak by at least this much against the unrelieved V1 flight
+
+
+def _relief_at_peak(L, r: dict, amax_g: float) -> dict:
+    """What FNPEG's load relief did around a flight's peak load (from its decision log)."""
+    t = S.load_telemetry(L, r["flight_id"])
+    tt, g = np.asarray(t["t_s"], float), np.asarray(t["g"], float)
+    dt, cmd, rel, ag = (np.asarray(t[k], float) for k in ("dec_t_s", "dec_cmd_deg", "dec_relief", "dec_a_g"))
+    t_pk = float(tt[int(np.argmax(g))])
+    w = (dt >= t_pk - V2_SAT_S) & (dt <= t_pk)
+    over = dt[ag > amax_g]
+    on = dt[rel > 0]
+    return {"t_peak_s": t_pk, "relief_from_s": float(on[0]) if len(on) else None,
+            "first_over_s": float(over[0]) if len(over) else None,
+            "engaged_in_time": bool(len(on) and (not len(over) or on[0] <= over[0])),
+            "saturated": bool(w.any() and (np.abs(cmd[w]) <= V2_SAT_DEG).all() and (rel[w] > 0).all()),
+            "s_above_limit": float((g > amax_g).sum() * (np.median(np.diff(tt)) if len(tt) > 1 else 1.0))}
+
+
+def _gate_v2(cfg, L, jobs, v1_jobs: Sequence[dict] = ()) -> dict:
+    """Load relief at amax = 3 g on the cases whose unrelieved peak exceeds 3.5 g. A flight is accepted when the
+    limit was held (peak <= amax + 0.15 g, and then it must also land within 2 km), or when the limit was
+    infeasible for it: the relief was on before the load crossed amax, the command was full lift-up for the 20 s
+    before the peak, and the peak is lower than the unrelieved V1 flight's. (Before 2026-11-14 the peak test was
+    required of every flight; on these entries 3 g cannot be reached even at full lift-up, see section 15.)"""
     have = _gate_done(L, "V2")
     if have is not None:
         return have
@@ -1079,18 +1107,30 @@ def _gate_v2(cfg, L, jobs) -> dict:
     rs = _results(L, jobs)
     if len(rs) < len(jobs):
         return {"pass": None}
+    v1 = {int(r["case"]): float(r["peak_g"]) for r in _results(L, list(v1_jobs))}
     main = [r for r in rs if r["arm"] == "gate_V2_fnpeg_3g"]
-    peak_ok = all(r["peak_g"] <= cfg.v2_amax_g + cfg.v2_tol_g for r in main)
-    miss_ok = [r["outcome"] == "drogue" and r["miss_km"] < cfg.v1_miss_km for r in main]
+    rows = []
+    for r in main:
+        a = _relief_at_peak(L, r, cfg.v2_amax_g)
+        held = bool(r["peak_g"] <= cfg.v2_amax_g + cfg.v2_tol_g)
+        pk1 = v1.get(int(r["case"]))
+        lowered = pk1 is None or r["peak_g"] <= pk1 - V2_MIN_DROP_G
+        infeasible = bool(not held and a["saturated"] and a["engaged_in_time"] and lowered)
+        landed = r["outcome"] == "drogue" and r["miss_km"] < cfg.v1_miss_km
+        rows.append({"flight": r["flight_id"], "case": int(r["case"]), "peak_g": r["peak_g"], "unrelieved_peak_g": pk1,
+                     "miss_km": r["miss_km"], "held": held, "infeasible_saturated": infeasible,
+                     "ok": bool((held and landed) or infeasible), **a})
     sweep = {}
     for r in rs:
         sweep.setdefault(int(r["case"]), {})[r["arm"].replace("gate_V2_fnpeg_", "")] = (r["peak_g"], r["miss_km"])
-    # "where feasible": the 3 g miss criterion is required where the 3 g flight lands (an infeasible 3 g case
-    # cannot reach the target at that load; it is reported, as Lu's Fig. 17 sweep is)
-    ok = peak_ok and all(m for r, m in zip(main, miss_ok) if r["outcome"] == "drogue")
-    return _gate_write(L, "V2", {"pass": bool(ok), "n_cases": len(main), "peak_ok": bool(peak_ok),
-                                 "miss_lt_2km": miss_ok, "flights": {r["flight_id"]: {"peak_g": r["peak_g"],
-                                                                                    "miss_km": r["miss_km"]} for r in rs},
+    ok = all(x["ok"] for x in rows)
+    return _gate_write(L, "V2", {"pass": bool(ok), "n_cases": len(main), "n_held": sum(x["held"] for x in rows),
+                                 "n_infeasible_saturated": sum(x["infeasible_saturated"] for x in rows),
+                                 "peak_ok": all(x["held"] for x in rows),
+                                 "rule": {"amax_g": cfg.v2_amax_g, "tol_g": cfg.v2_tol_g, "sat_s": V2_SAT_S,
+                                          "sat_deg": V2_SAT_DEG, "min_drop_g": V2_MIN_DROP_G},
+                                 "cases": rows, "flights": {r["flight_id"]: {"peak_g": r["peak_g"],
+                                                                            "miss_km": r["miss_km"]} for r in rs},
                                  "sweep": sweep})
 
 

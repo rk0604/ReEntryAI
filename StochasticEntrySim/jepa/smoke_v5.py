@@ -421,6 +421,10 @@ def t6_rl(tmp: Path, wide: Path) -> None:
 def make_legacy(root: Path) -> Path:
     """MyDrive/ReEntryAI/models/<name>.zip with a dummy SB3 PPO on rl_env's 13-feature observation."""
     p = root / "models" / "dummy_ppo_policy.zip"
+    ck = root / "checkpoints" / "run_x" / "ppo_1000_steps.zip"
+    if not ck.exists():                     # a temp-folder cleanup can remove one file and leave the other
+        ck.parent.mkdir(parents=True, exist_ok=True)
+        ck.write_bytes(b"checkpoint")
     if p.exists():
         return p
     import gymnasium as gym
@@ -437,8 +441,6 @@ def make_legacy(root: Path) -> Path:
             return np.zeros(13, np.float32), 0.0, True, False, {}
 
     p.parent.mkdir(parents=True, exist_ok=True)
-    (root / "checkpoints" / "run_x").mkdir(parents=True, exist_ok=True)
-    (root / "checkpoints" / "run_x" / "ppo_1000_steps.zip").write_bytes(b"checkpoint")
     PPO("MlpPolicy", Env(), seed=0, n_steps=8, batch_size=8).save(str(p))
     return p
 
@@ -588,7 +590,9 @@ def _newest(root: Path) -> float:
 
 def run_nb(root: Path, fx: dict, tag: str, fail: str = None, stall_min: float = 25.0) -> tuple:
     """Execute the notebook with nbconvert (output and errors to nb_runs/<tag>.out/.err). A run that writes nothing
-    under its study folder for stall_min minutes is killed and reported as stalled."""
+    under its study folder for stall_min minutes is killed and reported as stalled (a pause of the whole machine,
+    such as a laptop's sleep, restarts that clock). Run the smoke test from a console that stays open: when the
+    console of this process is closed, the notebook's worker processes can no longer start and the run hangs."""
     out = root.parent / "nb_runs"
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -599,11 +603,16 @@ def run_nb(root: Path, fx: dict, tag: str, fail: str = None, stall_min: float = 
                               "--output-dir", str(out), "--output", f"{tag}.ipynb", "ReEntryAI_JEPA_v5.ipynb"],
                              env=nb_env(root, fx, fail), stdout=so, stderr=se)
         stalled = False
+        last_poll, t_ref = time.time(), t0
         while p.poll() is None:
             try:
                 p.wait(timeout=20)
             except subprocess.TimeoutExpired:
-                if time.time() - max(t0, _newest(root)) > stall_min * 60:
+                now = time.time()
+                if now - last_poll > 300:           # the machine slept: that pause is not a stall
+                    t_ref = now
+                last_poll = now
+                if now - max(t_ref, _newest(root)) > stall_min * 60:
                     stalled = True
                     subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)] if os.name == "nt"
                                    else ["kill", "-9", str(p.pid)], capture_output=True)

@@ -382,7 +382,8 @@ README's numbers) and on A256 (out of its training distribution). A missing fold
 ## 5. Gates V1–V4 and E0
 
 The gates fly the dev suite (the 12 DEV48 cases), never a test case. V1: FNPEG with the true parameters lands
-within 2 km on ≥ 11 of 12 cases, Newton converging in ≤ 6 iterations in ≥ 99% of cycles. V2: load relief at 3 g.
+within 2 km on ≥ 11 of 12 cases, Newton converging in ≤ 6 iterations in ≥ 99% of cycles. V2: load relief at 3 g
+(the limit is held, or the law is at full lift-up when the load peaks: on steep entries 3 g cannot be reached).
 V3: the fading-memory filters reach the true drag scale within 3% by 150 s after 0.05 g. V4: PredGuid within 3.5 km
 on ≥ 11 of 12. E0: the v5 runner equals `run_lockstep_v4` bit for bit. **A failed gate stops the notebook** (no
 test flight may run on it). Passed gates are skipped.
