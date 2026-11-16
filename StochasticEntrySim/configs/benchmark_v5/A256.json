@@ -25,6 +25,6 @@
  "n_cases": 64,
  "n_conditions": 256,
  "note": "the v3 test set unchanged; every v3 and v4 flight pairs with v5 flights on it",
- "sha256": "cbf1b279854de260370e72680d42ee3b221bdd0ad9ff88bfbb8b5f63bff0d354",
+ "sha256": "f982fd2115e08d7290a5cc9d900ded74a9e1faf92c06f082b8f5c6ec1502a0af",
  "suite": "A256"
 }

@@ -616,8 +616,14 @@ def sha256_file(path) -> str:
     return h.hexdigest()
 
 
+def sha256_text(path) -> str:
+    """SHA-256 of a text file with CRLF read as LF: git stores configs/v3_testset.csv with LF, and a Windows checkout
+    (core.autocrlf) has CRLF, so the raw bytes differ between machines while the content does not."""
+    return hashlib.sha256(Path(path).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
 def a256_meta() -> dict:
-    return {"suite": "A256", "file": "configs/v3_testset.csv", "sha256": sha256_file(A256_CSV), "n_cases": 64,
+    return {"suite": "A256", "file": "configs/v3_testset.csv", "sha256": sha256_text(A256_CSV), "n_cases": 64,
             "atmospheres": T3.ATMOSPHERES, "n_conditions": 256,
             "note": "the v3 test set unchanged; every v3 and v4 flight pairs with v5 flights on it"}
 
@@ -648,7 +654,7 @@ def verify(bench_dir: Path = BENCH_DIR) -> Dict[str, str]:
             want[name.strip()] = h
     bad = [n for n, h in want.items() if not (bench_dir / n).exists() or sha256_file(bench_dir / n) != h]
     meta = json.loads((bench_dir / "A256.json").read_text())
-    if sha256_file(A256_CSV) != meta["sha256"]:
+    if sha256_text(A256_CSV) != meta["sha256"]:
         bad.append("configs/v3_testset.csv (A256.json pointer)")
     if bad:
         raise ChecksumError(f"benchmark files changed since they were frozen: {bad}")

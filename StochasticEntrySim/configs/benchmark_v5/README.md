@@ -21,7 +21,7 @@ atmosphere, bank actuator 20 deg/s, drogue deploy at 7.6 km). Plan and preregist
 | DEV48 | `DEV48.csv`, 12 cases x 4 atmospheres | tuning only, never a result |
 
 ### A256
-The v3 test set unchanged (sha256 `cbf1b279854de260`), each case in four atmospheres:
+The v3 test set unchanged (sha256 `f982fd2115e08d72`), each case in four atmospheres:
 nominal; thin (density x0.88, L/D x0.88); dense (x1.12, x1.12); out of range (x0.78, L/D x0.80).
 
 ### ORB-1 (Orion-class LEO return)
