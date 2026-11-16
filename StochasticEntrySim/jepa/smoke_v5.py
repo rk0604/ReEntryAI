@@ -219,6 +219,50 @@ def t1_suites(tmp: Path, workers: int) -> None:
     check("ORB-1 knobs reproduce the dispersed drag and lift (100 draws, simulator aero)", worst < 1e-12,
           f"(max relative error {worst:.1e})")
     t1_ds1(nom)
+    t1_as1(nom)
+
+
+def t1_as1(nom: dict) -> None:
+    """AS1 and the aero-schedule hook (v5_plan.md section 3.4b)."""
+    from jepa import benchmark_v5 as B
+    from jepa import physics_v4 as PH
+    from jepa.data import apply_domain
+    import math_3d
+    spec = B.AS1Spec()
+    doc = B.build_as1_doc(spec, workers=max(1, min(8, (os.cpu_count() or 2) - 1)))
+    check("AS1 regenerated == the frozen AS1.json bytes (schedules and reachability flags)",
+          (json.dumps(doc, indent=1) + "\n").encode() == (B.BENCH_DIR / "AS1.json").read_bytes(),
+          f"(reachable: {[doc['vehicles'][v]['n_feasible'] for v in B.AS1_VEHICLES]} of {len(doc['cases'])})")
+    conds = B.load_suite("AS1")
+    check("AS1 loads 64 cases x 2 vehicles in nominal air; every domain value a float; its copy of the simulator's "
+          "schedule equals the port's", len(conds) == 128 and {c["atmosphere"] for c in conds} == set(B.AS1_VEHICLES)
+          and all(isinstance(float(v), float) for c in conds for v in c["domain"].values())
+          and all(isinstance(c["feasible_as1"], bool) for c in conds)
+          and [tuple(r) for r in spec.ours] == [tuple(float(v) for v in r) for r in PH.TRIM_SCHEDULE])
+    # the hook: at a speed where the schedules differ, lift/drag of the true vehicle == the AS1 schedule's L/D; a
+    # later domain without the id puts the parameters back exactly
+    base = {"density_scale": 1.0, "lift_scale": 1.0, "mass_scale": 1.0}
+    x = [6_378_100.0 + 60_000.0, 0.1, 0.2, 4500.0, math.radians(-2.0), 0.7]
+    f0 = math_3d.nominal_aero_forces_from_state(x, 0.3, apply_domain(dict(nom), base))
+    ok, shown = True, {}
+    for v in B.AS1_VEHICLES:
+        f1 = math_3d.nominal_aero_forces_from_state(x, 0.3, apply_domain(dict(nom), B.as1_domain(v)))
+        ld0, ld1 = f0["lift_mag_N"] / f0["drag_mag_N"], f1["lift_mag_N"] / f1["drag_mag_N"]
+        sch = dict((r[0], r) for r in spec.schedule(v))
+        lo, hi = min(r[2] for r in sch.values()), max(r[2] for r in sch.values())
+        shown[v] = (round(ld0, 4), round(ld1, 4), round(f1["drag_mag_N"] / f0["drag_mag_N"], 4))
+        ok &= ld1 < ld0 - 0.02 and lo - 1e-9 <= ld1 <= hi + 1e-9
+        ok &= (abs(f1["drag_mag_N"] / f0["drag_mag_N"] - 1.0) < 1e-12) == (v == "bibb_ld")
+    fresh = apply_domain(dict(nom), base)
+    reused = apply_domain(apply_domain(dict(nom), B.as1_domain("bibb_ld_cd")), base)
+    check("aero hook: the true vehicle flies the AS1 schedule (lower L/D; drag changes only for bibb_ld_cd); a later "
+          "domain without it restores the parameters exactly", ok and reused == fresh
+          and "aero_schedule_before" not in reused, f"(L/D ours, AS1, drag ratio: {shown})")
+    ic = dict(B.ORB1Spec().nominal_ic())
+    a = B.fly_constant_bank_sim(ic, 45.0, dict(base))
+    b = B.fly_constant_bank_sim(ic, 45.0, B.as1_domain("bibb_ld"))
+    check("a full flight on the AS1 vehicle lands shorter than the simulator's own vehicle at the same bank",
+          b["downrange_km"] < a["downrange_km"] - 10.0, f"({a['downrange_km']:.0f} km vs {b['downrange_km']:.0f} km)")
 
 
 def t1_ds1(nom: dict) -> None:
@@ -730,19 +774,19 @@ def t9_analysis(root: Path, fx: dict) -> None:
     from jepa import study_v5 as S5
     cfg = S5.StudyConfigV5.smoke()
     L = S5.LayoutV5(root, read_only=[fx["v3"], fx["v4"], fx["legacy"], fx["data"]])
-    need_t = [f"T{i:02d}" for i in range(1, 14)]
+    need_t = [f"T{i:02d}" for i in range(1, 15)]
     need_f = [f"F{i:02d}" for i in range(1, 11)]
     have_t = {p.stem.split("_")[0] for p in L.tables.glob("T*.csv")}
     have_f = {p.stem.split("_")[0] for p in L.figures.glob("F*.png")}
     have_pdf = {p.stem.split("_")[0] for p in L.figures.glob("F*.pdf")}
-    check("every table T01-T13", set(need_t) <= have_t, f"(missing {sorted(set(need_t) - have_t)})")
+    check("every table T01-T14", set(need_t) <= have_t, f"(missing {sorted(set(need_t) - have_t)})")
     check("every figure F01-F10 as PNG and PDF", set(need_f) <= have_f and set(need_f) <= have_pdf,
           f"(missing {sorted((set(need_f) - have_f) | (set(need_f) - have_pdf))})")
     caps = json.loads((L.analysis / "captions.json").read_text())
     check("every table and figure has a caption and a data source",
           all(any(k.startswith(x) for k in caps) for x in need_t + need_f) and all(v.get("data") for v in caps.values()))
     t05 = pd.read_csv(next(L.tables.glob("T05_*.csv")))
-    ids = ["G1", "G2", "G3", "G4", "G5", "G6", "G7a", "G7b", "G7c", "J-mlp_direct", "J-gru_direct", "J-gru_pi",
+    ids = ["G1", "G2", "G3", "G4", "G5", "G6", "G7a", "G7b", "G7c", "G7d", "G7e", "A1", "A2", "A-shift", "J-mlp_direct", "J-gru_direct", "J-gru_pi",
            "J-r0_nojepa", "J-equiv", "J-mech", "R-dagger_fnpeg", "R-bcppo_fnpeg", "R-ppo_hist", "R-imit", "R-gap",
            "Q3a", "Q3b", "Q3a-sens", "Q3b-sens", "D1", "D2", "D-shift"]
     check("criteria table complete (G1-G7, J-each/equiv/mech, R-each/imit/gap, Q1-Q3, D1-D2)",
@@ -768,6 +812,26 @@ def t9_analysis(root: Path, fx: dict) -> None:
           and set(cfg.ds1_arms) <= set(t13b.arm) and set(d1.family) == {"DS1"}
           and set(d1.status) <= {"met", "not met"},
           f"(T13 {list(t13.id)}; T13b {list(t13b.arm)}; D1/D2 {list(d1.status)})")
+    t14 = pd.read_csv(next(L.tables.glob("T14_*.csv")))
+    t14b = pd.read_csv(next(L.tables.glob("T14b_*.csv")))
+    a1 = t05.set_index("id").loc[["A1", "A2"]]
+    check("AS1: T14 has A1 and A2 complete, T14b every AS1 arm against A256's nominal air, A1/A2 decided in their own "
+          "family", {"A1", "A2"} <= set(t14.id) and bool(t14.set_index("id").loc[["A1", "A2"], "complete"].all())
+          and set(cfg.as1_arms) <= set(t14b.arm) and set(a1.family) == {"AS1"} and set(a1.status) <= {"met", "not met"},
+          f"(T14 {list(t14.id)}; T14b {list(t14b.arm)}; A1/A2 {list(a1.status)})")
+    fl = pd.read_csv(L.flights / "flights.csv", low_memory=False)
+    v5f = fl[fl.source == "v5"] if "source" in fl else fl
+    iv_cols = {"use_intervals", "shield_interventions", "shield_steps", "interval_violations"} <= set(fl.columns)
+    legacy = v5f.arm.astype(str).str.startswith("rl_legacy_")
+    check("every v5 flight record carries the interval fields: shield never stepped, no interventions, intervals off "
+          "except legacy policies with the interval observation",
+          iv_cols and len(v5f) > 0 and bool(v5f.shield_interventions.notna().all())
+          and int(v5f.shield_interventions.sum()) == 0 and int(v5f.shield_steps.sum()) == 0
+          and not bool(v5f.use_intervals[~legacy].astype(str).str.lower().isin(["true", "1", "1.0"]).any()),
+          f"({len(v5f)} v5 flights, columns present: {iv_cols})")
+    t09 = pd.read_csv(next(L.tables.glob("T09_*.csv")))
+    check("compute table times the classical controller as flown and with its interval heat screen off",
+          {"classical", "classical_noscreen"} <= set(t09.arm), f"({sorted(set(t09.arm))})")
     L3 = S4.v3_layout(fx["v3"])
     L4 = S5.v4_layout(fx["v4"])
     try:
@@ -971,7 +1035,7 @@ def t15_outputs(root: Path) -> None:
     check("status history appended by every run", len(hist) >= 4, f"({len(hist)} rows)")
     logs = {p.stem for p in L.logs.glob("*.log")}
     want = {"setup", "benchmark", "gates", "tuning", "A256", "ORB1", "E3_train", "E3_fly", "E4_train", "E4_fly",
-            "explore", "open_loop", "analysis"}
+            "explore", "DS1", "AS1", "open_loop", "analysis"}
     check("a log per stage in 00_study/logs/", want <= logs, f"(missing {sorted(want - logs)})")
     curves = [L.model_dir(a, s) / "F_curves.png" for a in cfg.e3_arms for s in cfg.seeds] + \
         [L.policy_dir(a, s) / "F_curves.png" for a in S5.RL_TIER1 for s in cfg.rl_seeds] + \
@@ -993,7 +1057,7 @@ def t15_outputs(root: Path) -> None:
     check("tuning: round 2 recorded (refine.json) and both rounds scored before the choice",
           all(v == (True, want_n, [1, 2]) for v in tn.values()), f"({tn})")
     ex = sorted(p.name for p in (res / "A256").glob("*") if p.name in S5.EXPLORE_ARMS) if (res / "A256").exists() else []
-    check("the 180° and oracle arms flew in Tier 1", ex == sorted(S5.EXPLORE_ARMS), f"({ex})")
+    check("the 180°, oracle and no-relief arms flew in Tier 1", ex == sorted(S5.EXPLORE_ARMS), f"({ex})")
     tabs = len(list(L.tables.glob("T*.csv")))
     figs = len(list(L.figures.glob("F*.png"))), len(list(L.figures.glob("F*.pdf")))
     check("tables and figures (PNG and PDF) on disk", tabs >= 12 and min(figs) >= 10, f"({tabs} tables, {figs} figures)")
@@ -1034,7 +1098,8 @@ def _hook_only(base: str) -> Tuple[bool, str]:
         elif ln.startswith("+") and cur and hunks[cur]:
             hunks[cur][-1].append(ln[1:])
     n = {f: len(h) for f, h in hunks.items()}
-    about = all("density_profile" in "\n".join(h) for hs in hunks.values() for h in hs)
+    about = all("density_profile" in "\n".join(h) or "aero_schedule" in "\n".join(h)
+                for hs in hunks.values() for h in hs)
     return (not removed and n == HOOK_FILES and about), f"(removed lines {len(removed)}, added hunks {n})"
 
 

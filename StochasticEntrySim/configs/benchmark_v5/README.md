@@ -116,3 +116,22 @@ from 0 to 160 km); `density_scale` and `mass_scale` stay 1.
 The random profiles are of the size Earth-GRAM reports for density dispersions (a few percent low down,
 about 10 % at 80-100 km); they are not drawn from Earth-GRAM. Seed 20261115.
 <!-- DS1 end -->
+
+<!-- AS1 begin -->
+### AS1 (aerodynamic sensitivity; added 2026-11-15)
+
+A256's 64 entry cases and targets in nominal air, flown by a true vehicle whose trim aerodynamics follow
+the published Orion database instead of the simulator's own schedule (`AS1.json`, built by
+`python jepa/benchmark_v5.py --build-as1`; the other files are unchanged). The simulator's schedule has
+more lift than the database below about 6 km/s (`jepa/simulator_fidelity_audit.md` section 4.1). Every
+controller's internal model keeps the simulator's schedule, so this is an aerodynamic error that changes
+with Mach number.
+
+| Vehicle | L/D | CD | A256 targets still inside the 4.5 g footprint |
+|---|---|---|---|
+| bibb_ld | Bibb Part I Fig. 27 at FMV >= 8 (0.28 at FMV 8, 0.25 at FMV 25); capped at 0.28 below FMV 8 | the simulator's | 60 of 64 |
+| bibb_ld_cd | as bibb_ld | Bibb Part II Fig. 40(b) and Part I Fig. 26: 1.34 at FMV 3, 1.38 at FMV 8 and above | 60 of 64 |
+
+The values are read off the papers' figures (about +-0.03). `feasible` in `AS1.json` uses the rule and
+code that made A256's own flags (`testset_v3.footprint`, 4.5 g, margin > 0).
+<!-- AS1 end -->

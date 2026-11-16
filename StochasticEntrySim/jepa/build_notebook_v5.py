@@ -47,8 +47,9 @@ remains and skip.
 
 **Tiers (decision D1).** `TIER = 1` (default) runs the gates, legacy RL re-evaluation, tuning, the A256
 arms (FNPEG, PredGuid, MPPI + filtered physics, v2 at FNPEG's load), ORB-1 block 1, the four non-JEPA
-models, three RL baselines (5 seeds each), DS1 (density errors that change with altitude), and the
-exploratory arms (FNPEG and PredGuid with the published 180° bank range, FNPEG with the true parameters).
+models, three RL baselines (5 seeds each), DS1 (density errors that change with altitude), AS1 (the
+true vehicle on the published Orion aerodynamics), and the exploratory arms (FNPEG and PredGuid with the published
+180° bank range, FNPEG with the true parameters, FNPEG without its load relief).
 `TIER = 2` (after reading Tier 1's results) adds ORB-1 blocks 2–3
 for the arms still eligible, `mppi_truth` and the best non-JEPA and RL arms on ORB-1, SAC, and PPO in the
 full simulator. Everything is built and smoke-tested either way.
@@ -65,6 +66,7 @@ and the report says "provisional". What v5 does not test is listed in the report
 | RQ3 | How close do properly built RL baselines get? | E4: DAgger and BC → PPO from FNPEG, PPO (and SAC, full-sim PPO in Tier 2) |
 | RQ4 | On a standard Orion-class scenario, which controllers meet an Orion-style accuracy requirement and crew g limits? | ORB-1: 3 × 1,000 dispersed LEO returns, sequential stopping |
 | DS1 | Does RQ1's answer hold when the density error changes with altitude instead of staying constant? | DS1: A256's 64 cases × 4 altitude-varying density profiles |
+| AS1 | Does RQ1's answer hold when the true vehicle has the published Orion aerodynamics (less lift than the simulator's)? | AS1: A256's 64 cases × 2 true vehicles |
 | RQ5 | What does each controller cost per decision? | timing table |
 
 Inputs (read-only, guarded): `MyDrive/ReEntryAI_jepa_v3/`, `MyDrive/ReEntryAI_jepa_v4/`,
@@ -289,6 +291,12 @@ if RUN["DS1"]:
     S5.run_jobs(CFG, S5.jobs_ds1(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "DS1")
 """
 
+AS1 = r"""
+if RUN["AS1"]:
+    log = L.logger("AS1")
+    S5.run_jobs(CFG, S5.jobs_as1(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "AS1")
+"""
+
 ORB1_MORE = r"""
 if RUN["ORB1_more"]:
     log = L.logger("ORB1")
@@ -464,11 +472,22 @@ slow one, ~6 CPU-hours for its 256).
 """),
     ("code", DS1),
     ("md", r"""
+## 12c. AS1: the published Orion aerodynamics
+
+A256's 64 entry cases in nominal air, the true vehicle flying the published Orion trim aerodynamics
+(`configs/benchmark_v5/AS1.json`): `bibb_ld` (lower L/D) and `bibb_ld_cd` (lower L/D and CD). No controller's
+model is changed. The same eight arms and seed rule as DS1: 1,024 flights, 256 of them MPPI flights on the GPU, the
+rest on the CPU pool (`classical`: ~3 CPU-hours for its 128). Each condition carries a flag telling whether its
+target is still inside the true vehicle's 4.5 g footprint (60 of 64 for either vehicle).
+"""),
+    ("code", AS1),
+    ("md", r"""
 ## 13. Exploratory arms: the laws as published, and FNPEG's ceiling
 
 `fnpeg_180` and `predguid_180` (the same tuned laws with the published 180° bank range instead of the 90° every
-learned controller has) and `fnpeg_oracle` (FNPEG's predictor given the true parameters) on A256: what the 90°
-handle costs the published laws, and how far FNPEG is from its own ceiling (G7, estimates). CPU only.
+learned controller has), `fnpeg_oracle` (FNPEG's predictor given the true parameters) and `fnpeg_norelief` (the tuned
+FNPEG with Lu's load relief switched off) on A256: what the 90° handle costs the published laws, how far FNPEG is
+from its own ceiling, and whether its load relief costs it accuracy (G7, estimates). CPU only.
 """),
     ("code", EXPLORE),
     ("md", r"""
@@ -488,8 +507,9 @@ Footprint error of each E3 model and seed on the test split from 400 to 50 s to 
     ("md", r"""
 ## 15. Compute per decision, then the analysis
 
-RQ5's timing table (one flight per arm, single CPU thread and GPU), then every table T01–T13, figure F01–F10 (PNG
-and PDF, 200 dpi), `captions.json` and the criteria (G1–G7, J, R, Q, D). Bootstrap results are cached by comparison
+RQ5's timing table (one flight per arm, single CPU thread and GPU), then every table T01–T14, figure F01–F10 (PNG
+and PDF, 200 dpi), `captions.json` and the criteria (G1–G7, J, R, Q, D, A). The timing table has the classical
+controller twice: as flown, and with its diagnostic interval heat screen off (`classical_noscreen`). Bootstrap results are cached by comparison
 and input hash. Runs on any runtime and reports whatever exists: a criterion whose flights are not all there is
 shown as **pending** with provisional numbers, never as met or not met.
 """),

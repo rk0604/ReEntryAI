@@ -85,6 +85,14 @@ mounted on this machine); they were written by the same code.
 * **The heat-rate numbers of every arm** come from that same interval heat-shield object fed the
   nominal state (`math_3d.py:637-675`), so "peak heat rate" is its `.hi` value for all arms alike.
 
+## 2b. Acted on (2026-11-15, plan §15)
+
+* v5's flight records now store `use_intervals`, `shield_interventions`, `shield_steps` and
+  `interval_violations` (`fly_v5.interval_fields`), for every arm, so the answer to question 2 will be
+  in the data of the v5 run. v1–v4 records are as they were.
+* The compute table T09 times the classical controller as flown and again with the screen off
+  (`classical_noscreen`). Classical flights themselves are still flown with the screen on, as in v3.
+
 ## 3. What this means
 
 * No arm's trajectory was altered by a shield or a screen. The "provably safe" shield of the legacy

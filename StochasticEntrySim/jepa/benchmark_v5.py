@@ -16,6 +16,9 @@ configs/benchmark_v5/ and are verified against its SHA256SUMS every time they lo
     DS1     (added 2026-11-15) A256's 64 cases x four atmospheres whose density error changes with
             altitude (two shears, two GRAM-like random profiles), the only suite whose error no
             constant correction can represent; DS1.json holds every profile
+    AS1     (added 2026-11-15) A256's 64 cases in nominal air x two true vehicles whose trim
+            aerodynamics follow the published Orion database (lower L/D; lower L/D and CD) while
+            every controller's model keeps the simulator's schedule
 
 score() turns a flights table into every section-5 metric per arm x suite x (atmosphere or
 target range): success at 2/5/10/25 km, log miss, the Orion EM-1 requirement test (one-sided
@@ -24,6 +27,7 @@ compliance (Bairstow App. D.2 procedure), authority saturation, compute per deci
 
     python jepa/benchmark_v5.py --build --workers 11     # writes configs/benchmark_v5/ (then frozen)
     python jepa/benchmark_v5.py --build-ds1              # DS1.json only (2026-11-15), other files untouched
+    python jepa/benchmark_v5.py --build-as1 --workers 11 # AS1.json only (2026-11-15), other files untouched
     python jepa/benchmark_v5.py --verify
 """
 
@@ -54,7 +58,7 @@ from jepa.data import NOMINAL_DOMAIN
 BENCH_DIR = SIM_DIR / "configs" / "benchmark_v5"
 BENCH_REL = "configs/benchmark_v5"
 A256_CSV = SIM_DIR / "configs" / "v3_testset.csv"
-SUITES = ("A256", "ORB1", "DEV48", "DS1")
+SUITES = ("A256", "ORB1", "DEV48", "DS1", "AS1")
 FLOAT_FMT = "%.6f"
 R_KM = float(constants.RADIUS_EARTH) / 1000.0
 FT = 0.3048
@@ -294,6 +298,133 @@ def build_ds1(out_dir: Path = BENCH_DIR, spec: DS1Spec = DS1Spec()) -> dict:
     else:
         rd = rd.rstrip("\n") + "\n\n" + sec
     write_files({"DS1.json": (json.dumps(doc, indent=1) + "\n").encode(), "README.md": rd.encode("utf-8")}, out_dir)
+    return doc
+
+
+# ============================================================================
+# AS1: aerodynamic sensitivity (added 2026-11-15, v5_plan.md section 3.4b)
+# ============================================================================
+AS1_VEHICLES = ("bibb_ld", "bibb_ld_cd")
+
+
+@dataclass(frozen=True)
+class AS1Spec:
+    """Every number that defines AS1; saved in AS1.json. The true vehicle flies a trim schedule (FMV, CD, L/D) read
+    from the published Orion database instead of the simulator's own (jepa/simulator_fidelity_audit.md section
+    4.1); every controller's internal model keeps the simulator's schedule, so the aerodynamic error changes with
+    Mach number. Sources: L/D at FMV >= 8 from Bibb et al. Part I Fig. 27 (nominal); below FMV 8 the L/D is capped at
+    Part I's FMV 8 value (Part II gives no trim L/D curve and near-constant coefficients there); CD from Part II
+    Fig. 40(b) (FMV 2-4) and Part I Fig. 26 / Part II Fig. 38(a) (FMV >= 5). Figure readings, about +-0.03."""
+    ours: Tuple[Tuple[float, float, float], ...] = (
+        (0.0, 0.83, 0.10), (0.5, 0.85, 0.15), (0.7, 0.88, 0.20), (0.9, 1.02, 0.23), (1.1, 1.28, 0.25),
+        (1.5, 1.38, 0.28), (2.0, 1.43, 0.30), (3.0, 1.47, 0.33), (5.0, 1.50, 0.36), (8.0, 1.52, 0.40),
+        (10.0, 1.50, 0.39), (15.0, 1.52, 0.33), (20.0, 1.54, 0.30), (25.0, 1.55, 0.27), (30.0, 1.55, 0.27),
+        (35.0, 1.55, 0.28), (40.0, 1.55, 0.30))      # math_3d's default_trim_schedule (smoke check 1 compares them)
+    bibb_ld: Tuple[Tuple[float, float], ...] = (
+        (8.0, 0.280), (10.0, 0.277), (15.0, 0.263), (20.0, 0.257), (25.0, 0.250), (30.0, 0.245), (35.0, 0.244),
+        (40.0, 0.245))
+    ld_cap_below_fmv8: float = 0.28
+    bibb_cd: Tuple[Tuple[float, float], ...] = (
+        (2.0, 1.37), (3.0, 1.34), (5.0, 1.36), (8.0, 1.38), (10.0, 1.38), (15.0, 1.38), (20.0, 1.38), (25.0, 1.38),
+        (30.0, 1.38), (35.0, 1.38), (40.0, 1.38))
+
+    def schedule(self, vehicle: str) -> List[List[float]]:
+        ld, cd = dict(self.bibb_ld), dict(self.bibb_cd)
+        out = []
+        for f, c, l in self.ours:
+            l2 = ld[f] if f in ld else min(l, self.ld_cap_below_fmv8)
+            c2 = cd.get(f, c) if vehicle == "bibb_ld_cd" else c
+            out.append([float(f), float(c2), float(l2)])
+        return out
+
+
+def as1_schedule_id(vehicle: str) -> float:
+    """An AS1 vehicle as a number (1, 2): domains carry this id, because flight records copy domain values as floats."""
+    return float(AS1_VEHICLES.index(vehicle) + 1)
+
+
+def as1_schedule(sid: float, spec: AS1Spec = AS1Spec()) -> List[Tuple[float, float, float]]:
+    """The trim schedule of an AS1 id (data.apply_domain resolves aero_schedule_id with this)."""
+    return [tuple(r) for r in spec.schedule(AS1_VEHICLES[int(round(float(sid))) - 1])]
+
+
+def as1_domain(vehicle: str) -> dict:
+    return {"density_scale": 1.0, "lift_scale": 1.0, "mass_scale": 1.0, "aero_schedule_id": as1_schedule_id(vehicle)}
+
+
+def _as1_case(args) -> dict:
+    """Footprint margin of one A256 case's target under an AS1 vehicle (testset_v3's footprint code and rule)."""
+    c, vehicle = args
+    spec = T3.TestsetSpec()
+    fp = T3.footprint(float(c["altitude_m"]), float(c["velocity_mps"]), math.radians(float(c["gamma_deg"])),
+                      T3.truth_params(as1_domain(vehicle)), spec.footprint_dt_s, spec.bank_step_deg, spec.load_limit_g)
+    m = T3.margin_km(fp, (float(c["downrange_km"]), float(c["crossrange_km"])))
+    return {"case": int(c["case"]), "vehicle": vehicle, "margin_km": round(float(m), 3), "feasible": bool(m > 0.0)}
+
+
+def build_as1_doc(spec: AS1Spec = AS1Spec(), workers: int = 1) -> dict:
+    """AS1.json: the spec, both schedules and, per case and vehicle, whether A256's target is still inside the
+    4.5 g constant-bank footprint of the true vehicle (the rule that made A256's feasible_<atmosphere> flags)."""
+    import pandas as pd
+    rows = pd.read_csv(A256_CSV).to_dict("records")
+    tasks = [(c, v) for v in AS1_VEHICLES for c in rows]
+    if workers > 1:
+        with mp.Pool(workers) as pool:
+            res = pool.map(_as1_case, tasks, chunksize=4)
+    else:
+        res = [_as1_case(t) for t in tasks]
+    veh = {}
+    for v in AS1_VEHICLES:
+        mine = sorted((r for r in res if r["vehicle"] == v), key=lambda r: r["case"])
+        veh[v] = {"schedule": spec.schedule(v), "aero_schedule_id": as1_schedule_id(v),
+                  "margin_km": {str(r["case"]): r["margin_km"] for r in mine},
+                  "feasible": {str(r["case"]): r["feasible"] for r in mine},
+                  "n_feasible": int(sum(r["feasible"] for r in mine))}
+    return {"suite": "AS1", "spec": {"ours": [list(r) for r in spec.ours], "bibb_ld": [list(r) for r in spec.bibb_ld],
+                                     "ld_cap_below_fmv8": spec.ld_cap_below_fmv8,
+                                     "bibb_cd": [list(r) for r in spec.bibb_cd]},
+            "cases": [int(c["case"]) for c in rows], "vehicles": veh, "n_conditions": len(rows) * len(AS1_VEHICLES),
+            "note": "A256's entry cases and targets in nominal air; only the true vehicle's trim schedule differs "
+                    "(params['orion_trim_schedule'], set by data.apply_domain from aero_schedule_id). Controllers' "
+                    "internal models keep the simulator's own schedule."}
+
+
+AS1_README = """<!-- AS1 begin -->
+### AS1 (aerodynamic sensitivity; added 2026-11-15)
+
+A256's 64 entry cases and targets in nominal air, flown by a true vehicle whose trim aerodynamics follow
+the published Orion database instead of the simulator's own schedule (`AS1.json`, built by
+`python jepa/benchmark_v5.py --build-as1`; the other files are unchanged). The simulator's schedule has
+more lift than the database below about 6 km/s (`jepa/simulator_fidelity_audit.md` section 4.1). Every
+controller's internal model keeps the simulator's schedule, so this is an aerodynamic error that changes
+with Mach number.
+
+| Vehicle | L/D | CD | A256 targets still inside the 4.5 g footprint |
+|---|---|---|---|
+| bibb_ld | Bibb Part I Fig. 27 at FMV >= 8 ({ld8:g} at FMV 8, {ld25:g} at FMV 25); capped at {cap:g} below FMV 8 | the simulator's | {n1} of {n} |
+| bibb_ld_cd | as bibb_ld | Bibb Part II Fig. 40(b) and Part I Fig. 26: {cd3:g} at FMV 3, {cd8:g} at FMV 8 and above | {n2} of {n} |
+
+The values are read off the papers' figures (about +-0.03). `feasible` in `AS1.json` uses the rule and
+code that made A256's own flags (`testset_v3.footprint`, 4.5 g, margin > 0).
+<!-- AS1 end -->
+"""
+
+
+def build_as1(out_dir: Path = BENCH_DIR, spec: AS1Spec = AS1Spec(), workers: int = 1) -> dict:
+    """Write AS1.json, add (or replace) AS1's section in README.md, and rewrite SHA256SUMS; other files untouched."""
+    doc = build_as1_doc(spec, workers)
+    out_dir = Path(out_dir)
+    ld, cd = dict(spec.bibb_ld), dict(spec.bibb_cd)
+    sec = AS1_README.format(ld8=ld[8.0], ld25=ld[25.0], cap=spec.ld_cap_below_fmv8, cd3=cd[3.0], cd8=cd[8.0],
+                            n=len(doc["cases"]), n1=doc["vehicles"]["bibb_ld"]["n_feasible"],
+                            n2=doc["vehicles"]["bibb_ld_cd"]["n_feasible"])
+    rd = (out_dir / "README.md").read_text(encoding="utf-8") if (out_dir / "README.md").exists() else ""
+    if "<!-- AS1 begin -->" in rd:
+        a, b = rd.index("<!-- AS1 begin -->"), rd.index("<!-- AS1 end -->") + len("<!-- AS1 end -->\n")
+        rd = rd[:a] + sec + rd[b:]
+    else:
+        rd = rd.rstrip("\n") + "\n\n" + sec
+    write_files({"AS1.json": (json.dumps(doc, indent=1) + "\n").encode(), "README.md": rd.encode("utf-8")}, out_dir)
     return doc
 
 
@@ -554,6 +685,15 @@ def load_suite(name: str, bench_dir: Path = BENCH_DIR, check: bool = True) -> Li
                 out.append({**c, "suite": "DS1", "atmosphere": atm, "ic": T3.ic_of(c),
                             "domain": ds1_domain(doc, atm, int(c["case"])), "config_path": "configs/default.json"})
         return out
+    if name == "AS1":
+        doc = json.loads((bench_dir / "AS1.json").read_text())
+        out = []
+        for c in pd.read_csv(A256_CSV).to_dict("records"):
+            for v in AS1_VEHICLES:
+                out.append({**c, "suite": "AS1", "atmosphere": v, "ic": T3.ic_of(c), "domain": as1_domain(v),
+                            "feasible_as1": bool(doc["vehicles"][v]["feasible"][str(int(c["case"]))]),
+                            "config_path": "configs/default.json"})
+        return out
     raise ValueError(f"unknown suite {name!r}")
 
 
@@ -714,6 +854,7 @@ def build_all(workers: int = 1, out_dir: Path = BENCH_DIR, log=print, n_orb1: Op
                                             "orb1_in_training_domain": n_dom})
     write_files(files, Path(out_dir))
     build_ds1(Path(out_dir))                         # DS1 (added 2026-11-15): its file and README section
+    build_as1(Path(out_dir), workers=workers)        # AS1 (added 2026-11-15): its file and README section
     return {"targets": targets, "footprint": footprint, "orb1_feasible_frac": n_feas / len(orb1)}
 
 
@@ -844,6 +985,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--build", action="store_true")
     ap.add_argument("--build-ds1", action="store_true", help="write DS1.json (and its README section) only")
+    ap.add_argument("--build-as1", action="store_true", help="write AS1.json (and its README section) only")
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--out", default=str(BENCH_DIR))
@@ -854,5 +996,9 @@ if __name__ == "__main__":
     elif a.build_ds1:
         d = build_ds1(Path(a.out))
         print(f"DS1: {d['n_conditions']} conditions")
-    if a.verify or not (a.build or a.build_ds1):
+    elif a.build_as1:
+        d = build_as1(Path(a.out), workers=a.workers)
+        print(f"AS1: {d['n_conditions']} conditions; feasible: "
+              + ", ".join(f"{v} {d['vehicles'][v]['n_feasible']}" for v in AS1_VEHICLES))
+    if a.verify or not (a.build or a.build_ds1 or a.build_as1):
         print(f"verified {len(verify(Path(a.out)))} files")

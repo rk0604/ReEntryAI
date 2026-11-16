@@ -93,7 +93,7 @@ def compact(key: str, df: Optional[pd.DataFrame]):
 def _inputs(L) -> list:
     from jepa import benchmark_v5 as B
     files = [L.study / "study_config.json", PLAN, Path(__file__), B.BENCH_DIR / "ORB1_spec.json",
-             B.BENCH_DIR / "DS1.json"]
+             B.BENCH_DIR / "DS1.json", B.BENCH_DIR / "AS1.json"]
     files += [p for p in L.analysis.rglob("*") if p.is_file() and "cache" not in p.parts]
     files += list(L.tuning.glob("*/chosen.json"))
     return files
@@ -229,6 +229,17 @@ def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
         "density ratio high up meets a different one lower down. D1 and D2 (v2 against FNPEG and PredGuid) are their "
         "own Holm family; T13b shows what each arm loses from A256 to DS1.")
     tab("T13"), tab("T13b")
+    d.h1("AS1. The published Orion aerodynamics")
+    d.p("The simulator's trim schedule gives the capsule more lift than the published Orion database below about "
+        "6 km/s (L/D 0.40 against 0.28 at FMV 8; jepa/simulator_fidelity_audit.md). AS1 (added 2026-11-15, before the "
+        "full run) flies A256's 64 entry cases in nominal air with a true vehicle on the database's values: bibb_ld "
+        "(lower L/D) and bibb_ld_cd (lower L/D and lower CD). No controller is told: FNPEG's and PredGuid's "
+        "predictors, the physics model of mppi_filtered and the learned models all keep what they had, so this is "
+        "an aerodynamic error that changes with Mach number. A1 and A2 (v2 against FNPEG and PredGuid) are their own "
+        "Holm family. The targets were placed for the simulator's vehicle, so some are out of the weaker vehicle's "
+        "reach; the '-reach' rows use only the conditions still inside its 4.5 g footprint. T14b shows what each arm "
+        "loses from A256's nominal atmosphere to AS1.")
+    tab("T14"), tab("T14b")
     d.h1("RQ5. Compute per decision")
     tab("T09")
     d.h1("Success against the threshold")
@@ -250,6 +261,9 @@ def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
             "gram_like, gram_like_lift), a piecewise-linear density factor on a 2 km grid from 0 to 160 km "
             "(configs/benchmark_v5/DS1.json). The factor scales density in the equations of motion, the sensed "
             "accelerations and the g-load; the heating model does not see it.",
+            "<b>AS1</b>: A256's 64 cases in nominal air × 2 true vehicles on the published Orion trim aerodynamics "
+            "(bibb_ld, bibb_ld_cd; values read off Bibb et al. Parts I and II, about ±0.03), with a reachability "
+            "flag per condition from A256's own footprint rule (configs/benchmark_v5/AS1.json).",
         ])
     except Exception as e:                                   # the datasheet must not cost the report
         d.p(escape(f"(benchmark datasheet unavailable: {e})"))
@@ -263,8 +277,8 @@ def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
         "<b>success@5km / @2km</b>: outcome drogue (7.6 km) and great-circle miss below 5 / 2 km; <b>success@10km</b>: "
         "miss ≤ 10 km. <b>log miss</b> = ln(max(miss, 0.01 km)); failures keep their miss at termination.",
         "<b>Paired comparisons</b>: the unit is one condition, paired across arms by entry state and MPPI noise stream "
-        "(common random numbers). Deterministic arms are broadcast over seeds; RL comparisons pair seeds 0–4. ORB-1 "
-        "and DS1: a seeded arm flies seed case mod 5 and cases are resampled within those strata.",
+        "(common random numbers). Deterministic arms are broadcast over seeds; RL comparisons pair seeds 0–4. ORB-1, "
+        "DS1 and AS1: a seeded arm flies seed case mod 5 and cases are resampled within those strata.",
         f"<b>Uncertainty</b>: hierarchical bootstrap, {cfg.get('n_boot')} resamples (seeds, then cases within each "
         "atmosphere), 95% percentile intervals (90% for TOST); ORB-1: cases resampled within training-seed strata; "
         "per-seed exact McNemar and sign tests; Holm within each family. Sensitivity: the same bootstrap with each "

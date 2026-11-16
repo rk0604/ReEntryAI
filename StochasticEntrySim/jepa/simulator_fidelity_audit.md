@@ -75,7 +75,8 @@ footprint.
 The schedule was not changed: v1–v4's 6,000 training flights, v2's world models and every earlier
 result were produced with it, and changing it would invalidate experiments 1–4. A sensitivity run
 with Bibb's curve is possible without touching the simulator's code (the `orion_trim_schedule`
-parameter already overrides the table; this audit used it) and is offered as a follow-up.
+parameter already overrides the table; this audit used it). The user decided on 2026-11-15 to
+fly it: suite AS1 (plan §3.4b, §8.7), 64 cases × 2 true vehicles on Bibb's values, 8 arms.
 
 **Below Mach 8 (Bibb Part II, Figs. 38–40; read off the figures, ±0.03).** Part II plots the nominal
 trim CD against FMV for FMV ≤ 4 and the coefficients at α = 166° up to Mach 8; it has no trim L/D curve.

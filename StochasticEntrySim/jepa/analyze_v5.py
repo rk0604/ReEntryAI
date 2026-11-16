@@ -2,14 +2,14 @@
 jepa/analyze_v5.py
 
 Everything the v5 study reports (jepa/v5_plan.md sections 5, 6, 8, 10), written to 05_analysis/ as numbered
-tables (T01-T13, CSV) and figures (F01-F10, PNG and PDF at 200 dpi) with captions.json.
+tables (T01-T14, CSV) and figures (F01-F10, PNG and PDF at 200 dpi) with captions.json.
 
     load_flights_v5   v3's flights (A256: classical, v1, v2, v2single, ...), v4's (R0, v2's load curve) and v5's
                       in one table (arm, load, suite, seed, case, atmosphere / target, metrics); v3 and v4 read-only
     cube, comp        A256 paired comparisons with analyze_v4.Boot (hierarchical bootstrap: seeds, then cases within
                       atmospheres; cached in 05_analysis/cache/ by comparison and input hash)
     orb_paired        ORB-1 paired comparisons: each case one unit, cases resampled within training-seed strata
-    criteria          G1-G7, J-each / J-equiv / J-mech, R-each / R-imit / R-gap, Q1-Q3, D1-D2 (T05); a pass/fail
+    criteria          G1-G7, J-each / J-equiv / J-mech, R-each / R-imit / R-gap, Q1-Q3, D1-D2, A1-A2 (T05); a pass/fail
                       criterion is decided only when every paired flight of both arms exists (status "pending" before)
     ds1_analysis      DS1 (density shear, section 3.4): paired v2single − X by case (atmospheres averaged), cases
                       resampled within training-seed strata; each arm's change from A256 (T13, T13b)
@@ -63,6 +63,7 @@ CL, FN, PG = ("classical", OWN), ("fnpeg", OWN), ("predguid", OWN)
 MF, V2S, V2Sm = ("mppi_filtered", G), ("v2single", G), ("v2single", "fnpeg_matched")
 R0, V1, V2, MN, MT = ("R0", G), ("v1", G), ("v2", G), ("mppi_nominal", G), ("mppi_truth", G)
 FN180, PG180, FNO = ("fnpeg_180", OWN), ("predguid_180", OWN), ("fnpeg_oracle", OWN)
+FNR = ("fnpeg_norelief", OWN)
 E3 = [(a, G) for a in M5.ARMS_E3]
 RL1 = [(a, OWN) for a in S5.RL_TIER1]
 RL2 = [(a, OWN) for a in S5.RL_TIER2]
@@ -74,14 +75,14 @@ LAB = {"classical": "classical (v3)", "fnpeg": "FNPEG (Lu 2014)", "predguid": "P
        "mppi_filtered": "MPPI + filtered physics", "v2single": "v2 single member", "v2": "v2 ensemble",
        "R0": "R0 (v2 recipe, 1 member)", "v1": "v1", "mppi_nominal": "MPPI + nominal physics",
        "mppi_truth": "MPPI + true physics", "fnpeg_180": "FNPEG |σ| ≤ 180°", "predguid_180": "PredGuid |σ| ≤ 180°",
-       "fnpeg_oracle": "FNPEG, true parameters", "mlp_direct": "MLP direct", "gru_direct": "GRU direct",
+       "fnpeg_oracle": "FNPEG, true parameters", "fnpeg_norelief": "FNPEG, no load relief", "mlp_direct": "MLP direct", "gru_direct": "GRU direct",
        "gru_pi": "GRU + PI prober", "r0_nojepa": "R0 without JEPA", "dagger_fnpeg": "DAgger (FNPEG expert)",
        "bcppo_fnpeg": "BC → PPO (FNPEG)", "ppo_hist": "PPO", "sac_hist": "SAC", "ppo_matched": "PPO, full sim"}
 COL = {"classical": "#6250d6", "fnpeg": "#1baf7a", "predguid": "#2a78d6", "mppi_filtered": "#8fb8ea",
        "v2single": "#eda100", "v2": "#eb6834", "R0": "#c2410c", "v1": "#a3a29c", "mppi_truth": "#0b0b0b",
        "mlp_direct": "#b5179e", "gru_direct": "#7209b7", "gru_pi": "#3a0ca3", "r0_nojepa": "#f77f00",
        "dagger_fnpeg": "#2b9348", "bcppo_fnpeg": "#55a630", "ppo_hist": "#d00000", "sac_hist": "#9d0208",
-       "ppo_matched": "#6a040f", "fnpeg_180": "#80ed99", "predguid_180": "#90e0ef", "fnpeg_oracle": "#38a3a5"}
+       "ppo_matched": "#6a040f", "fnpeg_180": "#80ed99", "predguid_180": "#90e0ef", "fnpeg_oracle": "#38a3a5", "fnpeg_norelief": "#577590"}
 
 
 def key_of(arm: str, load: str) -> str:
@@ -181,6 +182,8 @@ def load_flights_v5(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4=None
     keep = ~is_a | np.array([(c, a) in a256 for c, a in zip(df.case, df.atmosphere)])
     ds1 = {(int(c["case"]), c["atmosphere"]) for c in S5.conditions(cfg, "DS1")}
     keep &= (df.suite != "DS1") | np.array([(c, a) in ds1 for c, a in zip(df.case, df.atmosphere)])
+    as1 = {(int(c["case"]), c["atmosphere"]) for c in S5.conditions(cfg, "AS1")}
+    keep &= (df.suite != "AS1") | np.array([(c, a) in as1 for c, a in zip(df.case, df.atmosphere)])
     df = df[keep].copy()
     is_a = df.suite == "A256"
     feas = df.get("feasible", pd.Series(np.nan, index=df.index)).map(lambda v: np.nan if pd.isna(v) else _b(v))
@@ -361,16 +364,80 @@ DS1_COMPARISONS = (("D1", "v2single", "fnpeg"), ("D2", "v2single", "predguid"), 
 DS1_FAMILY = ("D1", "D2")                            # the Holm family; the rest are estimates
 
 
-def ds1_analysis(cfg, L, main: pd.DataFrame) -> dict:
-    """DS1 per arm and atmosphere (B.score), each arm's change from A256 on the same 64 cases, and the paired
+def shift_analysis(cfg, L, main: pd.DataFrame, suite: str, comparisons, base_atmospheres=None,
+                   reach_ids=()) -> dict:
+    """A shifted suite on A256's cases (DS1, AS1) per arm and atmosphere (B.score), each arm's change from A256 on
+    the same 64 cases (base_atmospheres: which A256 atmospheres are the reference; None = all), and the paired
     comparisons v2single − X: success@5km, paired by condition, averaged over a case's atmospheres, cases resampled
-    within training-seed strata (case mod n_seeds, the seed a learned arm flew)."""
-    d = main[main.suite == "DS1"]
-    n_exp = len(S5.conditions(cfg, "DS1"))
+    within training-seed strata (case mod n_seeds, the seed a learned arm flew). reach_ids: comparisons repeated on
+    the conditions whose frozen `feasible` flag is True (id + "-reach", estimates)."""
+    d = main[main.suite == suite]
+    n_exp = len(S5.conditions(cfg, suite))
     out = {"n_expected": n_exp, "score": B.score(d.assign(arm=d.key)) if len(d) else pd.DataFrame(), "comp": [],
            "drop": []}
     if not len(d):
         return out
+
+    def paired(dd, tag, id_, a, b, n_expected):
+        piv = dd.pivot_table(index=["case", "atmosphere"], columns="key", values="success_5km", aggfunc="first")
+        if a not in piv or b not in piv:
+            return None
+        p = piv[[a, b]].astype(float).dropna()
+        if not len(p):
+            return None
+        cm = p.groupby(level="case").mean()
+        cases = cm.index.to_numpy()
+        r = orb_paired(L, f"v5|{id_}|{tag}", cm[a].to_numpy(), cm[b].to_numpy(), cases % len(cfg.seeds), cfg.n_boot)
+        per_atm = {atm: 100 * float(g[a].mean() - g[b].mean()) for atm, g in p.groupby(level="atmosphere")}
+        return {"id": id_, "a": a, "b": b, "n_pairs": int(len(p)), "n_expected": n_expected,
+                "complete": bool(len(p) == n_expected), "a_%": 100 * float(p[a].mean()),
+                "b_%": 100 * float(p[b].mean()), "diff_pp": 100 * r["diff"], "ci_lo_pp": 100 * r["ci_lo"],
+                "ci_hi_pp": 100 * r["ci_hi"], "p_boot": r["p_boot"], "n_cases": r["n"],
+                "per_atmosphere_pp": json.dumps({k: round(v, 2) for k, v in per_atm.items()})}
+
+    for id_, a, b in comparisons:
+        c = paired(d, suite, id_, a, b, n_exp)
+        if c is not None:
+            out["comp"].append(c)
+    if reach_ids:
+        n_reach = sum(1 for c in S5.conditions(cfg, suite) if c.get("feasible") is True)
+        dr = d[[_b(v) is True for v in d.feasible]]
+        for id_, a, b in comparisons:
+            if id_ in reach_ids and len(dr):
+                c = paired(dr, suite + "-reach", id_ + "-reach", a, b, n_reach)
+                if c is not None:
+                    out["comp"].append(c)
+    a256 = main[main.suite == "A256"]
+    if base_atmospheres is not None:
+        a256 = a256[a256.atmosphere.isin(list(base_atmospheres))]
+    cases = sorted(d.case.unique())
+    for key in sorted(d.key.unique()):
+        x, y = d[d.key == key], a256[(a256.key == key) & a256.case.isin(cases)]
+        out["drop"].append({"arm": key, f"{suite}_success5_%": 100 * float(x.success_5km.mean()),
+                            f"{suite}_n": int(len(x)),
+                            "A256_success5_%": 100 * float(y.success_5km.mean()) if len(y) else np.nan,
+                            "A256_n": int(len(y)),
+                            "change_pp": 100 * float(x.success_5km.mean() - y.success_5km.mean()) if len(y) else np.nan,
+                            f"{suite}_median_miss_km": float(x.miss_km.median()),
+                            "A256_median_miss_km": float(y.miss_km.median()) if len(y) else np.nan})
+    return out
+
+
+def ds1_analysis(cfg, L, main: pd.DataFrame) -> dict:
+    """DS1 (density shear, section 3.4): shift_analysis against all four A256 atmospheres."""
+    return shift_analysis(cfg, L, main, "DS1", DS1_COMPARISONS)
+
+
+# AS1: aerodynamic sensitivity (section 3.4b, added 2026-11-15)
+AS1_COMPARISONS = (("A1", "v2single", "fnpeg"), ("A2", "v2single", "predguid"), ("A3", "v2single", "mppi_filtered"),
+                   ("A4", "v2single", "classical")) + tuple((f"A-{a}", "v2single", a) for a in S5.RL_TIER1)
+AS1_FAMILY = ("A1", "A2")                            # the Holm family; the rest are estimates
+
+
+def as1_analysis(cfg, L, main: pd.DataFrame) -> dict:
+    """AS1: shift_analysis against A256's nominal atmosphere (AS1 flies nominal air); A1 and A2 again on the
+    conditions whose target is still inside the true vehicle's 4.5 g footprint."""
+    return shift_analysis(cfg, L, main, "AS1", AS1_COMPARISONS, base_atmospheres=("nominal",), reach_ids=AS1_FAMILY)
     piv = d.pivot_table(index=["case", "atmosphere"], columns="key", values="success_5km", aggfunc="first")
     for id_, a, b in DS1_COMPARISONS:
         if a not in piv or b not in piv:
@@ -447,8 +514,8 @@ def _prov(r) -> str:
     return "" if done else f"PROVISIONAL ({n} of {e} paired flights): "
 
 
-def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_seeds, ds: Optional[dict] = None
-             ) -> pd.DataFrame:
+def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_seeds, ds: Optional[dict] = None,
+             as1: Optional[dict] = None) -> pd.DataFrame:
     """T05. A pass/fail criterion is decided only on complete data: until every paired flight of both arms exists
     its status is "pending", `met` stays empty and the measured text is marked PROVISIONAL (the analysis runs on
     every "Run all", so without this a half-flown arm would show a verdict)."""
@@ -524,7 +591,10 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
         "; ".join(parts), all(gp.get(k) is True for k in vs) if g_done else None, status=None if g_done else "pending")
     for id_, q in (("G7a", "What does the 90° handle cost FNPEG? (fnpeg_180 − fnpeg, exploratory)"),
                    ("G7b", "What does the 90° handle cost PredGuid? (predguid_180 − predguid, exploratory)"),
-                   ("G7c", "How far is FNPEG from its own ceiling? (fnpeg_oracle − fnpeg, exploratory)")):
+                   ("G7c", "How far is FNPEG from its own ceiling? (fnpeg_oracle − fnpeg, exploratory)"),
+                   ("G7d", "What does the load relief cost or gain FNPEG? (fnpeg_norelief − fnpeg, exploratory)"),
+                   ("G7e", "Does v2 beat FNPEG flown without load relief? (v2single − fnpeg_norelief, "
+                           "exploratory)")):
         r = _get(t04, id_)
         if r is None:
             row(id_, "RQ1", q, "not run", None, status="not run")
@@ -671,6 +741,39 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
             "shear), same 64 cases? (descriptive)", "; ".join(f"{x['arm']} {x['change_pp']:+.1f} pp" for x in drop
                                                             if np.isfinite(x["change_pp"])), None)
 
+    # ---- AS1: the true vehicle on the published Orion aerodynamics (section 3.4b; own Holm family, A1-A2) ----
+    comp = {c["id"]: c for c in (as1 or {}).get("comp", [])}
+    afam = []
+    for id_, a_, b_ in AS1_COMPARISONS:
+        fam = "AS1" if id_ in AS1_FAMILY else "AS1 (estimate)"
+        q = f"Does v2 beat {b_} when the true vehicle has the published Orion aerodynamics? ({a_} − {b_}, AS1)"
+        c = comp.get(id_)
+        if c is None:
+            if id_ in AS1_FAMILY:
+                row(id_, fam, q, "not run", None, status="not run")
+            continue
+        done = bool(c["complete"])
+        met = bool(c["diff_pp"] > 0 and c["ci_lo_pp"] > 0) if (done and id_ in AS1_FAMILY) else None
+        row(id_, fam, q, ("" if done else f"PROVISIONAL ({c['n_pairs']} of {c['n_expected']} paired flights): ")
+            + f"success@5km {c['diff_pp']:+.1f} pp [{c['ci_lo_pp']:+.1f}, {c['ci_hi_pp']:+.1f}] over {c['n_cases']} cases "
+            f"(vehicles averaged within a case); per vehicle {c['per_atmosphere_pp']}", met, c["diff_pp"],
+            (c["ci_lo_pp"], c["ci_hi_pp"]), c["p_boot"] if id_ in AS1_FAMILY else None,
+            status=None if done or id_ not in AS1_FAMILY else "pending", pairs=(c["n_pairs"], c["n_expected"]))
+        if id_ in AS1_FAMILY:
+            afam.append(id_)
+            cr = comp.get(id_ + "-reach")
+            if cr is not None:
+                row(id_ + "-reach", "AS1 (estimate)", f"{id_} on the conditions whose target the true vehicle can still "
+                    "reach within 4.5 g (sensitivity estimate)", f"success@5km {cr['diff_pp']:+.1f} pp "
+                    f"[{cr['ci_lo_pp']:+.1f}, {cr['ci_hi_pp']:+.1f}] ({cr['n_pairs']} of {cr['n_expected']} reachable "
+                    "conditions flown by both)", None, cr["diff_pp"], (cr["ci_lo_pp"], cr["ci_hi_pp"]))
+    _holm(rows, afam)
+    drop = (as1 or {}).get("drop") or []
+    if drop:
+        row("A-shift", "AS1 (estimate)", "How much does each arm lose from A256's nominal atmosphere to AS1 (published "
+            "Orion aerodynamics), same 64 cases? (descriptive)",
+            "; ".join(f"{x['arm']} {x['change_pp']:+.1f} pp" for x in drop if np.isfinite(x["change_pp"])), None)
+
     for r_ in rows:
         if r_["status"] is None:
             r_["status"] = "estimate" if r_["met"] is None else ("met" if r_["met"] else "not met")
@@ -781,7 +884,7 @@ def _params_of(L, arm: str, seed: int) -> Optional[int]:
 # ============================================================================
 # The analysis
 # ============================================================================
-TABLES = tuple(f"T{i:02d}" for i in range(1, 14))
+TABLES = tuple(f"T{i:02d}" for i in range(1, 15))
 FIGURES = tuple(f"F{i:02d}" for i in range(1, 11))
 
 
@@ -870,7 +973,7 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
                                                                       n_seeds="count").reset_index()
         sc = sc.merge(spread, on=["suite", "arm", "group"], how="left")
     _table(L, caps, sc.round(5), "T01_metrics_by_arm",
-           "Every section-5 metric per arm × suite × atmosphere (A256 and DS1, DEV48 excluded) or target range (ORB-1), plus the "
+           "Every section-5 metric per arm × suite × atmosphere (A256, DS1 and AS1, DEV48 excluded) or target range (ORB-1), plus the "
            "arm's pooled row (group all): success at 2/5/10/25 km, success@5km within the load limit (peak g ≤ "
            f"{B.LOAD_OK_G:g}), mean log miss, median and p95 miss, peak g, heat, RCS, "
            "reversals, planning ms, authority saturation, the ORB-1 requirement LCB and g-duration compliance with its "
@@ -890,13 +993,13 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
 
     # ---- T04 RQ1 ----
     rq1 = [("G1", V2S, FN), ("G2", V2S, PG), ("G4", V2Sm, FN), ("G5", V2S, MF), ("G6a", FN, CL), ("G6b", PG, CL),
-           ("G7a", FN180, FN), ("G7b", PG180, PG), ("G7c", FNO, FN)]
+           ("G7a", FN180, FN), ("G7b", PG180, PG), ("G7c", FNO, FN), ("G7d", FNR, FN), ("G7e", V2S, FNR)]
     t04 = pd.DataFrame([r for nm, a, b in rq1 for m in ("success5", "log_miss") for r in comp(nm, a, b, m, seeds)])
     _table(L, caps, t04.round(5), "T04_rq1_paired_differences",
            "RQ1 at 4.5 g: paired differences A − B, pooled and per atmosphere, with 95% and 90% hierarchical-bootstrap "
            f"intervals ({cfg.n_boot} resamples: seeds, then cases within each atmosphere), bootstrap p, and the seeds "
            "where the pooled effect holds. success5 in percentage points; log_miss = mean paired difference of ln(miss). "
-           "G1/G2/G4/G5 are the Holm family; G6 the competence check; G7 exploratory. n_pairs / n_expected = conditions "
+           "G1/G2/G4/G5 are the Holm family; G6 the competence check; G7 exploratory (G7d, G7e: FNPEG without its load relief). n_pairs / n_expected = conditions "
            "flown by both arms / in the design (a criterion is decided only when they are equal). ci_*_clustered: the "
            "same bootstrap with each entry case resampled together with its four atmospheres (sensitivity analysis).", data)
     out["T04"] = t04
@@ -1033,11 +1136,31 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
            "altitude-varying density together with the different error mix, not a paired effect).", data)
     out["T13"] = t13
 
+    # ---- T14 AS1 (aerodynamic sensitivity) ----
+    a1 = as1_analysis(cfg, L, main)
+    t14 = pd.DataFrame(a1["comp"], columns=["id", "a", "b", "n_pairs", "n_expected", "complete", "a_%", "b_%", "diff_pp",
+                                            "ci_lo_pp", "ci_hi_pp", "p_boot", "n_cases", "per_atmosphere_pp"])
+    t14b = pd.DataFrame(a1["drop"], columns=["arm", "AS1_success5_%", "AS1_n", "A256_success5_%", "A256_n", "change_pp",
+                                             "AS1_median_miss_km", "A256_median_miss_km"])
+    _table(L, caps, t14.round(5), "T14_as1_aero_sensitivity",
+           "AS1 (v5_plan.md section 3.4b, added 2026-11-15): A256's 64 entry cases in nominal air, the true vehicle on "
+           "the published Orion trim aerodynamics (bibb_ld: lower L/D; bibb_ld_cd: lower L/D and CD) while every "
+           "controller's model keeps the simulator's schedule. Paired differences v2single − X in success@5km: each "
+           "case's two vehicles averaged, cases resampled within training-seed strata. A1 and A2 are their own Holm "
+           "family; the rest are estimates; '-reach' rows use only the conditions whose target is inside the true "
+           "vehicle's 4.5 g constant-bank footprint (per_atmosphere_pp is per vehicle).",
+           data + " + configs/benchmark_v5/AS1.json")
+    _table(L, caps, t14b.round(5), "T14b_as1_vs_a256",
+           "Each arm on AS1 against the same arm on A256's nominal atmosphere, same 64 cases: success@5km and median "
+           "miss, and the change in percentage points (descriptive: what the simulator's extra lift is worth to each "
+           "arm; AS1 includes targets the weaker vehicle cannot reach).", data)
+    out["T14"] = t14
+
     # ---- T05 criteria ----
-    t05 = criteria(cfg, main, t04, t06, t07, mech, orb, gates, seeds, rl_seeds, ds)
+    t05 = criteria(cfg, main, t04, t06, t07, mech, orb, gates, seeds, rl_seeds, ds, a1)
     _table(L, caps, t05, "T05_criteria", "Pre-registered criteria (v5_plan.md section 8): measured value, interval, "
            "bootstrap p, Holm-adjusted p within each family (RQ1: G1, G2, G4, G5; RQ2: the four J-each; RQ3: the Tier 1 "
-           "R-each; RQ4: Q3a, Q3b; DS1: D1, D2), seeds holding, met (blank = not decided), valid (G4 needs G3). status: met / not met "
+           "R-each; RQ4: Q3a, Q3b; DS1: D1, D2; AS1: A1, A2), seeds holding, met (blank = not decided), valid (G4 needs G3). status: met / not met "
            "(decided on complete data), pending (flights still missing: n_pairs of n_expected; the measured text is "
            "PROVISIONAL), estimate (no pass/fail), not run. ci_*_clustered: the interval with each entry case "
            "resampled together with its four atmospheres; clustered_excludes_0 tells whether the verdict survives it.",
@@ -1048,7 +1171,10 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
     cp = L.checks / "compute_per_decision.csv"
     t09 = pd.read_csv(cp) if cp.exists() else pd.DataFrame(columns=["arm", "device", "ms_median", "ms_p99", "params"])
     _table(L, caps, t09, "T09_rq5_compute", "RQ5: compute per guidance decision, median and p99 ms, single CPU thread "
-           "and GPU, one A256 flight per arm (nominal air), and parameter counts.", "01_checks/compute_per_decision.csv")
+           "and GPU, one A256 flight per arm (nominal air), and parameter counts. classical: the whole 1 s step as "
+           "flown (guidance, its diagnostic interval heat screen, and the simulator); classical_noscreen: the same "
+           "flight with the screen off (the screen cannot change a command; jepa/interval_layer_audit.md).",
+           "01_checks/compute_per_decision.csv")
 
     # ---- T10 tuning ----
     t10 = tuning_table(L)

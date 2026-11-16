@@ -237,6 +237,38 @@ use the table density).
 flight per condition (2,048 flights). A seeded arm flies seed case mod 5, as on ORB-1. No feasibility
 flag is computed (no footprint under an altitude-varying density).
 
+### 3.4b AS1 (the published Orion aerodynamics; added 2026-11-15, user decision)
+
+The simulator's trim schedule gives the capsule more lift than the published Orion database below about
+6 km/s (`jepa/simulator_fidelity_audit.md` §4.1). AS1 asks whether RQ1's answer depends on that.
+
+**Conditions.** A256's 64 entry cases and targets, nominal air, × 2 true vehicles = 128 conditions:
+
+| Vehicle | True trim schedule |
+|---|---|
+| `bibb_ld` | L/D from Bibb Part I Fig. 27 at FMV ≥ 8 (0.280 at 8, 0.263 at 15, 0.250 at 25, 0.245 at 40), capped at 0.28 below FMV 8; the simulator's CD |
+| `bibb_ld_cd` | the same L/D, and CD from Bibb Part II Fig. 40(b) and Part I Fig. 26 (1.37 at FMV 2, 1.34 at 3, 1.38 at 8 and above) |
+
+Values are read off the papers' figures (about ±0.03) and frozen in `configs/benchmark_v5/AS1.json`
+(`benchmark_v5.build_as1`; checksummed; the other suite files are unchanged). No controller is told:
+FNPEG's and PredGuid's predictors, `mppi_filtered`'s physics model, the classical predictor and the
+learned models keep what they had, so the truth differs from every model by an aerodynamic error that
+changes with Mach number (L/D × 0.70 at FMV 8 to × 0.93 at FMV 25; inside the 0.70–1.30 lift range the
+learned models were trained on, but never constant in training).
+
+**Reachability.** The targets were placed for the simulator's vehicle. Each condition carries
+`feasible`: its target is inside the true vehicle's 4.5 g constant-bank footprint, by the code and rule
+that made A256's own flags (`testset_v3.footprint`, margin > 0). 60 of 64 for either vehicle. Results
+are reported on all conditions and on the reachable ones.
+
+**Hook.** `data.apply_domain` sets the simulator's existing `orion_trim_schedule` parameter when a
+domain carries `aero_schedule_id` (1 or 2) and restores the parameters otherwise. `math_3d.py` is not
+touched; `data.py`'s addition sits inside the density hook's block. Off when absent (smoke check 1: a
+later domain without the id gives parameters equal to fresh ones).
+
+**Arms.** DS1's eight (`classical`, `fnpeg`, `predguid`, `mppi_filtered`, `v2single`, the Tier 1 RL
+arms), one flight per condition (1,024 flights), DS1's seed rule.
+
 ### 3.5 Scoring (`benchmark_v5.score`)
 
 Input: a flights table (one row per flight, v4's columns). Output: every metric of §5, the Q1
@@ -273,6 +305,7 @@ v4's E0b (statistical re-fly of v3) already covers GPU nondeterminism; v5 cites 
 | `classical` | v3's controller | ORB-1 (A256 exists in v3) | ≤ 3,000 |
 | `fnpeg_180`, `predguid_180` | exploratory: the same laws with \|σ\| ≤ 180° (how much does the 90° handle cost?) | A256 | 2 × 256 |
 | `fnpeg_oracle` | exploratory: FNPEG whose predictor knows the true parameters, filters off (ceiling of the law) | A256 | 256 |
+| `fnpeg_norelief` | exploratory (added 2026-11-15): the tuned `fnpeg` with Lu's load relief switched off, nothing else changed and no separate tuning. Shows whether the relief costs FNPEG accuracy (`jepa/guidance_audit.md` §3) | A256 | 256 |
 
 **FNPEG specification** (Lu 2014 §III and §VI-B, Brunner–Lu 2008; anything not fixed here is tuned, §4.5):
 * Predictor model: `physics_v4`'s port of the classical predictor's equations (non-rotating Earth,
@@ -387,7 +420,7 @@ E3 model and seed, against R0 (v4) and v1 (v3).
 
 Gates (§4.0) → legacy RL inventory → tuning (§4.5) → **A256**: `fnpeg`, `predguid`, `mppi_filtered`,
 `v2single@fnpeg_matched` → **ORB-1 block 1**: `classical`, `fnpeg`, `predguid`, `mppi_filtered`,
-`v2single` → E3 training and flights → E4 training and flights → DS1 (§3.4) → ORB-1 blocks 2–3 (arms
+`v2single` → E3 training and flights → E4 training and flights → DS1 (§3.4) → AS1 (§3.4b) → ORB-1 blocks 2–3 (arms
 still eligible) → exploratory arms → open loop → analysis → report. Within an arm, seed-major.
 
 ### 4.9 Compute tiers (D1)
@@ -397,7 +430,7 @@ first 20 flights and prints projected hours and Colab units (at the runtime's ra
 
 | Tier | Contents | Flights (new) | Training |
 |---|---|---|---|
-| 1 | gates, legacy RL eval, tuning (2 × 24 × 48 guidance flights + RL tuning), the A256 arms of §4.1–4.3 except the exploratory ones, `dagger_fnpeg`, `bcppo_fnpeg`, `ppo_hist` (5 seeds each since 2026-11-15; were 3), ORB-1 block 1 for `classical`, `fnpeg`, `predguid`, `mppi_filtered`, `v2single`; since 2026-11-11 (§15) also `fnpeg_180`, `predguid_180`, `fnpeg_oracle` on A256 and the larger tuning budget (2 × 36 × 48 guidance flights, 12 RL configurations per method); since 2026-11-15 (§15) DS1 (§3.4: 8 arms × 256 conditions) | ≈ 26,600 (≈ 9,300 of them cheap policy flights; was ≈ 23,000 before the 2026-11-15 additions: +1,536 E4 policy flights for seeds 3–4, +2,048 DS1 flights) | 20 dynamics models + 15 RL runs (was 9) (+ 36 RL tuning runs at 10% budget) |
+| 1 | gates, legacy RL eval, tuning (2 × 24 × 48 guidance flights + RL tuning), the A256 arms of §4.1–4.3 except the exploratory ones, `dagger_fnpeg`, `bcppo_fnpeg`, `ppo_hist` (5 seeds each since 2026-11-15; were 3), ORB-1 block 1 for `classical`, `fnpeg`, `predguid`, `mppi_filtered`, `v2single`; since 2026-11-11 (§15) also `fnpeg_180`, `predguid_180`, `fnpeg_oracle` on A256 and the larger tuning budget (2 × 36 × 48 guidance flights, 12 RL configurations per method); since 2026-11-15 (§15) DS1 (§3.4: 8 arms × 256 conditions), AS1 (§3.4b: 8 arms × 128 conditions) and `fnpeg_norelief` (256) | ≈ 27,900 (+1,280 for AS1 and `fnpeg_norelief`; ≈ 9,700 of them cheap policy flights; was ≈ 23,000 before the 2026-11-15 additions: +1,536 E4 policy flights for seeds 3–4, +2,048 DS1 flights) | 20 dynamics models + 15 RL runs (was 9) (+ 36 RL tuning runs at 10% budget) |
 | 2 | ORB-1 blocks 2–3 (eligible arms only), ORB-1 block 1 for the non-JEPA and RL arm with the highest A256 success@5km (descriptive), `sac_hist`, `ppo_matched`, `mppi_truth` on ORB-1 | ≈ 4,000–8,000 | 6 RL runs |
 | 3 | density-shear suite (D5): moved to Tier 1 as DS1 on 2026-11-15 (§3.4) | — | none |
 
@@ -461,6 +494,8 @@ heat load, RCS fuel, reversals, planning ms), plus:
 * **RQ5** What does each controller cost per decision? (descriptive)
 * **DS1** (added 2026-11-15) Does RQ1's answer hold when the density error changes with altitude instead
   of staying constant for the whole flight?
+* **AS1** (added 2026-11-15) Does RQ1's answer hold when the true vehicle has the published Orion
+  aerodynamics, with less lift than the simulator's own vehicle?
 
 ---
 
@@ -477,6 +512,7 @@ heat load, RCS fuel, reversals, planning ms), plus:
 | G5 | learned model beats explicit estimation | success@5km `v2single − mppi_filtered`, as G1 |
 | G6 | baseline competence (a check, not a hypothesis) | V1–V4 passed before test flights; reported: `fnpeg` and `predguid` vs `classical` per atmosphere |
 | G7 | what the 90° handle costs (exploratory) | `fnpeg_180 − fnpeg`, `predguid_180 − predguid`: estimates only |
+| G7d, G7e | what the load relief does to FNPEG (exploratory, added 2026-11-15) | `fnpeg_norelief − fnpeg` and `v2single − fnpeg_norelief`, success@5km, with both arms' peak g: estimates only |
 
 ### 8.2 RQ2 (A256; paired log miss vs R0, v4 flights; Holm over the 4 arms)
 
@@ -523,6 +559,18 @@ Descriptive table (§5 compute per decision, parameter counts).
 
 A seed rule does not apply (each case is flown by one seed). DS1 is a separate family so that adding it
 cannot change any RQ1–RQ4 verdict.
+
+### 8.7 AS1 (added 2026-11-15, before any test flight; own Holm family {A1, A2})
+
+| # | Question | Passes if |
+|---|---|---|
+| A1 | v2 beats FNPEG on the published Orion aerodynamics | success@5km `v2single − fnpeg` on AS1 > 0 (cases as units, the two vehicles averaged), 95% CI excludes 0, Holm p < 0.05 |
+| A2 | v2 beats PredGuid on the published Orion aerodynamics | same with `predguid` |
+| A1-reach, A2-reach | the same on the reachable conditions only | estimates |
+| A3, A4, A-*rl arm* | v2 vs `mppi_filtered`, `classical` and each Tier 1 RL arm on AS1 | estimates only |
+| A-shift | what each arm loses from A256's nominal atmosphere to AS1 on the same 64 cases | descriptive (T14b) |
+
+Statistics as DS1 (§6). AS1 is a separate family, so it cannot change any RQ1–RQ4 or DS1 verdict.
 
 ---
 
@@ -996,6 +1044,12 @@ their profiles, the hook's drag ratio and its clearing by the next domain, a fli
 ones against one without), the hook-only diff of `math_3d.py` and `data.py` against the v4 commit, and the DS1 tables
 T13 and T13b with criteria D1, D2 and D-shift.
 
+**2026-11-16, after AS1, `fnpeg_norelief`, the interval fields and the classical timing: 92 PASS,
+0 FAIL (490 min on a busy laptop; the smoke study is larger and the machine was shared).** New checks:
+AS1's regenerated file and its 128 conditions, the aero-schedule hook and its exact restore, a flight on
+the AS1 vehicle landing shorter, T14 and T14b with A1 and A2 in their own family, the interval fields in
+every v5 flight record (no shield step, no intervention), and `classical_noscreen` in T09.
+
 History. On 2026-11-04 (the first build) the same checks gave 75 PASS and 1 FAIL: one of check 14's
 seven launches never started a kernel and was killed by hand; the cause was not found and it did not
 recur (2026-11-04 rerun of two launches, 2026-11-14 all seven). On 2026-11-13 a rerun was lost when the
@@ -1117,6 +1171,22 @@ saturated.
 * **2026-11-15, five RL seeds (§4.4, §6, §8.3).** RQ3 compared v2 (5 seeds) with RL arms of 3 seeds and
   required 3 of 3. Every Tier 1 RL arm now trains seeds 0–4 and R-each needs ≥ 4 of 5 seeds, the rule of
   G1 and J-each. Cost: 6 more RL runs and 1,536 more policy flights (Tier 1 ≈ 26,600 flights, §4.9).
+* **2026-11-15, AS1, `fnpeg_norelief`, interval fields and the classical timing (the user's decisions
+  after the audits; no v5 test flight existed, no study folder had been started).**
+  (1) AS1 (§3.4b, §8.7): 128 conditions, 8 arms, 1,024 flights, own Holm family {A1, A2}. It answers the
+  fidelity audit's main finding (more lift than Orion's database) with flights instead of a caveat, and
+  is v5's only Mach-dependent aerodynamic error. It uses the simulator's existing schedule override;
+  `math_3d.py` is unchanged and `data.py` gains default-off lines (smoke checks 1 and 11).
+  (2) `fnpeg_norelief` on A256 (256 flights, G7d and G7e, estimates): the guidance audit found that our
+  FNPEG's load relief trades accuracy for load without holding the limit on a Lu-analog mission, so a
+  poor `fnpeg` result could be blamed on the relief; this arm shows FNPEG without it.
+  (3) Every v5 flight record now stores `use_intervals`, `shield_interventions`, `shield_steps` and
+  `interval_violations` from the simulator's own report (`fly_v5.interval_fields`), so "the shield never
+  acted" is in the data. (4) The compute table T09 times the classical controller twice: as flown, and
+  with its diagnostic interval heat screen off (`classical_noscreen`; the screen cannot change a
+  command, `jepa/interval_layer_audit.md`). The flights themselves are flown as before, screen on, so
+  classical results stay comparable with v3's.
+  RQ1–RQ4 and DS1 are unchanged: no flight, comparison or criterion of theirs is altered.
 * **2026-11-15, audits; no code behaviour changed by them.** (1) FNPEG against Lu (2014), equation by
   equation, with a Lu-analog test of the load relief, and PredGuid's constants against Bairstow (2006)
   Tables B.4 and B.7, all equal except the departures already recorded (GMAX, VFINAL, LAD, LOD,
@@ -1148,10 +1218,12 @@ Stated on 2026-11-11, before any v5 result. The report prints this section.
 multipliers on density, lift and mass. FNPEG's two filters estimate exactly that, and its predictor
 uses the simulator's own atmosphere table and aerodynamic model, so the classical laws are tested in
 their best case there. Since 2026-11-15, DS1 (§3.4) adds density errors that change with altitude,
-in their own Holm family so that RQ1–RQ4 are unchanged. v5 still does not test winds, Mach-dependent
-aerodynamic errors, navigation errors or sensor noise, and its results do not carry over to them.
+in their own Holm family so that RQ1–RQ4 are unchanged, and AS1 (§3.4b) one Mach-dependent aerodynamic
+error (the published Orion lift and drag). v5 still does not test winds, navigation errors or sensor
+noise, and its results do not carry over to them.
 
-**One simulator, no flight data** (added 2026-11-15; `jepa/simulator_fidelity_audit.md`). Every
+**One simulator, no flight data** (added 2026-11-15; `jepa/simulator_fidelity_audit.md`; AS1, §3.4b,
+tests the lift excess named here, with values read off published figures). Every
 result comes from a 3DOF model of an Orion-class capsule over a non-rotating spherical Earth, with
 perfect navigation, one NRLMSIS density profile, and a trim aerodynamic schedule whose L/D exceeds
 the published Orion database (Bibb et al. Part I) below about 6 km/s (0.40 against 0.28 at FMV 8;

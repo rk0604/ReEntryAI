@@ -69,10 +69,12 @@ GUIDANCE_KINDS = ("classical", "fnpeg", "predguid", "policy", "legacy_rl")
 RL_TIER1 = ("dagger_fnpeg", "bcppo_fnpeg", "ppo_hist")
 RL_TIER2 = ("sac_hist", "ppo_matched")
 ORB1_ARMS = ("classical", "fnpeg", "predguid", "mppi_filtered", "v2single")
-EXPLORE_ARMS = ("fnpeg_180", "predguid_180", "fnpeg_oracle")
+EXPLORE_ARMS = ("fnpeg_180", "predguid_180", "fnpeg_oracle", "fnpeg_norelief")   # norelief: 2026-11-15 (section 15)
 # DS1 (density shear, section 3.4, added 2026-11-15): one flight per arm and condition; learned arms fly the training
 # seed case mod n_seeds (as on ORB-1), so a seeded arm costs one flight per condition, not one per seed
 DS1_ARMS = ("classical", "fnpeg", "predguid", "mppi_filtered", "v2single") + RL_TIER1
+# AS1 (aerodynamic sensitivity, section 3.4b, added 2026-11-15): the same arms and the same seed rule as DS1
+AS1_ARMS = DS1_ARMS
 # Batching and worker knobs: change speed and memory, never results; free to differ between sessions.
 RUNTIME_KEYS = ("max_rows", "max_rows_physics", "v2_chunk", "guidance_batch", "units_per_hour", "tier")
 # Approximate Colab compute units per hour by runtime (the status cell's projection only).
@@ -96,6 +98,8 @@ class StudyConfigV5:
     a256_cases: Optional[Tuple[int, ...]] = None        # None: all 64 (also DS1's cases)
     ds1_atmospheres: Tuple[str, ...] = B.DS1_ATMOSPHERES   # DS1 (section 3.4): the four density-shear atmospheres
     ds1_arms: Tuple[str, ...] = DS1_ARMS
+    as1_vehicles: Tuple[str, ...] = B.AS1_VEHICLES         # AS1 (section 3.4b): the two true vehicles
+    as1_arms: Tuple[str, ...] = AS1_ARMS
     dev48_cases: Optional[Tuple[int, ...]] = None       # None: all 12
     orb1_per_block: Optional[int] = None                # None: all 1,000 per block (smoke: the first k)
     atmospheres: Tuple[str, ...] = ATM
@@ -179,6 +183,7 @@ class StudyConfigV5:
         return StudyConfigV5(
             mode="smoke", seeds=v3.seeds, rl_seeds=(0,), a256_cases=v3.cases, dev48_cases=(0,), orb1_per_block=1,
             ds1_atmospheres=("gram_like",), ds1_arms=("fnpeg", "predguid", "v2single", "dagger_fnpeg"),
+            as1_vehicles=("bibb_ld_cd",), as1_arms=("fnpeg", "predguid", "v2single", "dagger_fnpeg"),
             n_episodes=v3.n_episodes, tune_n=2, tune_refine_n=1,
             rl_tune_n={"dagger_fnpeg": 1, "bcppo_fnpeg": 1, "ppo_hist": 2, "sac_hist": 1},
             rl_tune_frac=0.5, gates_stop=False, v2_sweep_g=(2.7,), v2_sweep_n=1, v3_n_cases=1,
@@ -205,8 +210,8 @@ class StudyConfigV5:
         t2 = self.tier >= 2
         return {"benchmark": True, "legacy": True, "gates": True, "tuning": True, "A256": True, "ORB1_block1": True,
                 "E3_train": True, "E3_fly": True, "E4_train": True, "E4_fly": True, "ORB1_more": t2,
-                "tier2_rl": t2, "explore": True, "DS1": True, "open_loop": True, "timing": True, "analysis": True,
-                "report": True}
+                "tier2_rl": t2, "explore": True, "DS1": True, "AS1": True, "open_loop": True, "timing": True,
+                "analysis": True, "report": True}
 
 
 def git_commit() -> str:
@@ -234,7 +239,7 @@ def _inside_s(p: str, root: str) -> bool:
 
 STAGES = {
     "00_study": "frozen settings (study_config.json), status.json, status_history.csv, logs/, legacy RL inventory",
-    "01_benchmark": "a copy of configs/benchmark_v5 (A256, ORB-1, DEV48, DS1) with SHA256SUMS",
+    "01_benchmark": "a copy of configs/benchmark_v5 (A256, ORB-1, DEV48, DS1, AS1) with SHA256SUMS",
     "01_checks": "gates S0, V1-V4, E0 (<gate>.json + .done) and compute per decision (RQ5)",
     "02_models": "E3 models per arm and seed: ckpt.pt, model.json, train_log.csv, F_curves.png/pdf",
     "02_policies": "RL policies per arm and seed: policy.pt, run.json, learning_curve.csv, F_curves.png/pdf",
@@ -446,7 +451,7 @@ _SUITES: Dict[str, List[dict]] = {}
 
 
 def conditions(cfg: StudyConfigV5, suite: str) -> List[dict]:
-    """The conditions of a suite this config flies (A256, DEV48, ORB1, DS1, HELD256)."""
+    """The conditions of a suite this config flies (A256, DEV48, ORB1, DS1, AS1, HELD256)."""
     if suite not in _SUITES:
         if suite == "HELD256":
             import pandas as pd
@@ -468,6 +473,10 @@ def conditions(cfg: StudyConfigV5, suite: str) -> List[dict]:
             if (cfg.a256_cases is not None and k not in cfg.a256_cases) or c["atmosphere"] not in cfg.ds1_atmospheres:
                 continue
             c["feasible"] = None                     # no footprint was computed under an altitude-varying density
+        elif suite == "AS1":
+            if (cfg.a256_cases is not None and k not in cfg.a256_cases) or c["atmosphere"] not in cfg.as1_vehicles:
+                continue
+            c["feasible"] = c.get("feasible_as1")   # A256's footprint rule under the true vehicle (AS1.json)
         elif suite == "DEV48":
             if cfg.dev48_cases is not None and k not in cfg.dev48_cases:
                 continue
@@ -572,12 +581,14 @@ def arm_job(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, cond: dict, arm: str,
     """One flight of a named arm on a condition (guidance laws and MPPI arms of E1/E2)."""
     if arm == "classical":
         return classical_job(cond, stage)
-    if arm in ("fnpeg", "fnpeg_180", "fnpeg_oracle"):
+    if arm in ("fnpeg", "fnpeg_180", "fnpeg_oracle", "fnpeg_norelief"):
         c = tuned(L, "fnpeg", cfg)
         if arm == "fnpeg_180":
             c["sigma_max_deg"] = 180.0
         if arm == "fnpeg_oracle":
             c.update({"oracle": True, "filters": False})
+        if arm == "fnpeg_norelief":                      # the tuned law with Lu's load relief switched off
+            c["load_relief"] = False
         j = guidance_job(cond, arm, stage, "fnpeg", c, 180.0 if arm.endswith("180") else 90.0)
         j["untuned"] = not is_tuned(L, "fnpeg")          # test flights wait until tuning has chosen (section 4.5)
         return j
@@ -719,6 +730,12 @@ def jobs_ds1(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout) -> List[dict]:
     return [arm_job(cfg, L, L3, c, a, "DS1") for a in cfg.ds1_arms for c in conds]
 
 
+def jobs_as1(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout) -> List[dict]:
+    """AS1 (aerodynamic sensitivity, section 3.4b): every AS1 arm once per condition, with DS1's seed rule."""
+    conds = conditions(cfg, "AS1")
+    return [arm_job(cfg, L, L3, c, a, "AS1") for a in cfg.as1_arms for c in conds]
+
+
 def done_ids(L: LayoutV5, jobs: Sequence[dict]) -> set:
     """Flight ids among jobs whose result exists (one os.scandir per result folder)."""
     by_dir: Dict[Path, Dict[str, str]] = {}
@@ -762,8 +779,9 @@ def _cpu_worker(arg) -> int:
     L = LayoutV5(root, ro)
     m = shard[0]["model"]
     if m["kind"] == "classical":
-        for j in shard:
-            L.write_flight(_relabel(j, F4.fly_classical_v4(j)))
+        with F5.with_interval_fields():
+            for j in shard:
+                L.write_flight(_relabel(j, F4.fly_classical_v4(j)))
         return len(shard)
     if m["kind"] in ("policy", "legacy_rl"):
         law = F5.make_law("policy", {"path": m["path"], "legacy": m["kind"] == "legacy_rl"})
@@ -1624,7 +1642,7 @@ def all_stage_jobs(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, log=lambda *a:
     rl = list(RL_TIER1) + (list(RL_TIER2) if t2 else [])
     J = {"A256": jobs_a256(cfg, L, L3), "ORB1_block1": orb1_jobs(cfg, L, L3, ORB1_ARMS, [0], "ORB1", log),
          "E3": jobs_e3(cfg, L, L3), "E4": jobs_e4(cfg, L, L3, rl), "explore": jobs_explore(cfg, L, L3),
-         "DS1": jobs_ds1(cfg, L, L3)}
+         "DS1": jobs_ds1(cfg, L, L3), "AS1": jobs_as1(cfg, L, L3)}
     fin = legacy_finals(L)
     if fin:
         J["legacy"] = legacy_jobs(cfg, L, fin)
@@ -1759,11 +1777,11 @@ def timing_stage(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, device: str, log
     old_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
-        for arm in ("fnpeg", "predguid", "classical"):
+        for arm in ("fnpeg", "predguid", "classical", "classical_noscreen"):
             if (arm, "cpu") in done:
                 continue
-            if arm == "classical":
-                ms = _classical_step_ms(classical_job(cond, "timing"))
+            if arm.startswith("classical"):
+                ms = _classical_step_ms(classical_job(cond, "timing"), screen=arm == "classical")
             else:
                 j = arm_job(cfg, L, L3, cond, arm, "timing")
                 law = F5.make_law(j["model"]["kind"], j["model"]["cfg"])
@@ -1823,14 +1841,18 @@ def _params(model: dict) -> int:
     return 0
 
 
-def _classical_step_ms(job: dict) -> List[float]:
-    """Wall time of each 1 s step of the classical controller (predictor-corrector + simulator)."""
+def _classical_step_ms(job: dict, screen: bool = True) -> List[float]:
+    """Wall time of each 1 s step of the classical controller (predictor-corrector + simulator). screen=False turns
+    off the guidance's diagnostic interval heat screen, which every classical flight runs after choosing its command
+    and which cannot change it (jepa/interval_layer_audit.md): the timing of the guidance law itself."""
     import rl_env
     from jepa.data import apply_domain
     env = rl_env.OrionEntryEnv(config_path=job["config_path"], controller_mode="baseline", dispersion=False,
                                max_episode_steps=1400, fast_atmosphere=True)
     apply_domain(env.params, job["domain"])
     env.reset(seed=0, options={"ic_override": job["ic"]})
+    if not screen:
+        env.guidance._prediction_context.interval_active = False
     ms, done = [], False
     while not done:
         t0 = time.perf_counter()

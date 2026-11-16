@@ -147,6 +147,20 @@ def apply_domain(params: dict, domain: Dict[str, float]) -> dict:
                                      "factor": tuple(float(v) for v in prof["factor"])}
     else:
         params.pop("density_profile", None)
+    # v5's aerodynamic-sensitivity suite (density_profile's sibling): a domain with aero_schedule_id flies the true
+    # vehicle on another trim schedule (math_3d reads params["orion_trim_schedule"]); a later domain without one puts
+    # back whatever the params had before.
+    if domain.get("aero_schedule_id"):
+        from jepa.benchmark_v5 import as1_schedule
+        if "aero_schedule_before" not in params:
+            params["aero_schedule_before"] = params.get("orion_trim_schedule")
+        params["orion_trim_schedule"] = as1_schedule(domain["aero_schedule_id"])
+    elif "aero_schedule_before" in params:
+        before = params.pop("aero_schedule_before")
+        if before is None:
+            params.pop("orion_trim_schedule", None)
+        else:
+            params["orion_trim_schedule"] = before
     return params
 
 

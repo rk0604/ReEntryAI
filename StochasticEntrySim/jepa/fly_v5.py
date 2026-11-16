@@ -26,6 +26,7 @@ Closed-loop flights for the v5 study (jepa/v5_plan.md sections 4.1-4.4).
 
 from __future__ import annotations
 
+import contextlib
 import math
 import time
 from typing import Callable, Dict, List, Optional, Sequence
@@ -62,6 +63,35 @@ def flight_id_v5(job: dict) -> str:
         return f"{job['suite']}/{job['controller']}/{cond_key(job)}"
     return (f"{job['suite']}/{job['controller']}/{job['load']}/seed{int(job['seed'])}/"
             f"mppi{int(job.get('mppi_rep', 0))}/{cond_key(job)}")
+
+
+def interval_fields(info: dict) -> dict:
+    """What rl_env's interval layer did in a flight (added 2026-11-15, jepa/interval_layer_audit.md): whether any
+    interval option was on, and how often the shield overrode a command. Every v5 arm flies with the shield off, so
+    these are False and 0; the record shows it instead of leaving it to the code."""
+    info = info or {}
+    return {"use_intervals": bool(info.get("use_intervals", False)),
+            "shield_interventions": int(info.get("shield_interventions", 0)),
+            "shield_steps": int(info.get("shield_steps", 0)),
+            "interval_violations": int(info.get("interval_violations", 0))}
+
+
+@contextlib.contextmanager
+def with_interval_fields():
+    """For the classical and MPPI runners of v3/v4, which v5 does not change: while this is open, fly_v3.finish (the
+    one place they build a record, with the environment's last info in hand) also writes interval_fields."""
+    orig = F.finish
+
+    def finish(job, env, info, *a, **k):
+        res = orig(job, env, info, *a, **k)
+        res.update(interval_fields(info))
+        return res
+
+    F.finish = finish
+    try:
+        yield
+    finally:
+        F.finish = orig
 
 
 def result_extras_v5(job: dict) -> dict:
@@ -140,6 +170,7 @@ class GuidanceFlight:
                 "mppi_rep": self.job.get("mppi_rep") or 0}
         res = F.finish(shim, self.env, self.info, self.cmds, tel, time.time() - self.t0, self.plan_ms)
         res.update({"load": self.job.get("load"), "seed": self.job.get("seed")})
+        res.update(interval_fields(self.info))
         res.update(result_extras_v5(self.job))
         res.update(v5_metrics(res, tel, math.degrees(self.sigma_max), self.plan_ms))
         if law is not None and hasattr(law, "flight_summary"):
@@ -307,8 +338,9 @@ def run_mppi_v5(jobs: Sequence[dict], adapter, mppi: Optional[dict] = None, n_su
         if on_done is not None:
             on_done(rec)
 
-    out = F4.run_lockstep_v4(jobs, adapter, mppi, n_sub=n_sub, max_rows=max_rows, on_done=done, verbose=verbose,
-                             progress=progress)
+    with with_interval_fields():
+        out = F4.run_lockstep_v4(jobs, adapter, mppi, n_sub=n_sub, max_rows=max_rows, on_done=done, verbose=verbose,
+                                 progress=progress)
     return out
 
 
