@@ -35,8 +35,8 @@ INTRO = f"""
 
 {BADGE}
 
-**How to run.** Open in Colab (badge above), choose an **L4 GPU** runtime (it opens that way), and
-**Runtime → Run all**. **After any disconnect, crash or runtime release, Run all again**: every stage
+**How to run.** Open in Colab (badge above). It opens on an **L4 GPU** runtime; for the **first pass switch
+to a CPU runtime** (Runtime → Change runtime type; see *Passes* below), then **Runtime → Run all**. **After any disconnect, crash or runtime release, Run all again**: every stage
 reads Drive, skips finished work in seconds and resumes half-done work from its last checkpoint (at most
 5 minutes of any training is lost). No cell ever needs editing to resume; Colab may only ask you to
 re-authorize the Drive mount. The notebook **disconnects itself** when the last cell finishes or a cell
