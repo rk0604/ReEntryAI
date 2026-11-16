@@ -920,14 +920,29 @@ def run_mppi(cfg: StudyConfigV5, jobs: Sequence[dict], L: LayoutV5, device: str 
     return n_flown
 
 
+WAITING = {"cpu": 0, "gpu": 0}      # flights left for another runtime by run_jobs in this session (the notebook's notes)
+
+
 def run_jobs(cfg: StudyConfigV5, jobs: Sequence[dict], L: LayoutV5, device: str = "cpu", cpu_workers: int = 1,
-             gpu_workers: int = 1, can_gpu: bool = True, log=print, label: str = "flights") -> int:
-    n = run_cpu(cfg, jobs, L, cpu_workers, log, label)
+             gpu_workers: int = 1, can_gpu: bool = True, log=print, label: str = "flights", can_cpu: bool = True) -> int:
+    """CPU-pool flights, then MPPI flights. can_cpu=False (a GPU pass with GPU_PASS_SKIPS_CPU) leaves the CPU-pool
+    flights for a CPU runtime; can_gpu=False leaves the MPPI flights for a GPU runtime. Either only logs a count."""
+    if can_cpu:
+        n = run_cpu(cfg, jobs, L, cpu_workers, log, label)
+    else:
+        cj = [j for j in jobs if j["model"]["kind"] in GUIDANCE_KINDS]
+        k = len(cj) - len(done_ids(L, cj)) if cj else 0
+        WAITING["cpu"] += k
+        if k:
+            log(f"[{label}] {k} CPU flights wait for a CPU runtime (GPU_PASS_SKIPS_CPU)")
+        n = 0
     mj = [j for j in jobs if j["model"]["kind"] not in GUIDANCE_KINDS]
     if mj and can_gpu:
         n += run_mppi(cfg, mj, L, device, gpu_workers, log, label)
     elif mj:
-        log(f"[{label}] {len(mj) - len(done_ids(L, mj))} MPPI flights wait for a GPU runtime")
+        k = len(mj) - len(done_ids(L, mj))
+        WAITING["gpu"] += k
+        log(f"[{label}] {k} MPPI flights wait for a GPU runtime")
     return n
 
 

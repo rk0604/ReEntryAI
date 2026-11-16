@@ -580,7 +580,10 @@ Built by `jepa/build_notebook_v5.py` (reuse `AUTO_DISCONNECT_CODE`, `DONE_MD`, `
 `build_notebooks_v3.py` and v4's Settings-cell pattern: `MODE`, `RUN` per stage, `AUTO_DISCONNECT`,
 `CPU_WORKERS`, `GPU_WORKERS`). Colab metadata: GPU, L4. **Resume rule as v4: after any disconnect, Run
 all continues where it stopped**; nothing finished is redone. CPU-only runtimes skip GPU stages with a
-message, so analysis and report can run cheaply.
+message, so analysis and report can run cheaply. Since 2026-11-16 (§15) a GPU runtime by default skips the
+CPU-pool test flights with a message (`GPU_PASS_SKIPS_CPU = True` in the Settings cell; the gates and tuning
+still run there if not done, because the GPU stages need them), so the run is done in passes the user switches
+by hand, CPU → L4 → CPU, each releasing the runtime at its end and printing what the next pass must do.
 
 | # | Section | Resume behavior |
 |---|---|---|
@@ -1171,6 +1174,13 @@ saturated.
 * **2026-11-15, five RL seeds (§4.4, §6, §8.3).** RQ3 compared v2 (5 seeds) with RL arms of 3 seeds and
   required 3 of 3. Every Tier 1 RL arm now trains seeds 0–4 and R-each needs ≥ 4 of 5 seeds, the rule of
   G1 and J-each. Cost: 6 more RL runs and 1,536 more policy flights (Tier 1 ≈ 26,600 flights, §4.9).
+* **2026-11-16, GPU passes skip CPU work (user request; notebook plumbing only, no flight, setting or
+  result changes).** `run_jobs(..., can_cpu=False)` leaves the CPU-pool flights (guidance laws, classical,
+  RL policies) for a CPU runtime and counts them; the notebook passes `can_cpu = not (GPU_PASS_SKIPS_CPU and
+  a GPU runtime)` to every flight stage and to the legacy RL flights. Gates and tuning are prerequisites of
+  the GPU stages and still run on any runtime. The last cell prints the flights left for each runtime type.
+  The setting is a notebook variable, not a study setting, so the frozen `study_config.json` is unaffected.
+  Smoke check 1 tests the routing.
 * **2026-11-15, AS1, `fnpeg_norelief`, interval fields and the classical timing (the user's decisions
   after the audits; no v5 test flight existed, no study folder had been started).**
   (1) AS1 (§3.4b, §8.7): 128 conditions, 8 arms, 1,024 flights, own Holm family {A1, A2}. It answers the

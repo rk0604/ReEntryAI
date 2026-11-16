@@ -8,7 +8,7 @@ default <tempdir>/jepa_v4_smoke/: wide_smoke/, v3_smoke/, v4_smoke/; v4_smoke ma
   1  suites: ORB-1, DEV48 and DS1 regenerated equal the frozen files byte for byte; a changed file fails the
      checksum; ORB-1's simulator knobs reproduce the dispersed drag and lift exactly (100 draws, the simulator's
      aero); the density hook scales drag by DS1's factor, and a flight with a profile of ones is bit-identical to
-     one without
+     one without; GPU passes route no CPU-pool flight (GPU_PASS_SKIPS_CPU)
   2  FNPEG: predictor = truth lands < 1 km; batched == unbatched; load relief keeps a 3 g case under 3.15 g; the
      filters converge to the true drag scale
   3  PredGuid: phase sequences on a short and a long case; the final-phase design is reproducible
@@ -220,6 +220,39 @@ def t1_suites(tmp: Path, workers: int) -> None:
           f"(max relative error {worst:.1e})")
     t1_ds1(nom)
     t1_as1(nom)
+    t1_gpu_pass()
+
+
+def t1_gpu_pass() -> None:
+    """GPU_PASS_SKIPS_CPU: run_jobs on a GPU pass flies no CPU-pool flight and counts it; a CPU pass no MPPI flight."""
+    from jepa import study_v5 as S5
+    calls = []
+    saved = (S5.run_cpu, S5.run_mppi, S5.done_ids)
+    S5.run_cpu = lambda cfg, jobs, L, *a, **k: calls.append(("cpu", len(jobs))) or 0
+    S5.run_mppi = lambda cfg, jobs, L, *a, **k: calls.append(("mppi", len(jobs))) or 0
+    S5.done_ids = lambda L, jobs: set()
+    try:
+        jobs = [{"model": {"kind": "fnpeg"}}] * 3 + [{"model": {"kind": "policy"}}] * 2 + [{"model": {"kind": "v2"}}] * 4
+        before = dict(S5.WAITING)
+        msgs = []
+        S5.run_jobs(None, jobs, None, "cuda", 1, 1, True, msgs.append, "t", can_cpu=False)
+        gpu_pass, w1 = list(calls), dict(S5.WAITING)
+        calls.clear()
+        S5.run_jobs(None, jobs, None, "cpu", 1, 1, False, msgs.append, "t")
+        cpu_pass, w2 = list(calls), dict(S5.WAITING)
+        calls.clear()
+        S5.run_jobs(None, jobs, None, "cuda", 1, 1, True, msgs.append, "t")
+        both = list(calls)
+    finally:
+        S5.run_cpu, S5.run_mppi, S5.done_ids = saved
+        S5.WAITING.update(before)
+    nb = (SIM_DIR / "ReEntryAI_JEPA_v5.ipynb").read_text(encoding="utf-8")
+    check("GPU pass skips the CPU-pool flights (5 counted as waiting), a CPU pass the MPPI flights (4), the default "
+          "flies both; every notebook flight stage passes can_cpu",
+          gpu_pass == [("mppi", 4)] and w1["cpu"] - before["cpu"] == 5 and cpu_pass == [("cpu", 9)]
+          and w2["gpu"] - w1["gpu"] == 4 and both == [("cpu", 9), ("mppi", 4)]
+          and nb.count("S5.run_jobs(") == nb.count("can_cpu=CAN_CPU") == 10 and "GPU_PASS_SKIPS_CPU = True" in nb,
+          f"(gpu pass {gpu_pass}, cpu pass {cpu_pass}, default {both})")
 
 
 def t1_as1(nom: dict) -> None:

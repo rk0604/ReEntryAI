@@ -41,9 +41,17 @@ reads Drive, skips finished work in seconds and resumes half-done work from its 
 5 minutes of any training is lost). No cell ever needs editing to resume; Colab may only ask you to
 re-authorize the Drive mount. The notebook **disconnects itself** when the last cell finishes or a cell
 fails (so it never idles on paid compute units); set `AUTO_DISCONNECT = False` in the Settings cell to
-keep the runtime. CPU-only stages (gates, tuning, the guidance laws, classical ORB-1 flights) are limited
-by CPU cores: for long CPU stretches a **high-CPU CPU runtime** is cheaper; GPU stages then print what
-remains and skip.
+keep the runtime.
+
+**Passes (switch the runtime type yourself; nothing switches it for you).** On a GPU runtime the notebook
+does only GPU work by default (`GPU_PASS_SKIPS_CPU = True` in the Settings cell): training, MPPI flights and
+open loop, plus the gates and tuning if they are not done yet, because the GPU stages need them. The CPU-pool
+test flights (guidance laws, classical, RL policies, legacy RL) are left for a CPU runtime, which is cheaper
+for them. On a CPU runtime the GPU stages print what remains and skip. The suggested order is
+**CPU → L4 → CPU**: (1) a high-CPU CPU runtime for the gates, tuning and the guidance-law flights;
+(2) L4 for training and the MPPI flights; (3) a CPU runtime for the trained RL policies' flights, the analysis
+and the report. Each pass disconnects itself at the end, and its last cell prints what the next pass has to
+do. Repeat a pass if it was cut short. `GPU_PASS_SKIPS_CPU = False` flies everything on one runtime.
 
 **Tiers (decision D1).** `TIER = 1` (default) runs the gates, legacy RL re-evaluation, tuning, the A256
 arms (FNPEG, PredGuid, MPPI + filtered physics, v2 at FNPEG's load), ORB-1 block 1, the four non-JEPA
@@ -85,6 +93,8 @@ RUN_OVERRIDE = {}               # e.g. {"ORB1_block1": False} to skip a stage th
 AUTO_DISCONNECT = IN_COLAB      # release the runtime when the notebook finishes or a cell fails; False keeps it
 CPU_WORKERS = None              # guidance-law, policy and classical flights, one simulator per core (None = every core)
 GPU_WORKERS = None              # MPPI flights sharing the GPU (None = 6 GB each, 2 GB spare, at most 4)
+GPU_PASS_SKIPS_CPU = True       # on a GPU runtime, leave the CPU-pool test flights for a (cheaper) CPU runtime;
+                                # False flies everything on whatever runtime this is
 """
 
 SETUP = r"""
@@ -143,6 +153,7 @@ GPU_MEM_GB = torch.cuda.get_device_properties(0).total_memory / 1e9 if DEVICE ==
 CPU_WORKERS = CPU_WORKERS or (CPUS if MODE == "full" else min(2, CPUS))
 GPU_WORKERS = GPU_WORKERS or (max(1, min(4, CPUS, int((GPU_MEM_GB - 2) // 6))) if DEVICE == "cuda" else 1)
 CAN_GPU = DEVICE == "cuda" or MODE == "smoke"       # GPU stages; in smoke mode the CPU stands in for the GPU
+CAN_CPU = not (GPU_PASS_SKIPS_CPU and DEVICE == "cuda")   # CPU-pool test flights (gates and tuning always run)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 if DEVICE == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -166,7 +177,10 @@ LOG(f"MODE={MODE} TIER={TIER} v5 folder={V5_ROOT} device={DEVICE} ({RUNTIME}) cp
     f"repair: {REPAIR}")
 LOG("RUN this session: " + ", ".join(k for k, v in RUN.items() if v))
 if MODE == "full" and DEVICE != "cuda":
-    LOG("No GPU: training, MPPI flights and open loop only report what remains (Runtime -> Change runtime type -> L4).")
+    LOG("CPU pass: training, MPPI flights and open loop only report what remains (Runtime -> Change runtime type -> L4).")
+if not CAN_CPU:
+    LOG("GPU pass (GPU_PASS_SKIPS_CPU): the CPU-pool test flights only report what remains; the gates and tuning still "
+        "run here if they are not done, because the GPU stages need them.")
 """
 
 STATUS = r"""
@@ -204,7 +218,10 @@ if RUN["legacy"]:
                 %pip install -q stable-baselines3
             else:
                 raise
-        S5.run_cpu(CFG, S5.legacy_jobs(CFG, L, FINALS), L, CPU_WORKERS, log, "legacy RL")
+        if CAN_CPU:
+            S5.run_cpu(CFG, S5.legacy_jobs(CFG, L, FINALS), L, CPU_WORKERS, log, "legacy RL")
+        else:
+            log("legacy RL flights wait for a CPU runtime (GPU_PASS_SKIPS_CPU)")
     display(pd.read_csv(L.study / "legacy_rl_inventory.csv").head(30))
 """
 
@@ -237,15 +254,15 @@ if RUN["tuning"]:
 A256 = r"""
 if RUN["A256"]:
     log = L.logger("A256")
-    S5.run_jobs(CFG, S5.jobs_a256(CFG, L, L3, matched=False), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "A256")
-    S5.run_jobs(CFG, S5.jobs_matched(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "A256 matched")
+    S5.run_jobs(CFG, S5.jobs_a256(CFG, L, L3, matched=False), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "A256", can_cpu=CAN_CPU)
+    S5.run_jobs(CFG, S5.jobs_matched(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "A256 matched", can_cpu=CAN_CPU)
 """
 
 ORB1 = r"""
 if RUN["ORB1_block1"]:
     log = L.logger("ORB1")
     S5.run_jobs(CFG, S5.orb1_jobs(CFG, L, L3, S5.ORB1_ARMS, [0], "ORB1", log), L, DEVICE, CPU_WORKERS, GPU_WORKERS,
-                CAN_GPU, log, "ORB-1 block 1")
+                CAN_GPU, log, "ORB-1 block 1", can_cpu=CAN_CPU)
 """
 
 E3_TRAIN = r"""
@@ -263,7 +280,7 @@ if RUN["E3_train"]:
 E3_FLY = r"""
 if RUN["E3_fly"]:
     log = L.logger("E3_fly")
-    S5.run_jobs(CFG, S5.jobs_e3(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "E3")
+    S5.run_jobs(CFG, S5.jobs_e3(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "E3", can_cpu=CAN_CPU)
 """
 
 E4_TRAIN = r"""
@@ -282,19 +299,19 @@ if RUN["E4_train"]:
 E4_FLY = r"""
 if RUN["E4_fly"]:
     log = L.logger("E4_fly")
-    S5.run_jobs(CFG, S5.jobs_e4(CFG, L, L3, RL_ARMS), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "E4")
+    S5.run_jobs(CFG, S5.jobs_e4(CFG, L, L3, RL_ARMS), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "E4", can_cpu=CAN_CPU)
 """
 
 DS1 = r"""
 if RUN["DS1"]:
     log = L.logger("DS1")
-    S5.run_jobs(CFG, S5.jobs_ds1(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "DS1")
+    S5.run_jobs(CFG, S5.jobs_ds1(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "DS1", can_cpu=CAN_CPU)
 """
 
 AS1 = r"""
 if RUN["AS1"]:
     log = L.logger("AS1")
-    S5.run_jobs(CFG, S5.jobs_as1(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "AS1")
+    S5.run_jobs(CFG, S5.jobs_as1(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "AS1", can_cpu=CAN_CPU)
 """
 
 ORB1_MORE = r"""
@@ -302,16 +319,16 @@ if RUN["ORB1_more"]:
     log = L.logger("ORB1")
     for b in (1, 2):                    # block 3 becomes eligible only once block 2 is complete
         S5.run_jobs(CFG, S5.orb1_jobs(CFG, L, L3, S5.ORB1_ARMS, [b], "ORB1", log), L, DEVICE, CPU_WORKERS,
-                    GPU_WORKERS, CAN_GPU, log, f"ORB-1 block {b + 1}")
+                    GPU_WORKERS, CAN_GPU, log, f"ORB-1 block {b + 1}", can_cpu=CAN_CPU)
     extra = ["mppi_truth"] + S5.best_arms(CFG, L, L3)
     S5.run_jobs(CFG, S5.orb1_jobs(CFG, L, L3, extra, [0], "ORB1", log), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU,
-                log, "ORB-1 block 1 extra")
+                log, "ORB-1 block 1 extra", can_cpu=CAN_CPU)
 """
 
 EXPLORE = r"""
 if RUN["explore"]:
     log = L.logger("explore")
-    S5.run_jobs(CFG, S5.jobs_explore(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "exploratory")
+    S5.run_jobs(CFG, S5.jobs_explore(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "exploratory", can_cpu=CAN_CPU)
 """
 
 OPEN_LOOP = r"""
@@ -342,6 +359,9 @@ if RUN["analysis"]:
 
 REPORT = r"""
 S5.status(CFG, L, S5.all_stage_jobs(CFG, L, L3), RUNTIME)
+if S5.WAITING["cpu"] or S5.WAITING["gpu"]:
+    print(f"NEXT PASS: {S5.WAITING['cpu']} flights wait for a CPU runtime, {S5.WAITING['gpu']} MPPI flights (and any "
+          "training) for a GPU runtime. Runtime -> Change runtime type, then Run all.")
 if RUN["report"]:
     print("report:", R5.build_report(L))
 S5.update_manifest(L)
