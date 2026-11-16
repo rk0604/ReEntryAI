@@ -13,6 +13,9 @@ configs/benchmark_v5/ and are verified against its SHA256SUMS every time they lo
             3,000 cases in three blocks of 1,000
     DEV48   12 new testset_v3 cases (Sobol seed 20261104, A256's Sobol indices skipped) x the
             four atmospheres: the only suite any baseline is tuned on
+    DS1     (added 2026-11-15) A256's 64 cases x four atmospheres whose density error changes with
+            altitude (two shears, two GRAM-like random profiles), the only suite whose error no
+            constant correction can represent; DS1.json holds every profile
 
 score() turns a flights table into every section-5 metric per arm x suite x (atmosphere or
 target range): success at 2/5/10/25 km, log miss, the Orion EM-1 requirement test (one-sided
@@ -20,6 +23,7 @@ target range): success at 2/5/10/25 km, log miss, the Orion EM-1 requirement tes
 compliance (Bairstow App. D.2 procedure), authority saturation, compute per decision.
 
     python jepa/benchmark_v5.py --build --workers 11     # writes configs/benchmark_v5/ (then frozen)
+    python jepa/benchmark_v5.py --build-ds1              # DS1.json only (2026-11-15), other files untouched
     python jepa/benchmark_v5.py --verify
 """
 
@@ -50,7 +54,7 @@ from jepa.data import NOMINAL_DOMAIN
 BENCH_DIR = SIM_DIR / "configs" / "benchmark_v5"
 BENCH_REL = "configs/benchmark_v5"
 A256_CSV = SIM_DIR / "configs" / "v3_testset.csv"
-SUITES = ("A256", "ORB1", "DEV48")
+SUITES = ("A256", "ORB1", "DEV48", "DS1")
 FLOAT_FMT = "%.6f"
 R_KM = float(constants.RADIUS_EARTH) / 1000.0
 FT = 0.3048
@@ -154,6 +158,143 @@ def in_training_domain(row: dict) -> bool:
 
 def domain_of(row: dict) -> Dict[str, float]:
     return {k: float(row[k]) for k in ("density_scale", "lift_scale", "mass_scale")}
+
+
+# ============================================================================
+# DS1: density shear (added 2026-11-15, v5_plan.md section 3.4)
+# ============================================================================
+DS1_ATMOSPHERES = ("shear_dense_high", "shear_dense_low", "gram_like", "gram_like_lift")
+
+
+@dataclass(frozen=True)
+class DS1Spec:
+    """Every number that defines DS1; saved in DS1.json. The air is wrong by a factor that changes with altitude,
+    which no constant correction (FNPEG's and PredGuid's filters, mppi_filtered's scales, v2's training
+    randomization) can represent exactly."""
+    seed: int = 20261115
+    grid_step_km: float = 2.0               # profile nodes every 2 km from 0 to 160 km (the atmosphere table's top)
+    grid_top_km: float = 160.0
+    shear_amp: float = 0.15                 # shear profiles: x(1 +- amp) above shear_top, x(1 -+ amp) below shear_bottom
+    shear_top_km: float = 70.0
+    shear_bottom_km: float = 40.0
+    gp_sigma_0km: float = 0.04              # GRAM-like profiles: 1-sigma of ln(density factor) at 0 km ...
+    gp_sigma_100km: float = 0.12            # ... rising linearly to this at 100 km, constant above
+    gp_corr_km: float = 10.0                # squared-exponential vertical correlation length
+    gp_clip_sigma: float = 3.0              # draws truncated at +-3 sigma
+    lift_scale_gram_lift: float = 0.92      # gram_like_lift: a second draw and L/D x 0.92
+
+    def grid_m(self) -> np.ndarray:
+        n = int(round(self.grid_top_km / self.grid_step_km))
+        return np.arange(n + 1) * self.grid_step_km * 1000.0
+
+
+def ds1_shear(spec: DS1Spec, dense_high: bool) -> np.ndarray:
+    """Factor on the grid: (1 + a) above shear_top and (1 - a) below shear_bottom (dense_high), linear between."""
+    h = spec.grid_m() / 1000.0
+    w = np.clip((h - spec.shear_bottom_km) / (spec.shear_top_km - spec.shear_bottom_km), 0.0, 1.0)
+    s = 1.0 if dense_high else -1.0
+    return 1.0 + s * spec.shear_amp * (2.0 * w - 1.0)
+
+
+def ds1_gp(spec: DS1Spec, case: int, stream: int) -> np.ndarray:
+    """A smooth random factor exp(sigma(h) z(h)) on the grid: z a unit Gaussian process with squared-exponential
+    correlation in altitude, drawn from its own stream per (case, stream) and truncated at gp_clip_sigma."""
+    h = spec.grid_m() / 1000.0
+    C = np.exp(-0.5 * ((h[:, None] - h[None, :]) / spec.gp_corr_km) ** 2) + 1e-9 * np.eye(len(h))
+    Lc = np.linalg.cholesky(C)
+    z = Lc @ np.random.default_rng([spec.seed, int(stream), int(case)]).standard_normal(len(h))
+    z = np.clip(z, -spec.gp_clip_sigma, spec.gp_clip_sigma)
+    sig = spec.gp_sigma_0km + (spec.gp_sigma_100km - spec.gp_sigma_0km) * np.clip(h / 100.0, 0.0, 1.0)
+    return np.exp(sig * z)
+
+
+def build_ds1_doc(spec: DS1Spec = DS1Spec()) -> dict:
+    """DS1.json: the spec, the atmospheres and every profile (factor per grid node), for A256's 64 entry cases."""
+    import pandas as pd
+    cases = [int(c) for c in pd.read_csv(A256_CSV)["case"]]
+    r6 = lambda a: [round(float(v), 6) for v in a]
+    hi, lo = r6(ds1_shear(spec, True)), r6(ds1_shear(spec, False))
+    atms = {
+        "shear_dense_high": {"lift_scale": 1.0, "what": f"density x{1 + spec.shear_amp:.2f} above "
+                             f"{spec.shear_top_km:g} km, x{1 - spec.shear_amp:.2f} below {spec.shear_bottom_km:g} km, "
+                             "linear between", "profiles": {str(c): hi for c in cases}},
+        "shear_dense_low": {"lift_scale": 1.0, "what": "the mirror image: thin above, dense below",
+                            "profiles": {str(c): lo for c in cases}},
+        "gram_like": {"lift_scale": 1.0, "what": "a smooth random profile per case (stream 1)",
+                      "profiles": {str(c): r6(ds1_gp(spec, c, 1)) for c in cases}},
+        "gram_like_lift": {"lift_scale": spec.lift_scale_gram_lift, "what": "a second random profile per case "
+                           f"(stream 2) and L/D x{spec.lift_scale_gram_lift:g}",
+                           "profiles": {str(c): r6(ds1_gp(spec, c, 2)) for c in cases}}}
+    return {"suite": "DS1", "spec": asdict(spec), "alt_m": r6(spec.grid_m()), "cases": cases,
+            "atmospheres": atms, "n_conditions": len(cases) * len(atms),
+            "note": "A256's entry cases and targets; only the air differs (an altitude-dependent density factor, "
+                    "math_3d.density_profile_factor; density_scale and mass_scale stay 1)"}
+
+
+def ds1_profile_id(atm: str, case: int) -> float:
+    """A DS1 profile as a number: 1000 x (atmosphere index + 1) + case. Domains carry this id, not the profile,
+    because every flight record copies the domain's values as floats (fly_v3.result_record: dom_<key>)."""
+    return float(1000 * (DS1_ATMOSPHERES.index(atm) + 1) + int(case))
+
+
+_DS1_DOC: Dict[str, dict] = {}
+
+
+def ds1_profile(pid: float, bench_dir: Path = BENCH_DIR) -> dict:
+    """{"alt_m", "factor"} of a DS1 profile id (data.apply_domain resolves density_profile_id with this)."""
+    k = str(Path(bench_dir).resolve())
+    if k not in _DS1_DOC:
+        _DS1_DOC[k] = json.loads((Path(bench_dir) / "DS1.json").read_text())
+    doc, i = _DS1_DOC[k], int(round(float(pid)))
+    atm, case = DS1_ATMOSPHERES[i // 1000 - 1], i % 1000
+    return {"alt_m": list(doc["alt_m"]), "factor": list(doc["atmospheres"][atm]["profiles"][str(case)])}
+
+
+def ds1_domain(doc: dict, atm: str, case: int) -> dict:
+    a = doc["atmospheres"][atm]
+    return {"density_scale": 1.0, "lift_scale": float(a["lift_scale"]), "mass_scale": 1.0,
+            "density_profile_id": ds1_profile_id(atm, case)}
+
+
+DS1_README = """<!-- DS1 begin -->
+### DS1 (density shear; added 2026-11-15)
+
+A256's 64 entry cases and targets, each flown in four atmospheres whose density error changes with
+altitude (`DS1.json`, built by `python jepa/benchmark_v5.py --build-ds1`; the other files are unchanged).
+Every other suite's error is a constant multiplier, which FNPEG's and PredGuid's filters, mppi_filtered's
+scales and v2's training randomization can all represent exactly; here none of them can. The factor
+multiplies the simulator's density (`math_3d.density_profile_factor`, piecewise linear on a 2 km grid
+from 0 to 160 km); `density_scale` and `mass_scale` stay 1.
+
+| Atmosphere | Density factor | L/D |
+|---|---|---|
+| shear_dense_high | x{hi:.2f} above {top:g} km, x{lo:.2f} below {bot:g} km, linear between | x1 |
+| shear_dense_low | x{lo:.2f} above {top:g} km, x{hi:.2f} below {bot:g} km | x1 |
+| gram_like | exp(s(h) z(h)), z a unit Gaussian process (squared-exponential, {corr:g} km correlation), s from {s0:.0%} at 0 km to {s100:.0%} at 100 km, one draw per case, truncated at {clip:g} sigma | x1 |
+| gram_like_lift | as gram_like, a second draw per case | x{lift:g} |
+
+The random profiles are of the size Earth-GRAM reports for density dispersions (a few percent low down,
+about 10 % at 80-100 km); they are not drawn from Earth-GRAM. Seed {seed}.
+<!-- DS1 end -->
+"""
+
+
+def build_ds1(out_dir: Path = BENCH_DIR, spec: DS1Spec = DS1Spec()) -> dict:
+    """Write DS1.json, add (or replace) DS1's section in README.md, and rewrite SHA256SUMS; other files untouched."""
+    doc = build_ds1_doc(spec)
+    out_dir = Path(out_dir)
+    sec = DS1_README.format(hi=1 + spec.shear_amp, lo=1 - spec.shear_amp, top=spec.shear_top_km,
+                            bot=spec.shear_bottom_km, corr=spec.gp_corr_km, s0=spec.gp_sigma_0km,
+                            s100=spec.gp_sigma_100km, clip=spec.gp_clip_sigma, lift=spec.lift_scale_gram_lift,
+                            seed=spec.seed)
+    rd = (out_dir / "README.md").read_text(encoding="utf-8") if (out_dir / "README.md").exists() else ""
+    if "<!-- DS1 begin -->" in rd:
+        a, b = rd.index("<!-- DS1 begin -->"), rd.index("<!-- DS1 end -->") + len("<!-- DS1 end -->\n")
+        rd = rd[:a] + sec + rd[b:]
+    else:
+        rd = rd.rstrip("\n") + "\n\n" + sec
+    write_files({"DS1.json": (json.dumps(doc, indent=1) + "\n").encode(), "README.md": rd.encode("utf-8")}, out_dir)
+    return doc
 
 
 # ============================================================================
@@ -405,6 +546,14 @@ def load_suite(name: str, bench_dir: Path = BENCH_DIR, check: bool = True) -> Li
         for c in pd.read_csv(bench_dir / "ORB1.csv").to_dict("records"):
             out.append({**c, "suite": "ORB1", "atmosphere": "orb1", "ic": T3.ic_of(c), "domain": domain_of(c)})
         return out
+    if name == "DS1":
+        doc = json.loads((bench_dir / "DS1.json").read_text())
+        out = []
+        for c in pd.read_csv(A256_CSV).to_dict("records"):
+            for atm in DS1_ATMOSPHERES:
+                out.append({**c, "suite": "DS1", "atmosphere": atm, "ic": T3.ic_of(c),
+                            "domain": ds1_domain(doc, atm, int(c["case"])), "config_path": "configs/default.json"})
+        return out
     raise ValueError(f"unknown suite {name!r}")
 
 
@@ -564,6 +713,7 @@ def build_all(workers: int = 1, out_dir: Path = BENCH_DIR, log=print, n_orb1: Op
                                             "orb1_feasible_4p5g_by_target": feas45_by_target,
                                             "orb1_in_training_domain": n_dom})
     write_files(files, Path(out_dir))
+    build_ds1(Path(out_dir))                         # DS1 (added 2026-11-15): its file and README section
     return {"targets": targets, "footprint": footprint, "orb1_feasible_frac": n_feas / len(orb1)}
 
 
@@ -693,6 +843,7 @@ def orb1_eligible(flights, arm: str, block: int) -> bool:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--build", action="store_true")
+    ap.add_argument("--build-ds1", action="store_true", help="write DS1.json (and its README section) only")
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--out", default=str(BENCH_DIR))
@@ -700,5 +851,8 @@ if __name__ == "__main__":
     if a.build:
         r = build_all(a.workers, Path(a.out))
         print(json.dumps({k: v for k, v in r.items() if k != "footprint"}, indent=1))
-    if a.verify or not a.build:
+    elif a.build_ds1:
+        d = build_ds1(Path(a.out))
+        print(f"DS1: {d['n_conditions']} conditions")
+    if a.verify or not (a.build or a.build_ds1):
         print(f"verified {len(verify(Path(a.out)))} files")

@@ -92,7 +92,8 @@ def compact(key: str, df: Optional[pd.DataFrame]):
 
 def _inputs(L) -> list:
     from jepa import benchmark_v5 as B
-    files = [L.study / "study_config.json", PLAN, Path(__file__), B.BENCH_DIR / "ORB1_spec.json"]
+    files = [L.study / "study_config.json", PLAN, Path(__file__), B.BENCH_DIR / "ORB1_spec.json",
+             B.BENCH_DIR / "DS1.json"]
     files += [p for p in L.analysis.rglob("*") if p.is_file() and "cache" not in p.parts]
     files += list(L.tuning.glob("*/chosen.json"))
     return files
@@ -220,6 +221,14 @@ def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
         "enforces the limit gives up range there while a soft limit can be exceeded: Q3 is therefore also shown on "
         "the load-feasible cases, with success counted only within the load limit, and per target (T08b).")
     fig("F06"), fig("F07"), fig("F08"), tab("T08"), tab("T08b")
+    d.h1("DS1. Density errors that change during flight")
+    d.p("A256's errors are constant multipliers for the whole flight. DS1 (added 2026-11-15, before the full run) flies "
+        "the same 64 entry cases under air whose density error changes with altitude: a +15% error above 70 km that "
+        "turns into −15% below 40 km and the reverse, and two random GRAM-like profiles (4% scatter near the ground "
+        "growing to 12% at 100 km, 10 km correlation), the second also with L/D × 0.92. A filter that has learned a "
+        "density ratio high up meets a different one lower down. D1 and D2 (v2 against FNPEG and PredGuid) are their "
+        "own Holm family; T13b shows what each arm loses from A256 to DS1.")
+    tab("T13"), tab("T13b")
     d.h1("RQ5. Compute per decision")
     tab("T09")
     d.h1("Success against the threshold")
@@ -237,6 +246,10 @@ def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
             "<b>Footprint</b> (constant bank, nominal entry): " + escape(json.dumps(fp)[:600]),
             "<b>Targets</b>: " + escape("; ".join(f"{x['target_index']}: {x['downrange_km']} km" for x in spec.get("targets", []))),
             "<b>DEV48</b>: tuning only, never a result (configs/benchmark_v5/DEV48.csv).",
+            "<b>DS1</b>: A256's 64 cases × 4 altitude-varying density profiles (shear_dense_high, shear_dense_low, "
+            "gram_like, gram_like_lift), a piecewise-linear density factor on a 2 km grid from 0 to 160 km "
+            "(configs/benchmark_v5/DS1.json). The factor scales density in the equations of motion, the sensed "
+            "accelerations and the g-load; the heating model does not see it.",
         ])
     except Exception as e:                                   # the datasheet must not cost the report
         d.p(escape(f"(benchmark datasheet unavailable: {e})"))
@@ -250,7 +263,8 @@ def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
         "<b>success@5km / @2km</b>: outcome drogue (7.6 km) and great-circle miss below 5 / 2 km; <b>success@10km</b>: "
         "miss ≤ 10 km. <b>log miss</b> = ln(max(miss, 0.01 km)); failures keep their miss at termination.",
         "<b>Paired comparisons</b>: the unit is one condition, paired across arms by entry state and MPPI noise stream "
-        "(common random numbers). Deterministic arms are broadcast over seeds; RL comparisons pair seeds 0–2.",
+        "(common random numbers). Deterministic arms are broadcast over seeds; RL comparisons pair seeds 0–4. ORB-1 "
+        "and DS1: a seeded arm flies seed case mod 5 and cases are resampled within those strata.",
         f"<b>Uncertainty</b>: hierarchical bootstrap, {cfg.get('n_boot')} resamples (seeds, then cases within each "
         "atmosphere), 95% percentile intervals (90% for TOST); ORB-1: cases resampled within training-seed strata; "
         "per-seed exact McNemar and sign tests; Holm within each family. Sensitivity: the same bootstrap with each "

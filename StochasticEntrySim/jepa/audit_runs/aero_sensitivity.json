@@ -1,0 +1,50 @@
+{
+ "ours (default) | bank 0": {
+  "downrange_km": 3379.2,
+  "peak_g": 2.46,
+  "t_s": 749.0,
+  "outcome": "drogue"
+ },
+ "ours (default) | bank 60": {
+  "downrange_km": 2646.5,
+  "peak_g": 4.0,
+  "t_s": 569.75,
+  "outcome": "drogue"
+ },
+ "ours, re-entered | bank 0": {
+  "downrange_km": 3379.2,
+  "peak_g": 2.46,
+  "t_s": 749.0,
+  "outcome": "drogue"
+ },
+ "ours, re-entered | bank 60": {
+  "downrange_km": 2646.5,
+  "peak_g": 4.0,
+  "t_s": 569.75,
+  "outcome": "drogue"
+ },
+ "Bibb L/D | bank 0": {
+  "downrange_km": 3144.4,
+  "peak_g": 2.89,
+  "t_s": 692.0,
+  "outcome": "drogue"
+ },
+ "Bibb L/D | bank 60": {
+  "downrange_km": 2577.7,
+  "peak_g": 4.34,
+  "t_s": 546.75,
+  "outcome": "drogue"
+ },
+ "Bibb L/D and CD 1.38 | bank 0": {
+  "downrange_km": 3160.7,
+  "peak_g": 2.91,
+  "t_s": 693.25,
+  "outcome": "drogue"
+ },
+ "Bibb L/D and CD 1.38 | bank 60": {
+  "downrange_km": 2594.2,
+  "peak_g": 4.41,
+  "t_s": 547.75,
+  "outcome": "drogue"
+ }
+}

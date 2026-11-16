@@ -95,3 +95,24 @@ McNamara, L. W., and Braun, R. D., AAS 14-094 (Orion EM-1 entry requirements).
 
 ## How to cite
 "ReEntryAI v5 benchmark (A256, ORB-1, DEV48), configs/benchmark_v5 at commit af99feb41c7a."
+
+<!-- DS1 begin -->
+### DS1 (density shear; added 2026-11-15)
+
+A256's 64 entry cases and targets, each flown in four atmospheres whose density error changes with
+altitude (`DS1.json`, built by `python jepa/benchmark_v5.py --build-ds1`; the other files are unchanged).
+Every other suite's error is a constant multiplier, which FNPEG's and PredGuid's filters, mppi_filtered's
+scales and v2's training randomization can all represent exactly; here none of them can. The factor
+multiplies the simulator's density (`math_3d.density_profile_factor`, piecewise linear on a 2 km grid
+from 0 to 160 km); `density_scale` and `mass_scale` stay 1.
+
+| Atmosphere | Density factor | L/D |
+|---|---|---|
+| shear_dense_high | x1.15 above 70 km, x0.85 below 40 km, linear between | x1 |
+| shear_dense_low | x0.85 above 70 km, x1.15 below 40 km | x1 |
+| gram_like | exp(s(h) z(h)), z a unit Gaussian process (squared-exponential, 10 km correlation), s from 4% at 0 km to 12% at 100 km, one draw per case, truncated at 3 sigma | x1 |
+| gram_like_lift | as gram_like, a second draw per case | x0.92 |
+
+The random profiles are of the size Earth-GRAM reports for density dispersions (a few percent low down,
+about 10 % at 80-100 km); they are not drawn from Earth-GRAM. Seed 20261115.
+<!-- DS1 end -->

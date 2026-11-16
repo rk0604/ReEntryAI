@@ -70,6 +70,9 @@ RL_TIER1 = ("dagger_fnpeg", "bcppo_fnpeg", "ppo_hist")
 RL_TIER2 = ("sac_hist", "ppo_matched")
 ORB1_ARMS = ("classical", "fnpeg", "predguid", "mppi_filtered", "v2single")
 EXPLORE_ARMS = ("fnpeg_180", "predguid_180", "fnpeg_oracle")
+# DS1 (density shear, section 3.4, added 2026-11-15): one flight per arm and condition; learned arms fly the training
+# seed case mod n_seeds (as on ORB-1), so a seeded arm costs one flight per condition, not one per seed
+DS1_ARMS = ("classical", "fnpeg", "predguid", "mppi_filtered", "v2single") + RL_TIER1
 # Batching and worker knobs: change speed and memory, never results; free to differ between sessions.
 RUNTIME_KEYS = ("max_rows", "max_rows_physics", "v2_chunk", "guidance_batch", "units_per_hour", "tier")
 # Approximate Colab compute units per hour by runtime (the status cell's projection only).
@@ -89,8 +92,10 @@ class StudyConfigV5:
     mode: str = "full"                                  # "full" | "smoke" (every stage, tiny, numbers meaningless)
     tier: int = 1                                       # D1: Tier 1 first; Tier 2 after the user read Tier 1
     seeds: Tuple[int, ...] = (0, 1, 2, 3, 4)            # learned models (v3's v2 seeds, E3 seeds, MPPI noise indices)
-    rl_seeds: Tuple[int, ...] = (0, 1, 2)
-    a256_cases: Optional[Tuple[int, ...]] = None        # None: all 64
+    rl_seeds: Tuple[int, ...] = (0, 1, 2, 3, 4)         # 5 like the learned models (section 15, 2026-11-15; was 0-2)
+    a256_cases: Optional[Tuple[int, ...]] = None        # None: all 64 (also DS1's cases)
+    ds1_atmospheres: Tuple[str, ...] = B.DS1_ATMOSPHERES   # DS1 (section 3.4): the four density-shear atmospheres
+    ds1_arms: Tuple[str, ...] = DS1_ARMS
     dev48_cases: Optional[Tuple[int, ...]] = None       # None: all 12
     orb1_per_block: Optional[int] = None                # None: all 1,000 per block (smoke: the first k)
     atmospheres: Tuple[str, ...] = ATM
@@ -173,6 +178,7 @@ class StudyConfigV5:
                   critic_warmup_updates=1)
         return StudyConfigV5(
             mode="smoke", seeds=v3.seeds, rl_seeds=(0,), a256_cases=v3.cases, dev48_cases=(0,), orb1_per_block=1,
+            ds1_atmospheres=("gram_like",), ds1_arms=("fnpeg", "predguid", "v2single", "dagger_fnpeg"),
             n_episodes=v3.n_episodes, tune_n=2, tune_refine_n=1,
             rl_tune_n={"dagger_fnpeg": 1, "bcppo_fnpeg": 1, "ppo_hist": 2, "sac_hist": 1},
             rl_tune_frac=0.5, gates_stop=False, v2_sweep_g=(2.7,), v2_sweep_n=1, v3_n_cases=1,
@@ -199,7 +205,8 @@ class StudyConfigV5:
         t2 = self.tier >= 2
         return {"benchmark": True, "legacy": True, "gates": True, "tuning": True, "A256": True, "ORB1_block1": True,
                 "E3_train": True, "E3_fly": True, "E4_train": True, "E4_fly": True, "ORB1_more": t2,
-                "tier2_rl": t2, "explore": True, "open_loop": True, "timing": True, "analysis": True, "report": True}
+                "tier2_rl": t2, "explore": True, "DS1": True, "open_loop": True, "timing": True, "analysis": True,
+                "report": True}
 
 
 def git_commit() -> str:
@@ -227,7 +234,7 @@ def _inside_s(p: str, root: str) -> bool:
 
 STAGES = {
     "00_study": "frozen settings (study_config.json), status.json, status_history.csv, logs/, legacy RL inventory",
-    "01_benchmark": "a copy of configs/benchmark_v5 (A256, ORB-1, DEV48) with SHA256SUMS",
+    "01_benchmark": "a copy of configs/benchmark_v5 (A256, ORB-1, DEV48, DS1) with SHA256SUMS",
     "01_checks": "gates S0, V1-V4, E0 (<gate>.json + .done) and compute per decision (RQ5)",
     "02_models": "E3 models per arm and seed: ckpt.pt, model.json, train_log.csv, F_curves.png/pdf",
     "02_policies": "RL policies per arm and seed: policy.pt, run.json, learning_curve.csv, F_curves.png/pdf",
@@ -439,7 +446,7 @@ _SUITES: Dict[str, List[dict]] = {}
 
 
 def conditions(cfg: StudyConfigV5, suite: str) -> List[dict]:
-    """The conditions of a suite this config flies (A256, DEV48, ORB1, HELD256)."""
+    """The conditions of a suite this config flies (A256, DEV48, ORB1, DS1, HELD256)."""
     if suite not in _SUITES:
         if suite == "HELD256":
             import pandas as pd
@@ -457,6 +464,10 @@ def conditions(cfg: StudyConfigV5, suite: str) -> List[dict]:
             if (cfg.a256_cases is not None and k not in cfg.a256_cases) or c["atmosphere"] not in cfg.atmospheres:
                 continue
             c["feasible"] = c.get(f"feasible_{c['atmosphere']}")
+        elif suite == "DS1":
+            if (cfg.a256_cases is not None and k not in cfg.a256_cases) or c["atmosphere"] not in cfg.ds1_atmospheres:
+                continue
+            c["feasible"] = None                     # no footprint was computed under an altitude-varying density
         elif suite == "DEV48":
             if cfg.dev48_cases is not None and k not in cfg.dev48_cases:
                 continue
@@ -577,7 +588,7 @@ def arm_job(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, cond: dict, arm: str,
         j = guidance_job(cond, arm, stage, "predguid", c, 180.0 if arm.endswith("180") else 90.0)
         j["untuned"] = not is_tuned(L, "predguid")
         return j
-    if seed is None and arm in RL_TIER1 + RL_TIER2:      # ORB-1: case i flies RL training seed i mod 3
+    if seed is None and arm in RL_TIER1 + RL_TIER2:      # ORB-1, DS1: case i flies RL training seed i mod n_rl_seeds
         seed = int(cfg.rl_seeds[int(cond.get("train_seed", cond["case"])) % len(cfg.rl_seeds)])
     if seed is None:
         seed = orb1_seed(cfg, cond)
@@ -699,6 +710,13 @@ def jobs_explore(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout) -> List[dict]:
     """The laws as published (|sigma| <= 180 deg) and FNPEG's ceiling on A256: Tier 1 since 2026-11-11 (section 15)."""
     conds = conditions(cfg, "A256")
     return [arm_job(cfg, L, L3, c, a, "explore") for a in EXPLORE_ARMS for c in conds]
+
+
+def jobs_ds1(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout) -> List[dict]:
+    """DS1 (density shear, section 3.4): every DS1 arm once per condition; a seeded arm flies seed case mod n_seeds
+    (arm_job's ORB-1 rule), RL policies once they are trained, the guidance laws once tuning has chosen."""
+    conds = conditions(cfg, "DS1")
+    return [arm_job(cfg, L, L3, c, a, "DS1") for a in cfg.ds1_arms for c in conds]
 
 
 def done_ids(L: LayoutV5, jobs: Sequence[dict]) -> set:
@@ -1605,7 +1623,8 @@ def all_stage_jobs(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, log=lambda *a:
     t2 = cfg.tier >= 2
     rl = list(RL_TIER1) + (list(RL_TIER2) if t2 else [])
     J = {"A256": jobs_a256(cfg, L, L3), "ORB1_block1": orb1_jobs(cfg, L, L3, ORB1_ARMS, [0], "ORB1", log),
-         "E3": jobs_e3(cfg, L, L3), "E4": jobs_e4(cfg, L, L3, rl), "explore": jobs_explore(cfg, L, L3)}
+         "E3": jobs_e3(cfg, L, L3), "E4": jobs_e4(cfg, L, L3, rl), "explore": jobs_explore(cfg, L, L3),
+         "DS1": jobs_ds1(cfg, L, L3)}
     fin = legacy_finals(L)
     if fin:
         J["legacy"] = legacy_jobs(cfg, L, fin)

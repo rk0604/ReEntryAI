@@ -134,6 +134,19 @@ def apply_domain(params: dict, domain: Dict[str, float]) -> dict:
     params["ref_area_m2"] = float(constants.CAPSULE_REFERENCE_AREA_M2) * float(domain["density_scale"])
     params["cpas_lift_scale"] = float(domain["lift_scale"])
     params["mass_kg"] = float(constants.CAPSULE_MASS_KG) * float(domain["mass_scale"])
+    # v5's density-shear suite: an altitude-dependent density multiplier on top of density_scale
+    # (math_3d.density_profile_factor). A domain without one clears any left by an earlier flight on a reused env.
+    # The suite's domains name the profile by a number (density_profile_id, resolved from configs/benchmark_v5/
+    # DS1.json) so that every domain value stays a float.
+    prof = domain.get("density_profile")
+    if not prof and domain.get("density_profile_id"):
+        from jepa.benchmark_v5 import ds1_profile
+        prof = ds1_profile(domain["density_profile_id"])
+    if prof:
+        params["density_profile"] = {"alt_m": tuple(float(v) for v in prof["alt_m"]),
+                                     "factor": tuple(float(v) for v in prof["factor"])}
+    else:
+        params.pop("density_profile", None)
     return params
 
 

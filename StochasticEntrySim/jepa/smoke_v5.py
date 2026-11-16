@@ -5,8 +5,10 @@ CPU smoke test of the v5 study code (jepa/v5_plan.md section 12). The numbers it
 models, 2 cases, 2 seeds); the checks are what matter. It runs on the v4 smoke fixtures (smoke_v4.py --work,
 default <tempdir>/jepa_v4_smoke/: wide_smoke/, v3_smoke/, v4_smoke/; v4_smoke may be partial).
 
-  1  suites: ORB-1 and DEV48 regenerated equal the frozen files byte for byte; a changed file fails the checksum;
-     ORB-1's simulator knobs reproduce the dispersed drag and lift exactly (100 draws, the simulator's aero)
+  1  suites: ORB-1, DEV48 and DS1 regenerated equal the frozen files byte for byte; a changed file fails the
+     checksum; ORB-1's simulator knobs reproduce the dispersed drag and lift exactly (100 draws, the simulator's
+     aero); the density hook scales drag by DS1's factor, and a flight with a profile of ones is bit-identical to
+     one without
   2  FNPEG: predictor = truth lands < 1 km; batched == unbatched; load relief keeps a 3 g case under 3.15 g; the
      filters converge to the true drag scale
   3  PredGuid: phase sequences on a short and a long case; the final-phase design is reproducible
@@ -19,7 +21,7 @@ default <tempdir>/jepa_v4_smoke/: wide_smoke/, v3_smoke/, v4_smoke/; v4_smoke ma
   9  analysis: every table and figure, a complete criteria table, the bootstrap cache reused; the report builds
   10 the notebook runs end to end in smoke mode; a second run finds everything done in under a minute; v5 refuses
      to write under the v3, v4, data and legacy RL folders
-  11 v3 and v4 notebooks and code unchanged
+  11 v3 and v4 notebooks and code unchanged (math_3d.py and data.py: only the default-off density hook added)
   12 resume equivalence (bit-exact on CPU): E3, PPO, SAC (with buffer shards), DAgger, BC -> PPO
   13 interrupted writes: stale .tmp, truncated train state, corrupt flight JSON, artifact missing behind .done
   14 simulated disconnects (JEPA_V5_FAIL_AT) in the notebook's long stages, then an unchanged rerun: completes,
@@ -42,6 +44,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 SIM_DIR = Path(__file__).resolve().parents[1]
 if str(SIM_DIR) not in sys.path:
@@ -215,6 +218,51 @@ def t1_suites(tmp: Path, workers: int) -> None:
         worst = max(worst, abs(d1 / d0 / want_d - 1.0), abs(l1 / l0 / want_l - 1.0))
     check("ORB-1 knobs reproduce the dispersed drag and lift (100 draws, simulator aero)", worst < 1e-12,
           f"(max relative error {worst:.1e})")
+    t1_ds1(nom)
+
+
+def t1_ds1(nom: dict) -> None:
+    """DS1 and the density hook (v5_plan.md section 3.4)."""
+    from jepa import benchmark_v5 as B
+    from jepa.data import apply_domain
+    import math_3d
+    doc = B.build_ds1_doc()
+    check("DS1 regenerated == the frozen DS1.json bytes",
+          (json.dumps(doc, indent=1) + "\n").encode() == (B.BENCH_DIR / "DS1.json").read_bytes())
+    conds = B.load_suite("DS1")
+    ids_ok = all(B.ds1_profile(c["domain"]["density_profile_id"])["factor"]
+                 == doc["atmospheres"][c["atmosphere"]]["profiles"][str(int(c["case"]))] for c in conds)
+    check("DS1 loads 64 cases x 4 atmospheres; each domain names its profile by a number (every domain value a "
+          "float, as flight records need) that resolves to that case's profile", len(conds) == 256 and ids_ok
+          and all(isinstance(float(v), float) for c in conds for v in c["domain"].values())
+          and {c["atmosphere"] for c in conds} == set(B.DS1_ATMOSPHERES))
+    # the hook: drag with the profile / drag without == the profile's factor at that altitude; absent = untouched
+    worst, h_list = 0.0, (5_000.0, 41_000.0, 55_000.0, 69_000.0, 85_000.0, 130_000.0)
+    for c in conds[::37]:
+        for h in h_list:
+            x = [6_378_137.0 + h, 0.1, 0.2, 6500.0, math.radians(-2.0), 0.7]
+            p0 = apply_domain(dict(nom), {k: v for k, v in c["domain"].items() if k != "density_profile_id"})
+            p1 = apply_domain(dict(nom), c["domain"])
+            want = math_3d.density_profile_factor(p1["density_profile"], max(0.0, math_3d.constants.altitude(x[0])))
+            r = (math_3d.nominal_aero_forces_from_state(x, 0.3, p1)["drag_mag_N"]
+                 / math_3d.nominal_aero_forces_from_state(x, 0.3, p0)["drag_mag_N"])
+            worst = max(worst, abs(r / want - 1.0))
+    reused = apply_domain(apply_domain(dict(nom), conds[0]["domain"]), {"density_scale": 1.0, "lift_scale": 1.0,
+                                                                         "mass_scale": 1.0})
+    check("density hook: drag scales by the profile's factor at each altitude; a later domain without a profile "
+          "clears it", worst < 1e-12 and "density_profile" not in reused, f"(max relative error {worst:.1e})")
+    # bit-exact: a whole full-simulator flight with a profile of ones equals the flight without one
+    ic = dict(B.ORB1Spec().nominal_ic())
+    flat = {"alt_m": list(doc["alt_m"]), "factor": [1.0] * len(doc["alt_m"])}
+    base_dom = {"density_scale": 1.0, "lift_scale": 1.0, "mass_scale": 1.0}
+    t0 = time.time()
+    a = B.fly_constant_bank_sim(ic, 45.0, dict(base_dom))
+    b = B.fly_constant_bank_sim(ic, 45.0, dict(base_dom, density_profile=flat))
+    s = B.fly_constant_bank_sim(ic, 45.0, next(c["domain"] for c in conds if c["atmosphere"] == "shear_dense_low"))
+    keys = sorted(k for k in a if isinstance(a[k], (int, float)))
+    check("a full flight with a profile of ones is bit-identical to one without; a shear profile changes it",
+          all(a[k] == b[k] for k in keys) and any(a[k] != s[k] for k in keys),
+          f"(compared {keys}; {time.time() - t0:.0f}s)")
 
 
 # ============================================================================
@@ -682,12 +730,12 @@ def t9_analysis(root: Path, fx: dict) -> None:
     from jepa import study_v5 as S5
     cfg = S5.StudyConfigV5.smoke()
     L = S5.LayoutV5(root, read_only=[fx["v3"], fx["v4"], fx["legacy"], fx["data"]])
-    need_t = [f"T{i:02d}" for i in range(1, 13)]
+    need_t = [f"T{i:02d}" for i in range(1, 14)]
     need_f = [f"F{i:02d}" for i in range(1, 11)]
     have_t = {p.stem.split("_")[0] for p in L.tables.glob("T*.csv")}
     have_f = {p.stem.split("_")[0] for p in L.figures.glob("F*.png")}
     have_pdf = {p.stem.split("_")[0] for p in L.figures.glob("F*.pdf")}
-    check("every table T01-T12", set(need_t) <= have_t, f"(missing {sorted(set(need_t) - have_t)})")
+    check("every table T01-T13", set(need_t) <= have_t, f"(missing {sorted(set(need_t) - have_t)})")
     check("every figure F01-F10 as PNG and PDF", set(need_f) <= have_f and set(need_f) <= have_pdf,
           f"(missing {sorted((set(need_f) - have_f) | (set(need_f) - have_pdf))})")
     caps = json.loads((L.analysis / "captions.json").read_text())
@@ -696,8 +744,8 @@ def t9_analysis(root: Path, fx: dict) -> None:
     t05 = pd.read_csv(next(L.tables.glob("T05_*.csv")))
     ids = ["G1", "G2", "G3", "G4", "G5", "G6", "G7a", "G7b", "G7c", "J-mlp_direct", "J-gru_direct", "J-gru_pi",
            "J-r0_nojepa", "J-equiv", "J-mech", "R-dagger_fnpeg", "R-bcppo_fnpeg", "R-ppo_hist", "R-imit", "R-gap",
-           "Q3a", "Q3b", "Q3a-sens", "Q3b-sens"]
-    check("criteria table complete (G1-G7, J-each/equiv/mech, R-each/imit/gap, Q1-Q3)",
+           "Q3a", "Q3b", "Q3a-sens", "Q3b-sens", "D1", "D2", "D-shift"]
+    check("criteria table complete (G1-G7, J-each/equiv/mech, R-each/imit/gap, Q1-Q3, D1-D2)",
           set(ids) <= set(t05.id) and t05.id.str.startswith("Q1-").any() and t05.id.str.startswith("Q2-").any(),
           f"({len(t05)} rows; missing {sorted(set(ids) - set(t05.id))}; not run: "
           f"{list(t05[t05.measured == 'not run'].id)})")
@@ -712,6 +760,14 @@ def t9_analysis(root: Path, fx: dict) -> None:
           {"n_pairs", "n_expected", "complete", "ci_lo_clustered", "ci_hi_clustered"} <= set(t04.columns)
           and bool(pooled.complete.all()) and pooled.ci_lo_clustered.notna().any() and any(L.tables.glob("T08b_*.csv")),
           f"({len(pooled)} pooled comparisons, {int(pooled.complete.sum())} complete)")
+    t13 = pd.read_csv(next(L.tables.glob("T13_*.csv")))
+    t13b = pd.read_csv(next(L.tables.glob("T13b_*.csv")))
+    d1 = t05.set_index("id").loc[["D1", "D2"]]
+    check("DS1: T13 has D1 and D2 complete, T13b every DS1 arm against A256, D1/D2 decided in their own family",
+          {"D1", "D2"} <= set(t13.id) and bool(t13.set_index("id").loc[["D1", "D2"], "complete"].all())
+          and set(cfg.ds1_arms) <= set(t13b.arm) and set(d1.family) == {"DS1"}
+          and set(d1.status) <= {"met", "not met"},
+          f"(T13 {list(t13.id)}; T13b {list(t13b.arm)}; D1/D2 {list(d1.status)})")
     L3 = S4.v3_layout(fx["v3"])
     L4 = S5.v4_layout(fx["v4"])
     try:
@@ -954,12 +1010,44 @@ V34 = ["jepa/study_v3.py", "jepa/fly_v3.py", "jepa/analyze_v3.py", "jepa/testset
        "ReEntryAI_JEPA_v3_2_fly.ipynb", "ReEntryAI_JEPA_v3_3_analyze.ipynb", "ReEntryAI_JEPA_v3_resultspdf.ipynb"]
 
 
+# The one change v5 makes to the simulator (approved by the user 2026-11-15, v5_plan.md section 3.4): an optional
+# altitude-dependent density multiplier, off unless the parameters carry a density_profile.
+HOOK_FILES = {"math_3d.py": 2, "jepa/data.py": 1}     # file -> number of added hunks
+
+
+def _hook_only(base: str) -> Tuple[bool, str]:
+    """The diff of the hook files against base adds lines only, in exactly the expected hunks, each about the
+    density profile."""
+    r = subprocess.run(["git", "diff", "-U0", base, "--", *HOOK_FILES], capture_output=True, text=True)
+    if r.returncode:
+        return False, r.stderr.strip()
+    hunks: Dict[str, List[List[str]]] = {f: [] for f in HOOK_FILES}
+    removed, cur = [], None
+    for ln in r.stdout.splitlines():
+        if ln.startswith("+++ "):
+            cur = ln[6:] if ln.startswith("+++ b/") else None
+            cur = next((f for f in HOOK_FILES if cur and cur.endswith(f)), None)
+        elif ln.startswith("@@") and cur:
+            hunks[cur].append([])
+        elif ln.startswith("-") and not ln.startswith("--- "):
+            removed.append(ln)
+        elif ln.startswith("+") and cur and hunks[cur]:
+            hunks[cur][-1].append(ln[1:])
+    n = {f: len(h) for f, h in hunks.items()}
+    about = all("density_profile" in "\n".join(h) for hs in hunks.values() for h in hs)
+    return (not removed and n == HOOK_FILES and about), f"(removed lines {len(removed)}, added hunks {n})"
+
+
 def t11_unchanged(tmp: Path) -> None:
     section("11. v3 and v4 code, plans and notebooks unchanged")
     base = "2565808"                                   # the v4 study commit (v5 work starts after it)
-    r = subprocess.run(["git", "diff", "--name-only", base, "--", *V34], capture_output=True, text=True)
-    check("v3/v4 modules, plans, simulator and the v4 notebook identical to the v4 commit", r.returncode == 0
-          and not r.stdout.strip(), f"(changed: {r.stdout.split()})")
+    others = [p for p in V34 if p not in HOOK_FILES]
+    r = subprocess.run(["git", "diff", "--name-only", base, "--", *others], capture_output=True, text=True)
+    check("v3/v4 modules, plans, simulator and the v4 notebook identical to the v4 commit (except the density hook)",
+          r.returncode == 0 and not r.stdout.strip(), f"(changed: {r.stdout.split()})")
+    ok, why = _hook_only(base)
+    check("math_3d.py and data.py differ from the v4 commit only by the default-off density hook (lines added, none "
+          "removed)", ok, why)
     before = (SIM_DIR / "ReEntryAI_JEPA_v4.ipynb").read_bytes()
     subprocess.run([sys.executable, "jepa/build_notebook_v4.py"], check=True, capture_output=True)
     after = (SIM_DIR / "ReEntryAI_JEPA_v4.ipynb").read_bytes()

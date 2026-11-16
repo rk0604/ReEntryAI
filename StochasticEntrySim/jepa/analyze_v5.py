@@ -2,15 +2,17 @@
 jepa/analyze_v5.py
 
 Everything the v5 study reports (jepa/v5_plan.md sections 5, 6, 8, 10), written to 05_analysis/ as numbered
-tables (T01-T12, CSV) and figures (F01-F10, PNG and PDF at 200 dpi) with captions.json.
+tables (T01-T13, CSV) and figures (F01-F10, PNG and PDF at 200 dpi) with captions.json.
 
     load_flights_v5   v3's flights (A256: classical, v1, v2, v2single, ...), v4's (R0, v2's load curve) and v5's
                       in one table (arm, load, suite, seed, case, atmosphere / target, metrics); v3 and v4 read-only
     cube, comp        A256 paired comparisons with analyze_v4.Boot (hierarchical bootstrap: seeds, then cases within
                       atmospheres; cached in 05_analysis/cache/ by comparison and input hash)
     orb_paired        ORB-1 paired comparisons: each case one unit, cases resampled within training-seed strata
-    criteria          G1-G7, J-each / J-equiv / J-mech, R-each / R-imit / R-gap, Q1-Q3 (T05); a pass/fail criterion
-                      is decided only when every paired flight of both arms exists (status "pending" before that)
+    criteria          G1-G7, J-each / J-equiv / J-mech, R-each / R-imit / R-gap, Q1-Q3, D1-D2 (T05); a pass/fail
+                      criterion is decided only when every paired flight of both arms exists (status "pending" before)
+    ds1_analysis      DS1 (density shear, section 3.4): paired v2single − X by case (atmospheres averaged), cases
+                      resampled within training-seed strata; each arm's change from A256 (T13, T13b)
     ClusterBoot       sensitivity analysis: the same bootstrap with each entry case resampled together with its four
                       atmospheres (the pooled A256 intervals treat the 256 conditions as independent)
     analyze           the tables, the figures, the criteria; returns a summary for the report
@@ -19,7 +21,8 @@ Definitions (section 5): success@5km / @2km = outcome drogue and miss < 5 / 2 km
 miss <= 10 km; success@5km within the load limit = success@5km and peak g <= 4.6 (benchmark_v5.LOAD_OK_G);
 log miss = ln(max(miss, 0.01 km)). Deterministic arms (classical, fnpeg, predguid, their
 exploratory variants, legacy RL) fly once per condition and are broadcast over seeds; MPPI arms' "seed s" is
-model seed s and noise index s; RL arms' seeds are training seeds 0-2 (comparisons with them pair seeds 0-2).
+model seed s and noise index s; RL arms' seeds are training seeds 0-4 (comparisons with them pair seeds 0-4;
+section 15, 2026-11-15, was 0-2).
 """
 
 from __future__ import annotations
@@ -176,6 +179,8 @@ def load_flights_v5(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4=None
     a256 = {(int(c["case"]), c["atmosphere"]): c.get("feasible") for c in S5.conditions(cfg, "A256")}
     is_a = df.suite == "A256"
     keep = ~is_a | np.array([(c, a) in a256 for c, a in zip(df.case, df.atmosphere)])
+    ds1 = {(int(c["case"]), c["atmosphere"]) for c in S5.conditions(cfg, "DS1")}
+    keep &= (df.suite != "DS1") | np.array([(c, a) in ds1 for c, a in zip(df.case, df.atmosphere)])
     df = df[keep].copy()
     is_a = df.suite == "A256"
     feas = df.get("feasible", pd.Series(np.nan, index=df.index)).map(lambda v: np.nan if pd.isna(v) else _b(v))
@@ -349,6 +354,53 @@ def orb_paired(L, key: str, a: np.ndarray, b: np.ndarray, strata: np.ndarray, n_
 
 
 # ============================================================================
+# DS1: density shear (section 3.4, added 2026-11-15)
+# ============================================================================
+DS1_COMPARISONS = (("D1", "v2single", "fnpeg"), ("D2", "v2single", "predguid"), ("D3", "v2single", "mppi_filtered"),
+                   ("D4", "v2single", "classical")) + tuple((f"D-{a}", "v2single", a) for a in S5.RL_TIER1)
+DS1_FAMILY = ("D1", "D2")                            # the Holm family; the rest are estimates
+
+
+def ds1_analysis(cfg, L, main: pd.DataFrame) -> dict:
+    """DS1 per arm and atmosphere (B.score), each arm's change from A256 on the same 64 cases, and the paired
+    comparisons v2single − X: success@5km, paired by condition, averaged over a case's atmospheres, cases resampled
+    within training-seed strata (case mod n_seeds, the seed a learned arm flew)."""
+    d = main[main.suite == "DS1"]
+    n_exp = len(S5.conditions(cfg, "DS1"))
+    out = {"n_expected": n_exp, "score": B.score(d.assign(arm=d.key)) if len(d) else pd.DataFrame(), "comp": [],
+           "drop": []}
+    if not len(d):
+        return out
+    piv = d.pivot_table(index=["case", "atmosphere"], columns="key", values="success_5km", aggfunc="first")
+    for id_, a, b in DS1_COMPARISONS:
+        if a not in piv or b not in piv:
+            continue
+        p = piv[[a, b]].astype(float).dropna()
+        if not len(p):
+            continue
+        cm = p.groupby(level="case").mean()
+        cases = cm.index.to_numpy()
+        r = orb_paired(L, f"v5|{id_}|DS1", cm[a].to_numpy(), cm[b].to_numpy(), cases % len(cfg.seeds), cfg.n_boot)
+        per_atm = {atm: 100 * float(g[a].mean() - g[b].mean()) for atm, g in p.groupby(level="atmosphere")}
+        out["comp"].append({"id": id_, "a": a, "b": b, "n_pairs": int(len(p)), "n_expected": n_exp,
+                            "complete": bool(len(p) == n_exp), "a_%": 100 * float(p[a].mean()),
+                            "b_%": 100 * float(p[b].mean()), "diff_pp": 100 * r["diff"], "ci_lo_pp": 100 * r["ci_lo"],
+                            "ci_hi_pp": 100 * r["ci_hi"], "p_boot": r["p_boot"], "n_cases": r["n"],
+                            "per_atmosphere_pp": json.dumps({k: round(v, 2) for k, v in per_atm.items()})})
+    a256 = main[main.suite == "A256"]
+    cases = sorted(d.case.unique())
+    for key in sorted(d.key.unique()):
+        x, y = d[d.key == key], a256[(a256.key == key) & a256.case.isin(cases)]
+        out["drop"].append({"arm": key, "DS1_success5_%": 100 * float(x.success_5km.mean()), "DS1_n": int(len(x)),
+                            "A256_success5_%": 100 * float(y.success_5km.mean()) if len(y) else np.nan,
+                            "A256_n": int(len(y)),
+                            "change_pp": 100 * float(x.success_5km.mean() - y.success_5km.mean()) if len(y) else np.nan,
+                            "DS1_median_miss_km": float(x.miss_km.median()),
+                            "A256_median_miss_km": float(y.miss_km.median()) if len(y) else np.nan})
+    return out
+
+
+# ============================================================================
 # Telemetry-derived ORB-1 quantities (landing errors, g-duration curves), cached per flight
 # ============================================================================
 def orb1_telemetry(L, df_orb: pd.DataFrame) -> pd.DataFrame:
@@ -395,7 +447,8 @@ def _prov(r) -> str:
     return "" if done else f"PROVISIONAL ({n} of {e} paired flights): "
 
 
-def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_seeds) -> pd.DataFrame:
+def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_seeds, ds: Optional[dict] = None
+             ) -> pd.DataFrame:
     """T05. A pass/fail criterion is decided only on complete data: until every paired flight of both arms exists
     its status is "pending", `met` stays empty and the measured text is marked PROVISIONAL (the analysis runs on
     every "Run all", so without this a half-flown arm would show a verdict)."""
@@ -530,7 +583,8 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
             continue
         n = int(r["n_seeds"])
         done = _n(r)[2]
-        met = bool(r["diff"] > 0 and r["ci_lo"] > 0 and int(r["seeds_holding"]) >= n) if done else None
+        need = 4 if n >= 5 else n                    # 4 of 5 like G1/J (section 15, 2026-11-15; was 3 of 3)
+        met = bool(r["diff"] > 0 and r["ci_lo"] > 0 and int(r["seeds_holding"]) >= need) if done else None
         row(id_, "RQ3" if arm in S5.RL_TIER1 else "RQ3 (Tier 2, outside the Holm family)",
             f"Does v2 beat {arm}? (v2single − {arm}, seeds {list(rl_seeds)})", _prov(r) + s5_text(r) + clu(r), met,
             r["diff"], (r["ci_lo"], r["ci_hi"]), r["p_boot"], f"{int(r['seeds_holding'])}/{n}",
@@ -589,6 +643,33 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
                         for x in ss)
         row(f"{id_}-sens", "RQ4", f"Is {id_} driven by target 0 or by the load limit? (v2single − {other}; "
             "sensitivity estimates, T08b)", txt or "not run", None, status=None if ss else "not run")
+
+    # ---- DS1: density errors that change during flight (section 3.4; own Holm family, D1-D2) ----
+    comp = {c["id"]: c for c in (ds or {}).get("comp", [])}
+    dfam = []
+    for id_, a_, b_ in DS1_COMPARISONS:
+        fam = "DS1" if id_ in DS1_FAMILY else "DS1 (estimate)"
+        q = f"Does v2 beat {b_} under density shear? ({a_} − {b_}, DS1)"
+        c = comp.get(id_)
+        if c is None:
+            if id_ in DS1_FAMILY:
+                row(id_, fam, q, "not run", None, status="not run")
+            continue
+        done = bool(c["complete"])
+        met = bool(c["diff_pp"] > 0 and c["ci_lo_pp"] > 0) if (done and id_ in DS1_FAMILY) else None
+        row(id_, fam, q, ("" if done else f"PROVISIONAL ({c['n_pairs']} of {c['n_expected']} paired flights): ")
+            + f"success@5km {c['diff_pp']:+.1f} pp [{c['ci_lo_pp']:+.1f}, {c['ci_hi_pp']:+.1f}] over {c['n_cases']} cases "
+            f"(atmospheres averaged within a case); per atmosphere {c['per_atmosphere_pp']}", met, c["diff_pp"],
+            (c["ci_lo_pp"], c["ci_hi_pp"]), c["p_boot"] if id_ in DS1_FAMILY else None,
+            status=None if done or id_ not in DS1_FAMILY else "pending", pairs=(c["n_pairs"], c["n_expected"]))
+        if id_ in DS1_FAMILY:
+            dfam.append(id_)
+    _holm(rows, dfam)
+    drop = (ds or {}).get("drop") or []
+    if drop:
+        row("D-shift", "DS1 (estimate)", "How much does each arm lose from A256 (constant errors) to DS1 (density "
+            "shear), same 64 cases? (descriptive)", "; ".join(f"{x['arm']} {x['change_pp']:+.1f} pp" for x in drop
+                                                            if np.isfinite(x["change_pp"])), None)
 
     for r_ in rows:
         if r_["status"] is None:
@@ -700,7 +781,7 @@ def _params_of(L, arm: str, seed: int) -> Optional[int]:
 # ============================================================================
 # The analysis
 # ============================================================================
-TABLES = tuple(f"T{i:02d}" for i in range(1, 13))
+TABLES = tuple(f"T{i:02d}" for i in range(1, 14))
 FIGURES = tuple(f"F{i:02d}" for i in range(1, 11))
 
 
@@ -789,7 +870,7 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
                                                                       n_seeds="count").reset_index()
         sc = sc.merge(spread, on=["suite", "arm", "group"], how="left")
     _table(L, caps, sc.round(5), "T01_metrics_by_arm",
-           "Every section-5 metric per arm × suite × atmosphere (A256, DEV48 excluded) or target range (ORB-1), plus the "
+           "Every section-5 metric per arm × suite × atmosphere (A256 and DS1, DEV48 excluded) or target range (ORB-1), plus the "
            "arm's pooled row (group all): success at 2/5/10/25 km, success@5km within the load limit (peak g ≤ "
            f"{B.LOAD_OK_G:g}), mean log miss, median and p95 miss, peak g, heat, RCS, "
            "reversals, planning ms, authority saturation, the ORB-1 requirement LCB and g-duration compliance with its "
@@ -934,11 +1015,29 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
     if any(k in orb for k in ("Q3a", "Q3b")):
         out["Q3"] = {k: orb[k] for k in ("Q3a", "Q3b") if k in orb}
 
+    # ---- T13 DS1 (density shear) ----
+    ds = ds1_analysis(cfg, L, main)
+    t13 = pd.DataFrame(ds["comp"], columns=["id", "a", "b", "n_pairs", "n_expected", "complete", "a_%", "b_%", "diff_pp",
+                                            "ci_lo_pp", "ci_hi_pp", "p_boot", "n_cases", "per_atmosphere_pp"])
+    t13b = pd.DataFrame(ds["drop"], columns=["arm", "DS1_success5_%", "DS1_n", "A256_success5_%", "A256_n", "change_pp",
+                                             "DS1_median_miss_km", "A256_median_miss_km"])
+    _table(L, caps, t13.round(5), "T13_ds1_density_shear",
+           "DS1 (v5_plan.md section 3.4, added 2026-11-15): A256's 64 entry cases under four density profiles that "
+           "change with altitude (two ±15% shears crossing over between 40 and 70 km, and two GRAM-like random "
+           "profiles, the second with L/D × 0.92). Paired differences v2single − X in success@5km: each case's "
+           "atmospheres averaged, cases resampled within training-seed strata (a seeded arm flies seed case mod 5). "
+           "D1 and D2 are their own Holm family; the rest are estimates.", data + " + configs/benchmark_v5/DS1.json")
+    _table(L, caps, t13b.round(5), "T13b_ds1_vs_a256",
+           "Each arm on DS1 against the same arm on A256's same 64 cases (constant errors): success@5km and median "
+           "miss, and the change in percentage points (descriptive; the error sets differ, so this is the cost of "
+           "altitude-varying density together with the different error mix, not a paired effect).", data)
+    out["T13"] = t13
+
     # ---- T05 criteria ----
-    t05 = criteria(cfg, main, t04, t06, t07, mech, orb, gates, seeds, rl_seeds)
+    t05 = criteria(cfg, main, t04, t06, t07, mech, orb, gates, seeds, rl_seeds, ds)
     _table(L, caps, t05, "T05_criteria", "Pre-registered criteria (v5_plan.md section 8): measured value, interval, "
            "bootstrap p, Holm-adjusted p within each family (RQ1: G1, G2, G4, G5; RQ2: the four J-each; RQ3: the Tier 1 "
-           "R-each; RQ4: Q3a, Q3b), seeds holding, met (blank = not decided), valid (G4 needs G3). status: met / not met "
+           "R-each; RQ4: Q3a, Q3b; DS1: D1, D2), seeds holding, met (blank = not decided), valid (G4 needs G3). status: met / not met "
            "(decided on complete data), pending (flights still missing: n_pairs of n_expected; the measured text is "
            "PROVISIONAL), estimate (no pass/fail), not run. ci_*_clustered: the interval with each entry case "
            "resampled together with its four atmospheres; clustered_excludes_0 tells whether the verdict survives it.",

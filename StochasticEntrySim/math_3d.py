@@ -1629,6 +1629,36 @@ def aero_coefficients_from_speed_altitude(V_mps: float, altitude_m: float, param
     }
 
 
+def density_profile_factor(profile: Dict[str, Any], altitude_m: float) -> float:
+    """
+    Density multiplier at one altitude from a piecewise-linear profile.
+
+    input
+    profile dict with "alt_m" (increasing altitudes, m) and "factor" (multipliers, same length);
+    altitudes outside the table use the end values
+    altitude_m geometric altitude in meters
+
+    output
+    the multiplier (float)
+    """
+    alts = profile["alt_m"]
+    facs = profile["factor"]
+    h = float(altitude_m)
+    if h <= alts[0]:
+        return float(facs[0])
+    if h >= alts[-1]:
+        return float(facs[-1])
+    lo, hi = 0, len(alts) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if alts[mid] <= h:
+            lo = mid
+        else:
+            hi = mid
+    w = (h - alts[lo]) / (alts[hi] - alts[lo])
+    return float(facs[lo] + w * (facs[hi] - facs[lo]))
+
+
 def nominal_aero_forces_from_state(
     x: List[float],
     sigma_rad: float,
@@ -1663,6 +1693,11 @@ def nominal_aero_forces_from_state(
         ap=params.get("ap", 7.0),
     )
     rho = atm["rho_kgm3"] if atm["rho_kgm3"] is not None else 0.0
+    # Optional altitude-dependent density multiplier (v5 density-shear suite DS1). Absent by default, so every
+    # flight without it is bit-for-bit what it was before the hook existed.
+    profile = params.get("density_profile")
+    if profile is not None:
+        rho = rho * density_profile_factor(profile, altitude_m)
     q_pa = 0.5 * rho * V_mps * V_mps
 
     surface_area = _get_param(params, "ref_area_m2", "S")

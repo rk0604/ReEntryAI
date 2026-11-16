@@ -1,0 +1,90 @@
+[
+ {
+  "gamma0": -1.0,
+  "amax": null,
+  "cap": 180.0,
+  "outcome": "drogue",
+  "miss_km": 16.446663296124946,
+  "peak_g": 2.4395649300291535,
+  "t_s": 800.0,
+  "max_bank": 11.901607291966771,
+  "s_over_90": 0
+ },
+ {
+  "gamma0": -1.1,
+  "amax": null,
+  "cap": 180.0,
+  "outcome": "drogue",
+  "miss_km": 78.66322552898282,
+  "peak_g": 2.425635744408381,
+  "t_s": 791.5,
+  "max_bank": 0.0,
+  "s_over_90": 0
+ },
+ {
+  "gamma0": -1.2,
+  "amax": null,
+  "cap": 180.0,
+  "outcome": "drogue",
+  "miss_km": 188.05866475842615,
+  "peak_g": 2.4366860155032275,
+  "t_s": 776.5,
+  "max_bank": 0.0,
+  "s_over_90": 0
+ },
+ {
+  "gamma0": -1.3,
+  "amax": null,
+  "cap": 180.0,
+  "outcome": "drogue",
+  "miss_km": 291.5908171478859,
+  "peak_g": 2.447907467667412,
+  "t_s": 762.5,
+  "max_bank": 0.0,
+  "s_over_90": 0
+ },
+ {
+  "gamma0": -1.4,
+  "amax": null,
+  "cap": 180.0,
+  "outcome": "drogue",
+  "miss_km": 389.66308725521594,
+  "peak_g": 2.459635899476643,
+  "t_s": 749.0,
+  "max_bank": 0.0,
+  "s_over_90": 0
+ },
+ {
+  "gamma0": -1.5,
+  "amax": null,
+  "cap": 180.0,
+  "outcome": "drogue",
+  "miss_km": 482.6379852764002,
+  "peak_g": 2.4727345590171885,
+  "t_s": 736.25,
+  "max_bank": 0.0,
+  "s_over_90": 0
+ },
+ {
+  "gamma0": -1.7,
+  "amax": null,
+  "cap": 180.0,
+  "outcome": "drogue",
+  "miss_km": 654.6707759732893,
+  "peak_g": 2.547460174229812,
+  "t_s": 712.75,
+  "max_bank": 0.0,
+  "s_over_90": 0
+ },
+ {
+  "gamma0": -2.0,
+  "amax": null,
+  "cap": 180.0,
+  "outcome": "drogue",
+  "miss_km": 882.508113375645,
+  "peak_g": 2.8583393568019906,
+  "t_s": 681.25,
+  "max_bank": 0.0,
+  "s_over_90": 0
+ }
+]
