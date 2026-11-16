@@ -1,4 +1,12 @@
-# v5 RL training on Kaggle (ground truth for the build; DRAFT 2026-11-16, not implemented)
+# v5 RL training on Kaggle (ground truth; built 2026-11-16)
+
+Built as: `jepa/kaggle_v5.py` (export, inputs, platform, restore, pack, import), `study_v5.SessionLimit` (no run
+starts that cannot finish before the session ends), `rl_v5.check_hardware` (a run never resumes on other hardware),
+`jepa/build_notebook_v5_kaggle.py` → `ReEntryAI_JEPA_v5_kaggle_rl.ipynb`, the Colab notebook's `RL_ON_KAGGLE`
+(section 11 exports the inputs and imports the results), smoke check 16. Where the build differs from the draft
+below, the build is right and the draft has been corrected: the state travels as **one tar + manifest per
+session** (Kaggle keeps only a limited number of files per output), and the inputs are **one JSON file**
+(`v5_rl_inputs.json`, written by the Colab notebook into `00_study/kaggle/to_kaggle/`).
 
 Decision (the user, 2026-11-16): **every v5 RL run, tuning included, trains on Kaggle's free GPU**, so all RL
 arms share one hardware and one wall-clock budget. Everything else stays where `v5_plan.md` puts it. This file
@@ -49,23 +57,33 @@ analysis, report).
 
 ## 4. Persistence and resume on Kaggle
 
-* Root: `/kaggle/working/ReEntryAI_jepa_v5/`, **the same layout as the Drive folder** (`00_study/`,
-  `02_policies/<arm>/seed_<k>/`, `03_tuning/rl_<arm>/...`, `04_flights/` for the DEV48 tuning flights), so
-  every file maps 1:1 to Drive. Written through `LayoutV5` (guarded, atomic, fsync'd) as on Colab.
-* Each version starts by copying the **previous version's output** (attached as an input) into
-  `/kaggle/working`, then `repair`, then continues: finished runs (`policy.pt`) are skipped, a run in
-  progress resumes from `train_state.pt` (saved every 5 min, `RLCfg.save_every_s = 300`). Loss per
-  interruption: ≤ 5 min of training; a version that hits the 12 h limit loses ≤ 5 min.
-* A version stops itself before Kaggle's 12 h limit: it starts no new run when < 3.3 h remain (a run's cap is
-  3 h) and saves; the next version continues.
-* `train_state.pt` and `run.json` record the GPU name. **Resume refuses another GPU type** (raises with the
-  two names).
+* The session's study folder is `/tmp/ReEntryAI_jepa_v5/` (the repo is cloned to `/tmp/ReEntryAI_v5`), **the
+  same layout as the Drive folder** (`00_study/`, `02_policies/<arm>/seed_<k>/`, `03_tuning/rl_<arm>/...`,
+  `04_flights/` for the DEV48 tuning flights), written through `LayoutV5` as on Colab. The output
+  (`/kaggle/working`) holds only `v5_rl_state.tar` (the whole folder) and `v5_rl_manifest.json` (session number,
+  the tar's sha256, every file's size and sha256, the finished runs), rewritten after every run, at setup,
+  and by a `post_run_cell` hook when a cell fails.
+* Each version starts by unpacking the **newest attached earlier output** (highest session number among
+  `/kaggle/input`), checked against its manifest, then `repair`, then continues: finished runs (`policy.pt`)
+  are skipped, a run in progress resumes from `train_state.pt` (saved every 5 min, `RLCfg.save_every_s =
+  300`). Loss per interruption: ≤ 5 min of training.
+* A version stops itself before Kaggle's 12 h limit (`SESSION_HOURS = 11.5`): `SessionLimit` starts a run
+  only if 1.1 × its wall-clock cap + the work after it (DEV48 flights, fast eval) + 15 min fit; the next
+  version continues.
+* Each run writes `hardware.json` (GPU, CPU, torch, CUDA, platform) at its first start and into `run.json`;
+  **a resume on another GPU type, torch, CUDA or platform raises.** The study-level
+  `00_study/rl_platform.json` is written by session 1; **every later session must match it** or the setup
+  cell raises, so no RL run of the study trains elsewhere. The full-mode setup also refuses any GPU that is
+  not a T4.
 
 ## 5. Inputs (Kaggle dataset `reentryai-v5-rl-inputs`, uploaded once by the user from Drive)
 
+One file, `v5_rl_inputs.json`, written by the Colab notebook's section 11 once FNPEG is tuned
+(`kaggle_v5.export_inputs`), holding the text and sha256 of:
+
 * `00_study/study_config.json`: the frozen v5 settings. The Kaggle notebook freezes against it
   (`freeze_config_v5` must find equal settings; it raises otherwise).
-* `03_tuning/fnpeg/chosen.json` (FNPEG expert and clone source; `tuned(L, "fnpeg")`).
+* `03_tuning/fnpeg/chosen.json` (FNPEG expert and clone source; `tuned(L, "fnpeg")`) and `vf.json`.
 * Nothing else: the benchmark suites and code come from the `space-jepa5` clone; `verify()` runs as on Colab.
   RL Tier 1 does not read the 6,000-episode data (Tier 2's `ppo_matched` does not either: it draws episodes
   from the fast env).
@@ -74,15 +92,17 @@ analysis, report).
 
 ## 6. Getting results back to Drive
 
-* Kaggle side writes `manifest.json` in its output: every file under `02_policies/` and `03_tuning/rl_*`
-  (and the DEV48 tuning flights) with size and sha256, the GPU name, the commit, the Kaggle version number.
-* Colab side, new cell **"Import RL from Kaggle"** (CPU, cheap): reads the output either by the Kaggle API
-  (`kaggle kernels output <user>/<kernel>`, token in a Colab secret; the user's own account, nothing sent
-  elsewhere) or from a zip the user downloaded and put in Drive (`MyDrive/ReEntryAI_v5_kaggle/`).
-  It checks every sha256, refuses to overwrite a different file already on Drive, copies with `LayoutV5`
-  writes, and logs what it imported. Re-running it is a no-op.
-* Only finished artifacts are imported (a run is imported when its `policy.pt` exists; partial `train_state`
-  stays on Kaggle).
+* The user downloads the newest version's `v5_rl_state.tar` and `v5_rl_manifest.json` (Output tab) into
+  `MyDrive/ReEntryAI_jepa_v5/00_study/kaggle/from_kaggle/` and runs the Colab notebook's section 11
+  (`kaggle_v5.import_rl`, any runtime). The tar is cumulative, so the newest session is enough.
+* Import checks the tar's and every file's sha256, that `rl_platform.json` matches any platform already
+  imported and that every finished run's `hardware.json` matches it; then, if any target file on Drive
+  differs, it raises **before writing anything**; otherwise it writes the new files with `LayoutV5`.
+  Importing the same session again writes nothing.
+* Imported: finished runs only (`02_policies/<arm>/seed_<k>/` and `03_tuning/rl_<arm>/config_<j>/` whose
+  `policy.pt` exists, without `train_state*`), `03_tuning/rl_<arm>/` result files, the DEV48 tuning flights
+  (`04_flights/{results,telemetry}/DEV48/tune_<rl arm>_c*`), `00_study/rl_platform.json`, and the Kaggle logs
+  (into `00_study/kaggle/logs/`, the newest session's copy replacing the older).
 
 ## 7. Changes to the code (when built)
 
@@ -103,10 +123,15 @@ analysis, report).
 
 ## 8. Open points
 
-* Is the study already frozen on Drive (did setup complete after commit f4503a7)? If yes and nothing was
-  flown, the frozen settings are unchanged by this design (`RL_ON_KAGGLE` is a notebook setting, not a study
-  setting), so no new folder is needed. If anything platform-related is added to the frozen settings, it
-  must be decided before the first freeze.
+* The study was frozen on Drive on 2026-11-16 (the user started the Colab CPU pass at f4503a7). Nothing in
+  this design is a study setting (`RL_ON_KAGGLE`, the platform files and the session limit live outside
+  `study_config.json`), so that folder continues as is. The Colab CPU pass at f4503a7 never trains RL
+  (RL needs a GPU runtime there), so no RL work exists outside Kaggle.
+* **The Colab L4 pass must run the code with `RL_ON_KAGGLE`** (it pulls the newest `space-jepa5` on a fresh
+  runtime). An L4 session started on f4503a7's code would tune and train RL on Colab.
+* Kaggle details to confirm on first use: whether a failed "Save & Run All" version keeps `/kaggle/working`
+  (the hook saves before it ends either way), and how an attached notebook output is updated to its newest
+  version (the setup cell prints which session it restored).
 * Calendar: ≤ ≈ 55 T4-hours of capped RL work ≈ 2 weeks of quota; T4 vs L4 speed is unmeasured.
 * E3 training and MPPI flights still need Colab L4 units; measure their rate in the first L4 pass before
   deciding anything else.

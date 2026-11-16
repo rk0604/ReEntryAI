@@ -27,6 +27,8 @@ default <tempdir>/jepa_v4_smoke/: wide_smoke/, v3_smoke/, v4_smoke/; v4_smoke ma
   14 simulated disconnects (JEPA_V5_FAIL_AT) in the notebook's long stages, then an unchanged rerun: completes,
      finished flights keep their modification times, outputs equal the uninterrupted run's
   15 outputs: every table and figure (PNG and PDF), curves, captions, logs, status files and the report exist
+  16 RL on Kaggle: inputs exported, two notebook sessions (restore, resume), one platform enforced, import into
+     Drive (finished runs only, checked, nothing overwritten)
 
     python jepa/smoke_v5.py [--work <dir>] [--workers N] [--only 1,2,...]
 """
@@ -44,7 +46,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 SIM_DIR = Path(__file__).resolve().parents[1]
 if str(SIM_DIR) not in sys.path:
@@ -1182,6 +1184,139 @@ def throughput(root: Path) -> pd.DataFrame:
     return g.round(2)
 
 
+# ============================================================================
+# 16. RL on Kaggle (jepa/kaggle_rl.md)
+# ============================================================================
+def run_kaggle_nb(base: Path, live: Path, out: Path, inputs: Sequence[Path], tag: str,
+                  max_runs: Optional[int] = None) -> tuple:
+    nbdir = base / "nb"
+    nbdir.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "JEPA_V5_MODE": "smoke", "JEPA_V5_KAGGLE_LIVE": str(live), "JEPA_V5_KAGGLE_OUT": str(out),
+           "JEPA_V5_KAGGLE_INPUTS": os.pathsep.join(map(str, inputs)), "PYTHONIOENCODING": "utf-8"}
+    env.pop("JEPA_V5_KAGGLE_MAX_RUNS", None)
+    if max_runs is not None:
+        env["JEPA_V5_KAGGLE_MAX_RUNS"] = str(max_runs)
+    t0 = time.time()
+    r = subprocess.run([sys.executable, "-m", "nbconvert", "--to", "notebook", "--execute",
+                        "--ExecutePreprocessor.timeout=-1", "--ExecutePreprocessor.startup_timeout=180",
+                        "--output-dir", str(nbdir), "--output", f"{tag}.ipynb", "ReEntryAI_JEPA_v5_kaggle_rl.ipynb"],
+                       env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return r, time.time() - t0, _nb_text(nbdir / f"{tag}.ipynb")
+
+
+def t16_kaggle(work: Path) -> None:
+    section("16. RL on Kaggle: inputs out, two sessions (restore, resume), one platform, import into Drive")
+    from jepa import kaggle_v5 as K
+    from jepa import rl_v5 as RL
+    from jepa import study_v5 as S5
+    subprocess.run([sys.executable, "jepa/build_notebook_v5_kaggle.py"], check=True, capture_output=True)
+    nb = (SIM_DIR / "ReEntryAI_JEPA_v5.ipynb").read_text(encoding="utf-8")
+    check("Colab notebook: RL_ON_KAGGLE in full mode; RL tuning and training then only export and import",
+          'RL_ON_KAGGLE = MODE == \\"full\\"' in nb and "K.export_inputs(L, log)" in nb and "K.import_rl(L, K_FROM, log)"
+          in nb and "if RL_ON_KAGGLE:" in nb)
+    src = work / "v5_smoke"
+    if not (src / "03_tuning" / "fnpeg" / "chosen.json").exists():
+        check("Kaggle check needs check 10's smoke study (FNPEG tuned)", False, f"({src})")
+        return
+    base = work / "kaggle_smoke"
+    shutil.rmtree(base, ignore_errors=True)
+    drive = base / "drive"                                    # a Drive study folder holding only what Colab has
+    Ld = S5.LayoutV5(drive).make()
+    for rel in K.INPUT_FILES:
+        if (src / rel).exists():
+            Ld.atomic_bytes(drive / rel, (src / rel).read_bytes())
+    inp = K.export_inputs(Ld)
+    ds = base / "input1" / "reentryai-v5-rl-inputs"
+    ds.mkdir(parents=True)
+    shutil.copy2(inp, ds / K.INPUTS)
+    cfg = S5.StudyConfigV5.smoke()
+    n_tune = sum(int(cfg.rl_tune_n.get(a, 1)) for a in S5.RL_TIER1)
+    n_runs = n_tune + len(S5.RL_TIER1) * len(cfg.rl_seeds)
+
+    out1 = base / "out1"
+    r1, t1, txt1 = run_kaggle_nb(base, base / "live1", out1, [base / "input1"], "k1", max_runs=2)
+    m1 = json.loads((out1 / K.MANIFEST).read_text()) if (out1 / K.MANIFEST).exists() else {}
+    if r1.returncode != 0:
+        print(r1.stdout[-2000:], r1.stderr[-6000:])
+    check("Kaggle session 1 ends without error, stops after its 2 runs and saves its state",
+          r1.returncode == 0 and m1.get("seq") == 1 and len(m1.get("runs_done", [])) == 2 and "not started" in txt1,
+          f"({t1:.0f}s; runs done {m1.get('runs_done')})")
+
+    in2 = base / "input2"                                     # session 2: a new machine, session 1's output attached
+    shutil.copytree(base / "input1", in2)
+    shutil.copytree(out1, in2 / "kaggle-rl-session-1")
+    out2 = base / "out2"
+    r2, t2, txt2 = run_kaggle_nb(base, base / "live2", out2, [in2], "k2")
+    m2 = json.loads((out2 / K.MANIFEST).read_text()) if (out2 / K.MANIFEST).exists() else {}
+    if r2.returncode != 0:
+        print(r2.stdout[-2000:], r2.stderr[-6000:])
+    check("Kaggle session 2 restores session 1, finishes every RL tuning and training run, prints RL COMPLETE",
+          r2.returncode == 0 and m2.get("seq") == 2 and "restored session 1" in txt2 and "RL COMPLETE" in txt2
+          and len(m2.get("runs_done", [])) == n_runs, f"({t2:.0f}s; {len(m2.get('runs_done', []))}/{n_runs} runs)")
+
+    L2 = S5.LayoutV5(base / "live2")
+    hw = json.loads((base / "live2" / K.PLATFORM).read_text())
+    refused = []
+    try:
+        K.check_platform(L2, {**hw, "gpu": "Tesla P100-PCIE-16GB"})
+    except RuntimeError:
+        refused.append("session")
+    run_d = base / "live1" / "03_tuning" / "rl_dagger_fnpeg" / "config_00"
+    if (run_d / "hardware.json").exists():
+        h = json.loads((run_d / "hardware.json").read_text())
+        (run_d / "hardware.json").write_text(json.dumps({**h, "gpu": "Tesla P100-PCIE-16GB"}))
+        (run_d / "policy.pt").unlink(missing_ok=True)
+        try:
+            RL.check_hardware(S5.LayoutV5(base / "live1"), run_d, "cpu")
+        except RuntimeError:
+            refused.append("run")
+    check("a session or a run on another GPU type is refused", refused == ["session", "run"], f"({refused})")
+
+    fk = drive / "00_study" / "kaggle" / "from_kaggle"
+    fk.mkdir(parents=True)
+    for f in (K.STATE_TAR, K.MANIFEST):
+        shutil.copy2(out2 / f, fk / f)
+    ok_imp, detail = False, ""
+    try:
+        res = K.import_rl(Ld, fk, log=lambda *a: None)
+        pols = all((Ld.policy_dir(a, s) / "policy.pt").exists() for a in S5.RL_TIER1 for s in cfg.rl_seeds)
+        chosen = all((Ld.tuning / f"rl_{a}" / "chosen.json").exists() for a in S5.RL_TIER1)
+        no_state = not any(p.name.startswith("train_state") for p in drive.rglob("*"))
+        tune_fl = any((drive / "04_flights" / "results" / "DEV48").glob("tune_*"))
+        res2 = K.import_rl(Ld, fk, log=lambda *a: None)
+        ok_imp = pols and chosen and no_state and tune_fl and (drive / K.PLATFORM).exists() and res2["files_new"] == 0
+        detail = f"({res}; again: {res2['files_new']} new)"
+    except Exception as e:                                    # noqa: BLE001
+        detail = f"({type(e).__name__}: {e})"
+    check("import: every finished policy and RL tuning result on Drive, no train state, the platform recorded; "
+          "importing again writes nothing", ok_imp, detail)
+
+    p = Ld.policy_dir(S5.RL_TIER1[0], cfg.rl_seeds[0]) / "run.json"
+    keep = p.read_bytes()
+    p.write_bytes(keep + b" ")
+    n_before = sum(1 for _ in drive.rglob("*"))
+    shutil.rmtree(Ld.policy_dir(S5.RL_TIER1[1], cfg.rl_seeds[0]))
+    conflict = False
+    try:
+        K.import_rl(Ld, fk, log=lambda *a: None)
+    except ValueError:
+        conflict = True
+    untouched = not Ld.policy_dir(S5.RL_TIER1[1], cfg.rl_seeds[0]).exists()
+    p.write_bytes(keep)
+    bad_tar = fk / K.STATE_TAR
+    b = bytearray(bad_tar.read_bytes())
+    b[len(b) // 2] ^= 0xFF
+    bad_tar.write_bytes(bytes(b))
+    corrupt = False
+    try:
+        K.import_rl(Ld, fk, log=lambda *a: None)
+    except ValueError:
+        corrupt = True
+    check("import refuses a file that differs from Drive's (writing nothing) and a corrupted download",
+          conflict and untouched and corrupt, f"(conflict {conflict}, nothing written {untouched}, corrupt {corrupt}; "
+                                              f"{n_before} files)")
+
+
 def main(work: Path, workers: int, only=None, keep: bool = False) -> None:
     t_all = time.time()
     torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
@@ -1229,6 +1364,8 @@ def main(work: Path, workers: int, only=None, keep: bool = False) -> None:
         tp = throughput(root)
         if len(tp):
             print("\nmeasured smoke throughput per arm type (CPU):\n" + tp.to_string(index=False))
+    if run(16):
+        t16_kaggle(work)
     shutil.rmtree(tmp, ignore_errors=True)
     n_ok = sum(ok for _, ok, _ in RESULTS)
     print(f"\nnotes: {json.dumps(NOTES, default=str)}")

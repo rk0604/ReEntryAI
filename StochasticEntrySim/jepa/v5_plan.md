@@ -1174,6 +1174,19 @@ saturated.
 * **2026-11-15, five RL seeds (§4.4, §6, §8.3).** RQ3 compared v2 (5 seeds) with RL arms of 3 seeds and
   required 3 of 3. Every Tier 1 RL arm now trains seeds 0–4 and R-each needs ≥ 4 of 5 seeds, the rule of
   G1 and J-each. Cost: 6 more RL runs and 1,536 more policy flights (Tier 1 ≈ 26,600 flights, §4.9).
+* **2026-11-16, every RL run trains on Kaggle (user decision; `jepa/kaggle_rl.md` is the detail).** Colab
+  units ran short, and RL tuning and training were the largest GPU item. All of it (12 tuning configurations
+  per method and seeds 0–4 of `dagger_fnpeg`, `bcppo_fnpeg`, `ppo_hist`) now trains in
+  `ReEntryAI_JEPA_v5_kaggle_rl.ipynb` on Kaggle's free T4, **one platform and one GPU type for every RL run**,
+  because each run's budget is wall-clock capped (3 h) and the hardware therefore shapes the result. Enforced in
+  code: the study's `00_study/rl_platform.json` (GPU, torch, CUDA, platform) is fixed by the first Kaggle session
+  and every later session must match it; a run never resumes on other hardware (`rl_v5.check_hardware`); full
+  mode refuses any GPU but a T4; Colab's `RL_ON_KAGGLE` (full mode) never tunes or trains RL and instead exports
+  the inputs (`v5_rl_inputs.json`) and imports finished runs, checked by sha256 and refusing any overwrite. No
+  study setting changed, so the study folder frozen on 2026-11-16 continues. RL policy flights stay on Colab's
+  CPU runtime like every other CPU-pool flight. Limitation (§16): RL trained on a Kaggle T4 with a 3 h cap per
+  run; the learned models trained on Colab GPUs; each RL run's decisions reached are reported (T07). Smoke
+  check 16.
 * **2026-11-16, GPU passes skip CPU work (user request; notebook plumbing only, no flight, setting or
   result changes).** `run_jobs(..., can_cpu=False)` leaves the CPU-pool flights (guidance laws, classical,
   RL policies) for a CPU runtime and counts them; the notebook passes `can_cpu = not (GPU_PASS_SKIPS_CPU and
@@ -1231,6 +1244,12 @@ their best case there. Since 2026-11-15, DS1 (§3.4) adds density errors that ch
 in their own Holm family so that RQ1–RQ4 are unchanged, and AS1 (§3.4b) one Mach-dependent aerodynamic
 error (the published Orion lift and drag). v5 still does not test winds, navigation errors or sensor
 noise, and its results do not carry over to them.
+
+**RL trained on other hardware than the learned models** (added 2026-11-16, §15; `jepa/kaggle_rl.md`). Every
+RL run trained on one Kaggle T4 in one pinned environment, each capped at 3 h of wall time (or its decision
+budget); the world models and E3 models trained on Colab GPUs. The RL arms are comparable with each other; the
+cap is hardware-dependent, so each run's decisions reached are reported (T07), and a faster GPU could have given
+the RL arms more training within the same cap.
 
 **One simulator, no flight data** (added 2026-11-15; `jepa/simulator_fidelity_audit.md`; AS1, §3.4b,
 tests the lift excess named here, with values read off published figures). Every

@@ -1476,7 +1476,43 @@ def rl_cfg(cfg: StudyConfigV5, L: LayoutV5, arm: str, extra: Optional[dict] = No
     return RL.RLCfg(**kw)
 
 
-def tune_rl(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, workers: int, log=print) -> dict:
+@dataclass
+class SessionLimit:
+    """A session that must stop on time (Kaggle, jepa/kaggle_rl.md section 4): an RL run starts only if its wall-clock
+    cap, 10 % and the work after it (extra_s) fit before the deadline; after_run (e.g. packing the state into the
+    session's output) is called after each run. max_runs is a test hook (runs started in this session)."""
+    deadline: Optional[float] = None
+    max_runs: Optional[int] = None
+    margin_s: float = 900.0
+    after_run: Optional[Callable[[], None]] = None
+    started: int = 0
+    stopped: bool = False
+
+    def may_start(self, budget_h: float, log=print, label: str = "", extra_s: float = 0.0) -> bool:
+        if self.stopped:
+            return False
+        why = None
+        if self.max_runs is not None and self.started >= self.max_runs:
+            why = f"{self.max_runs} run(s) started this session (limit)"
+        elif self.deadline is not None:
+            need = budget_h * 3600 * 1.1 + extra_s + self.margin_s
+            left = self.deadline - time.time()
+            if need > left:
+                why = f"{need / 3600:.2f} h needed, {left / 3600:.2f} h left in this session"
+        if why:
+            self.stopped = True
+            log(f"[session] {label} not started: {why}. Save and start the next session; it continues here.")
+            return False
+        self.started += 1
+        return True
+
+    def done(self) -> None:
+        if self.after_run is not None:
+            self.after_run()
+
+
+def tune_rl(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, workers: int, log=print,
+            limit: Optional[SessionLimit] = None) -> dict:
     """RL configurations (seed 0, cfg.rl_tune_frac of the budget) scored on DEV48 in the full simulator."""
     from jepa import rl_v5 as RL
     if not is_tuned(L, "fnpeg"):
@@ -1484,6 +1520,7 @@ def tune_rl(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, w
         return {}
     fn = tuned(L, "fnpeg", cfg)
     out = {}
+    n_dev = len(conditions(cfg, "DEV48"))
     for arm in arms:
         if arm not in RL_SPACES:
             continue
@@ -1503,6 +1540,10 @@ def tune_rl(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, w
             kw = {**base, **c, **red, "seed": 0}
             kw["hidden"] = tuple(kw["hidden"])
             d = L.tuning / m / f"config_{j:02d}"
+            if limit is not None and not limit.may_start(0.0 if (d / "policy.pt").exists() else red["budget_hours"],
+                                                         log, f"tune {arm} config {j}",
+                                                         extra_s=n_dev * 90.0 / max(1, int(workers))):
+                return out
             RL.train_rl_dir(L, d, arm, RL.RLCfg(**kw), device, fn, log, label=f"tune {arm} config {j}")
             js = [policy_job(cd, f"tune_{arm}_c{j:02d}", "tuning", str(d / "policy.pt"), 0)
                   for cd in conditions(cfg, "DEV48")]
@@ -1512,6 +1553,8 @@ def tune_rl(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, w
                 L.write_json(L.tuning / m / f"config_{j:02d}.json", {"method": m, "config_index": j,
                                                                     "config": {**c}, "sampled": c,
                                                                     "budget": red, "score": _score_dev(rs)})
+            if limit is not None:
+                limit.done()
         out[arm] = _choose_method(cfg, L, m, n, log)
     return out
 
@@ -1551,7 +1594,8 @@ def train_e3_stage(cfg: StudyConfigV5, L: LayoutV5, data_fn: Callable[[], dict],
     return out
 
 
-def train_rl_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device, log=print) -> List[dict]:
+def train_rl_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device, log=print,
+                   limit: Optional[SessionLimit] = None) -> List[dict]:
     """Every RL arm and seed (seed-major within the arm), then its fast-env evaluation (fast-vs-full gap)."""
     from jepa import rl_v5 as RL
     fn = tuned(L, "fnpeg", cfg)
@@ -1562,7 +1606,13 @@ def train_rl_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device,
             log(f"[E4] {arm} waits for tuning (03_tuning/)")
             continue
         for s in cfg.rl_seeds:
-            info = RL.train_rl_arm(L, arm, s, rl_cfg(cfg, L, arm), device, fn, log)
+            rc = rl_cfg(cfg, L, arm)
+            fresh = not (L.policy_dir(arm, s) / "fast_eval.json").exists()
+            if limit is not None and fresh and not limit.may_start(
+                    0.0 if (L.policy_dir(arm, s) / "policy.pt").exists() else rc.budget_hours, log,
+                    f"{arm} seed {s}", extra_s=600.0):
+                return out
+            info = RL.train_rl_arm(L, arm, s, rc, device, fn, log)
             d = L.policy_dir(arm, s)
             fe = d / "fast_eval.json"
             if (d / "policy.pt").exists() and not fe.exists():
@@ -1572,6 +1622,8 @@ def train_rl_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device,
                                   "A256": RL.fast_success_on(pol, conditions(cfg, "A256"), device),
                                   "A256_cases": [[int(c["case"]), c["atmosphere"]] for c in conditions(cfg, "A256")]})
             out.append(info)
+            if limit is not None and fresh:
+                limit.done()
     return out
 
 

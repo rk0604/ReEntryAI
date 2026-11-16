@@ -799,6 +799,42 @@ def bcppo_train(L, d: Path, cfg: RLCfg, device, label: str, fnpeg_cfg: Optional[
 
 
 # ============================================================================
+# Hardware of an RL run (jepa/kaggle_rl.md: every RL run on one platform and one GPU type)
+# ============================================================================
+def hardware_info(device) -> dict:
+    """What an RL run trains on: GPU name, CPU model and count, torch and CUDA versions, platform tag."""
+    cpu = ""
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as f:
+            cpu = next((ln.split(":", 1)[1].strip() for ln in f if ln.startswith("model name")), "")
+    except OSError:
+        import platform
+        cpu = platform.processor()
+    gpu = torch.cuda.get_device_name(0) if str(device).startswith("cuda") and torch.cuda.is_available() else "cpu"
+    return {"gpu": gpu, "cpu": cpu, "cpu_count": os.cpu_count(), "torch": torch.__version__,
+            "cuda": torch.version.cuda, "platform": os.environ.get("JEPA_V5_RL_PLATFORM", "")}
+
+
+# the fields a run may not change between its start and a resume (the CPU model may: a cloud VM is not chosen)
+HW_SAME = ("gpu", "torch", "cuda", "platform")
+
+
+def check_hardware(L, d: Path, device) -> dict:
+    """hardware.json at a run's first start; a resume on other hardware (GPU type, torch, CUDA, platform) raises."""
+    hw = hardware_info(device)
+    p = Path(d) / "hardware.json"
+    if p.exists():
+        have = json.loads(p.read_text())
+        diff = {k: (have.get(k), hw.get(k)) for k in HW_SAME if have.get(k) != hw.get(k)}
+        if diff:
+            raise RuntimeError(f"RL run {d} started on other hardware and may not resume here (one platform for every "
+                               f"RL run, jepa/kaggle_rl.md): {diff}")
+        return have
+    L.write_json(p, hw)
+    return hw
+
+
+# ============================================================================
 # One RL arm, one seed
 # ============================================================================
 def train_rl_dir(L, d: Path, arm: str, cfg: RLCfg, device, fnpeg_cfg: Optional[dict] = None, log=print,
@@ -810,6 +846,7 @@ def train_rl_dir(L, d: Path, arm: str, cfg: RLCfg, device, fnpeg_cfg: Optional[d
         p = d / "run.json"
         return json.loads(p.read_text()) if p.exists() else {"arm": arm, "seed": cfg.seed}
     L.guard(d).mkdir(parents=True, exist_ok=True)
+    hw = check_hardware(L, d, device)
     label = label or f"{arm} seed {cfg.seed}"
     t0 = time.time()
     if arm == "dagger_fnpeg":
@@ -824,7 +861,8 @@ def train_rl_dir(L, d: Path, arm: str, cfg: RLCfg, device, fnpeg_cfg: Optional[d
         out = ppo_full_train(L, d, cfg, device, label, log=log)
     else:
         raise ValueError(f"unknown RL arm {arm!r}")
-    info = {"arm": arm, "seed": int(cfg.seed), **out, "wall_s": round(time.time() - t0, 1), "cfg": asdict(cfg)}
+    info = {"arm": arm, "seed": int(cfg.seed), **out, "wall_s": round(time.time() - t0, 1), "cfg": asdict(cfg),
+            "hardware": hw}
     L.write_json(d / "run.json", info)
     return info
 

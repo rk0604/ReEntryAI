@@ -95,6 +95,8 @@ CPU_WORKERS = None              # guidance-law, policy and classical flights, on
 GPU_WORKERS = None              # MPPI flights sharing the GPU (None = 6 GB each, 2 GB spare, at most 4)
 GPU_PASS_SKIPS_CPU = True       # on a GPU runtime, leave the CPU-pool test flights for a (cheaper) CPU runtime;
                                 # False flies everything on whatever runtime this is
+RL_ON_KAGGLE = MODE == "full"   # every RL run (tuning and training) trains on Kaggle, one platform for all of them
+                                # (jepa/kaggle_rl.md); this notebook only exports the inputs and imports the results
 """
 
 SETUP = r"""
@@ -242,7 +244,9 @@ if RUN["tuning"]:
     log = L.logger("tuning")
     TUNED = S5.tune_guidance(CFG, L, CPU_WORKERS, log)
     RL_ARMS = list(S5.RL_TIER1) + (list(S5.RL_TIER2) if CFG.tier >= 2 else [])
-    if CAN_GPU:
+    if RL_ON_KAGGLE:
+        log("RL tuning runs on Kaggle (ReEntryAI_JEPA_v5_kaggle_rl.ipynb); section 11 exports its inputs")
+    elif CAN_GPU:
         S5.tune_rl(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log)
     else:
         log("RL tuning waits for a GPU runtime")
@@ -287,7 +291,19 @@ E4_TRAIN = r"""
 RL_ARMS = list(S5.RL_TIER1) + (list(S5.RL_TIER2) if RUN["tier2_rl"] else [])
 if RUN["E4_train"]:
     log = L.logger("E4_train")
-    if CAN_GPU:
+    if RL_ON_KAGGLE:
+        from jepa import kaggle_v5 as K
+        K_IN = K.export_inputs(L, log)
+        if K_IN:
+            log(f"Kaggle input: {K_IN} (upload it once as a Kaggle dataset; jepa/kaggle_rl.md)")
+        K_FROM = K.kaggle_dir(L) / "from_kaggle"
+        if (K_FROM / K.STATE_TAR).exists():
+            K.import_rl(L, K_FROM, log)
+        else:
+            log(f"no Kaggle RL results yet: put the newest session's {K.STATE_TAR} and {K.MANIFEST} in {K_FROM}")
+        done = sum((L.policy_dir(a, s) / "policy.pt").exists() for a in RL_ARMS for s in CFG.rl_seeds)
+        log(f"RL policies on Drive: {done}/{len(RL_ARMS) * len(CFG.rl_seeds)}; their flights wait for the rest")
+    elif CAN_GPU:
         S5.train_rl_stage(CFG, L, RL_ARMS, DEVICE, log)
     else:
         log("RL training waits for a GPU runtime")
@@ -471,6 +487,14 @@ Each model × 5 seeds under v2's MPPI at 4.5 g on A256. A model not trained yet 
 environment (ppo_matched: the full simulator). Checkpoints every 5 minutes with optimizer, normalizer and RNG
 state; learning curves redrawn at each; `policy.pt` marks a run done; then each policy's fast-environment success
 (the fast side of the fast-vs-full gap).
+
+**In the full study every RL run trains on Kaggle** (`RL_ON_KAGGLE`, `jepa/kaggle_rl.md`): one platform and one
+GPU type for all RL tuning and training, so the RL arms stay comparable. This cell (any runtime, cheap) then
+(1) writes `00_study/kaggle/to_kaggle/v5_rl_inputs.json` once FNPEG is tuned: upload it once as a Kaggle dataset
+for `ReEntryAI_JEPA_v5_kaggle_rl.ipynb`; (2) imports the RL results: download the newest Kaggle session's
+`v5_rl_state.tar` and `v5_rl_manifest.json` (that notebook's Output tab) into `00_study/kaggle/from_kaggle/` on
+Drive and run this cell. Every file is checked against its sha256, only finished runs are imported, and a file
+that differs from one already on Drive stops the import before anything is written.
 """),
     ("code", E4_TRAIN),
     ("md", r"""
