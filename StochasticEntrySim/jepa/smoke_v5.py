@@ -224,6 +224,7 @@ def t1_suites(tmp: Path, workers: int) -> None:
     t1_as1(nom)
     t1_gpu_pass()
     t1_gpu_lock()
+    t1_v4_amendment()
 
 
 def t1_gpu_pass() -> None:
@@ -288,6 +289,46 @@ def t1_gpu_lock() -> None:
           all(refused) and none_yet and d1["gpu"] == d2["gpu"] == doc["gpu"] == "Tesla T4"
           and len(doc["sessions"]) == 2 and 'GPU_TYPE = \\"T4\\"' in nb and "S5.check_gpu_platform(" in nb
           and '"gpuType": "T4"' in nb, f"(refused {refused}, sessions {len(doc['sessions'])})")
+
+
+def t1_v4_amendment() -> None:
+    """The 2026-11-17 amendment (study_v5.AMENDMENTS): a study frozen with V4 at 11 of 12 continues at 10 of 12, the
+    change is recorded once in study_config.json, any other difference still raises, and a V4 that failed under the
+    old rule is re-scored from the same flights (Colab's misses) and passes, keeping the earlier verdict."""
+    import dataclasses
+    from jepa import study_v5 as S5
+    from jepa import fly_v5 as F5
+    colab = [0.7232258865537036, 2.027634080688927, 0.4138458729419711, 3.060855119540347, 3.9519253124951406,
+             2.940864529905687, 1.473606255943776, 3.069809268468227, 3.707779926118449, 1.2417665265284175,
+             2.884711933201825, 3.1022397006764924]
+    with tempfile.TemporaryDirectory() as td:
+        L = S5.LayoutV5(td).make()
+        old = dataclasses.replace(S5.StudyConfigV5(), v4_min_frac=11 / 12)
+        S5.freeze_config_v5(old, L)
+        cfg = S5.StudyConfigV5()
+        d1 = S5.freeze_config_v5(cfg, L)
+        d2 = S5.freeze_config_v5(cfg, L)
+        doc = json.loads((L.study / "study_config.json").read_text())
+        try:
+            S5.freeze_config_v5(dataclasses.replace(cfg, v4_miss_km=4.0), L)
+            other_raises = False
+        except ValueError:
+            other_raises = True
+        jobs = S5.gate_jobs(cfg, L)["V4"]
+        for j, m in zip(jobs, colab):
+            L.write_json(L.result_path(F5.flight_id_v5(j)), {"flight_id": F5.flight_id_v5(j), "case": j["case"],
+                         "outcome": "drogue", "miss_km": m, "predguid_phases": "initial_roll-ballistic-final"})
+        S5._gate_write(L, "V4", {"pass": False, "n": 12, "n_miss_lt_3p5km": 10})     # as written on Colab
+        g1 = S5._gate_v4(cfg, L, jobs)
+        g2 = S5._gate_v4(cfg, L, jobs)
+        g_old = S5._gate_v4(old, L, jobs)                    # the old rule on the same flights still fails
+    check("V4 amendment: a study frozen at 11 of 12 continues at 10 of 12 with the change recorded once, any other "
+          "change still raises; Colab's failed V4 is re-scored from the same flights and passes, keeping the old verdict",
+          d1["config"]["v4_min_frac"] == d2["config"]["v4_min_frac"] == 10 / 12
+          and len(doc.get("amendments", [])) == 1 and doc["amendments"][0]["key"] == "v4_min_frac" and other_raises
+          and g1["pass"] is True and g1["pass_before_amendment"] is False and g1["n_needed"] == 10
+          and g2 == g1 and g_old["pass"] is False,
+          f"(amendments {len(doc.get('amendments', []))}, rescored {g1['pass']}, n_ok {g1['n_miss_lt_3p5km']})")
 
 
 def t1_as1(nom: dict) -> None:

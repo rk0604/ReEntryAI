@@ -291,7 +291,7 @@ once per condition and are broadcast across seeds (as `analyze_v3.cube`).
 | V1 FNPEG verification | on the 12 DEV48 cases, nominal air, predictor = true parameters, no load limit (changed 2026-11-11, §15: was 16 A256 cases; a gate must not look at test cases) | miss < 2 km in ≥ 11 of 12 (was 15 of 16; Lu reports < 1 km in his own simulator; ours adds roll dynamics the predictor does not model), Newton iteration converges in ≤ 6 iterations per cycle in ≥ 99% of cycles |
 | V2 load relief | same 12 cases, amax = 3.0 g, cases whose unconstrained peak exceeds 3.5 g | realized peak ≤ amax + 0.15 g and miss < 2 km where feasible; as amax drops below feasibility the miss grows gradually (Lu Fig. 17), checked on 2 cases at 2.7/2.5/2.3 g **Changed 2026-11-14 (§15):** a flight also passes when the limit was infeasible for it: relief on before the load crossed amax, full lift-up commanded for the 20 s before the peak, and a lower peak than the unrelieved flight |
 | V3 filters | thin (×0.88) and dense (×1.12) air, the first 8 DEV48 cases each | the filter's drag ratio K_D is within 3% of the true scale by 150 s after the 0.05 g point |
-| V4 PredGuid verification | the 12 DEV48 cases, nominal air, nominal model | miss < 3.5 km in ≥ 11 of 12 (was 15 of 16; Bairstow's Monte Carlo bound); the phase sequence is logged and sensible (initial roll → final for these ranges) |
+| V4 PredGuid verification | the 12 DEV48 cases, nominal air, nominal model | miss < 3.5 km in ≥ 10 of 12 (amended 2026-11-17 from 11 of 12, §15, before any test flight; was 15 of 16; Bairstow's Monte Carlo bound); the phase sequence is logged and sensible (initial roll → final for these ranges) |
 | E0 runner | v5 runner vs `run_lockstep_v4` on CPU, v2 and physics adapters, 3 flights | bit-identical |
 
 v4's E0b (statistical re-fly of v3) already covers GPU nondeterminism; v5 cites v4's floor.
@@ -1088,7 +1088,8 @@ a sleep of the machine. Run it from a console that stays open.
 **Gates V1–V4 flown on the 12 DEV48 cases with the full study's settings (2026-11-14, this laptop, 55
 dev-suite flights in 10 min; E0 needs the real v3 checkpoints and runs on Colab).** V1 passes: 12 of 12
 within 2 km (largest miss 1.15 km), every Newton cycle within 6 iterations. V3 passes: K_D equals the true
-drag scale in all 16 flights. V4 passes at the threshold: 11 of 12 within 3.5 km (the twelfth 3.57 km).
+drag scale in all 16 flights. V4 passes at the threshold: 11 of 12 within 3.5 km (the twelfth 3.57 km). (On Colab, 2026-11-17, the same
+code scored 10 of 12: the amendment of §15, 2026-11-17.)
 V2, as first written, fails, and would have stopped the notebook:
 
 | DEV48 case | unrelieved peak (V1) | peak at amax = 3 g | miss at 3 g | relief on before the load crossed 3 g | full lift-up for the 20 s before the peak |
@@ -1239,6 +1240,23 @@ saturated.
   session on another GPU type raises (`study_v5.check_gpu_platform`), so every E3 model and MPPI arm shares one
   GPU type. torch/CUDA versions are logged per session, not locked (Colab updates them). No GPU work had run
   when this was made (only CPU passes), so the study folder frozen on 2026-11-16 continues. Smoke check 1.
+* **2026-11-17, gate V4 amended to 10 of 12 (user decision; before any test flight; `study_v5.AMENDMENTS`).**
+  On Colab V4 failed: 10 of 12 DEV48 PredGuid flights within 3.5 km (misses 0.41–3.95 km, all landed, phase
+  sequence initial roll → ballistic → final in all 12), where this laptop had 11 of 12 (2026-11-14 and again
+  2026-11-17). The cause is not a bug: PredGuid's lateral logic (App. B.61–B.67) reverses the bank on the first
+  2 s guidance cycle at which the crossrange crosses its deadband, so a late reversal can move by one cycle and
+  the landing by kilometres. Evidence: the same commit flown in a Linux container (Python 3.13, numpy 2.5)
+  reproduced Colab's 12 misses to the metre, Windows (numpy 2.3) gave the laptop's; the two flights of case 4
+  agree to float precision until `K2ROLL` flips sign at t ≈ 418 s on one and not the other; on Windows a
+  relative change of 1e-8 in the entry speed (0.08 mm/s) moved case 4 from 0.48 to 1.22 km and case 7 from 0.51
+  to 3.54 km, 1e-7 case 4 to 3.27 km, while 1e-12 changed nothing. pymsis 0.12 and 0.13 give identical densities;
+  flying other gate flights first in the same process changes nothing. So "11 of 12 within 3.5 km" decides
+  PredGuid by rounding. The alternative, dropping PredGuid (the law Orion flies) from G2, Q3, D2, A2 and G7, was
+  rejected by the user. Changed: `v4_min_frac` 11/12 → 10/12; a study folder frozen at 11/12 continues and
+  records the amendment in `00_study/study_config.json` (`amendments`, with this reason), any other difference
+  still raises; a V4 verdict cached under the old rule is re-scored from the same flights (V4.json keeps
+  `pass_before_amendment`). No flight is flown again. Consequences stated in §16 (PredGuid's per-case misses are
+  rounding-sensitive; its DEV48 tuning choice is partly chance). Smoke check 1.
 
 ---
 
@@ -1260,6 +1278,13 @@ budget); the world models and E3 models trained on Colab GPUs (v5's own GPU work
 flights included, on one GPU type, a T4: `00_study/gpu_platform.json`, §15 2026-11-17). The RL arms are comparable with each other; the
 cap is hardware-dependent, so each run's decisions reached are reported (T07), and a faster GPU could have given
 the RL arms more training within the same cap.
+
+**PredGuid's misses depend on rounding** (added 2026-11-17, §15). PredGuid's bank reversals fire on the
+first guidance cycle the crossrange crosses a deadband, so near the end of a flight a microscopic difference (a
+platform's last-digit rounding, or 1e-8 of the entry speed) can move a reversal by one 2 s cycle and the landing by
+up to about 3 km. Its per-case misses are therefore partly chance (all study flights ran on one platform, Colab, so
+they are reproducible there); paired comparisons over 256 cases average this out, but single-case results and
+PredGuid's DEV48 tuning choice (12 cases per configuration) carry it. Gate V4 was amended for this reason.
 
 **One simulator, no flight data** (added 2026-11-15; `jepa/simulator_fidelity_audit.md`; AS1, §3.4b,
 tests the lift excess named here, with values read off published figures). Every
