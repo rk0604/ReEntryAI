@@ -578,12 +578,12 @@ Statistics as DS1 (§6). AS1 is a separate family, so it cannot change any RQ1�
 
 Built by `jepa/build_notebook_v5.py` (reuse `AUTO_DISCONNECT_CODE`, `DONE_MD`, `DONE` from
 `build_notebooks_v3.py` and v4's Settings-cell pattern: `MODE`, `RUN` per stage, `AUTO_DISCONNECT`,
-`CPU_WORKERS`, `GPU_WORKERS`). Colab metadata: GPU, L4. **Resume rule as v4: after any disconnect, Run
+`CPU_WORKERS`, `GPU_WORKERS`). Colab metadata: GPU, T4 (L4 until 2026-11-17, §15). **Resume rule as v4: after any disconnect, Run
 all continues where it stopped**; nothing finished is redone. CPU-only runtimes skip GPU stages with a
 message, so analysis and report can run cheaply. Since 2026-11-16 (§15) a GPU runtime by default skips the
 CPU-pool test flights with a message (`GPU_PASS_SKIPS_CPU = True` in the Settings cell; the gates and tuning
 still run there if not done, because the GPU stages need them), so the run is done in passes the user switches
-by hand, CPU → L4 → CPU, each releasing the runtime at its end and printing what the next pass must do.
+by hand, CPU → T4 → CPU, each releasing the runtime at its end and printing what the next pass must do.
 
 | # | Section | Resume behavior |
 |---|---|---|
@@ -1230,6 +1230,15 @@ saturated.
   SB3 policies get the interval observation); the classical baseline alone runs a diagnostic interval
   heat screen every cycle, which cannot change its command but is inside its measured step time, so
   T09's classical row is not comparable with the other arms' and is to be labelled so.
+* **2026-11-17, all Colab GPU work on one GPU type, a T4 (user decision; budget, not a study setting).** The
+  Colab GPU pass (E3 training, MPPI flights, open loop, GPU timing) moves from L4 to T4: about 2.7× fewer units
+  per hour, and this work is a fixed amount (E3: `E3TrainCfg.steps = 36_000`; MPPI: fixed sample counts, the
+  planner has no time budget), so a slower GPU changes its duration, not its result beyond rounding. Only the
+  timings (T09) depend on the GPU, and they name it. Enforced in code: `GPU_TYPE = "T4"` (Settings cell, full
+  mode) refuses any other GPU at setup, and the first GPU session writes `00_study/gpu_platform.json`; a later
+  session on another GPU type raises (`study_v5.check_gpu_platform`), so every E3 model and MPPI arm shares one
+  GPU type. torch/CUDA versions are logged per session, not locked (Colab updates them). No GPU work had run
+  when this was made (only CPU passes), so the study folder frozen on 2026-11-16 continues. Smoke check 1.
 
 ---
 
@@ -1247,7 +1256,8 @@ noise, and its results do not carry over to them.
 
 **RL trained on other hardware than the learned models** (added 2026-11-16, §15; `jepa/kaggle_rl.md`). Every
 RL run trained on one Kaggle T4 in one pinned environment, each capped at 3 h of wall time (or its decision
-budget); the world models and E3 models trained on Colab GPUs. The RL arms are comparable with each other; the
+budget); the world models and E3 models trained on Colab GPUs (v5's own GPU work, E3 training and MPPI
+flights included, on one GPU type, a T4: `00_study/gpu_platform.json`, §15 2026-11-17). The RL arms are comparable with each other; the
 cap is hardware-dependent, so each run's decisions reached are reported (T07), and a faster GPU could have given
 the RL arms more training within the same cap.
 

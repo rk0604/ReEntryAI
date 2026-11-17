@@ -33,12 +33,12 @@ is the spec; when it is built, `v5_plan.md` §9 and §15/§16 get the summary an
 | Setup, benchmark S0, legacy RL inventory, gates V1–V4/E0, guidance tuning (FNPEG, PredGuid), CPU-pool test flights | Colab CPU runtime | as now |
 | **RL tuning** (`tune_rl`: 12 configurations per method at 10 % budget + their DEV48 policy flights) | **Kaggle** | needs FNPEG's `chosen.json` first (its expert and clone source) |
 | **RL training** (`train_rl_stage`: `dagger_fnpeg`, `bcppo_fnpeg`, `ppo_hist` × seeds 0–4) and each run's `fast_eval.json` | **Kaggle** | needs the RL `chosen.json` of its method |
-| E3 training, MPPI flights, open loop, GPU timing | Colab L4 | as now (cost not yet measured) |
+| E3 training, MPPI flights, open loop, GPU timing | Colab T4 (L4 until 2026-11-17) | one GPU type, locked by `00_study/gpu_platform.json` (`v5_plan.md` §15) |
 | E4 policy flights (RL policies in the full simulator), legacy RL flights, analysis, report | Colab CPU runtime | as now; they read the policies imported from Kaggle |
 | Tier 2 RL (`sac_hist`, `ppo_matched`) | Kaggle, same GPU type | only if `TIER = 2` later |
 
 Order: Colab CPU pass (until FNPEG and PredGuid are tuned) → Kaggle RL tuning → Kaggle RL training →
-import to Drive → Colab L4 pass (can run in parallel with the Kaggle weeks) → Colab CPU pass (policy flights,
+import to Drive → Colab T4 pass (can run in parallel with the Kaggle weeks) → Colab CPU pass (policy flights,
 analysis, report).
 
 ## 3. Kaggle facts the design relies on (check on first use; Kaggle changes these)
@@ -127,11 +127,11 @@ One file, `v5_rl_inputs.json`, written by the Colab notebook's section 11 once F
   this design is a study setting (`RL_ON_KAGGLE`, the platform files and the session limit live outside
   `study_config.json`), so that folder continues as is. The Colab CPU pass at f4503a7 never trains RL
   (RL needs a GPU runtime there), so no RL work exists outside Kaggle.
-* **The Colab L4 pass must run the code with `RL_ON_KAGGLE`** (it pulls the newest `space-jepa5` on a fresh
-  runtime). An L4 session started on f4503a7's code would tune and train RL on Colab.
+* **The Colab GPU (T4) pass must run the code with `RL_ON_KAGGLE`** (it pulls the newest `space-jepa5` on a fresh
+  runtime). A GPU session started on f4503a7's code would tune and train RL on Colab.
 * Kaggle details to confirm on first use: whether a failed "Save & Run All" version keeps `/kaggle/working`
   (the hook saves before it ends either way), and how an attached notebook output is updated to its newest
   version (the setup cell prints which session it restored).
 * Calendar: ≤ ≈ 55 T4-hours of capped RL work ≈ 2 weeks of quota; T4 vs L4 speed is unmeasured.
-* E3 training and MPPI flights still need Colab L4 units; measure their rate in the first L4 pass before
+* E3 training and MPPI flights still need Colab T4 units; measure their rate in the first T4 pass before
   deciding anything else.

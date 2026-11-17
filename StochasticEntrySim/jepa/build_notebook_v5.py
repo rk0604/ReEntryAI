@@ -35,7 +35,7 @@ INTRO = f"""
 
 {BADGE}
 
-**How to run.** Open in Colab (badge above). It opens on an **L4 GPU** runtime; for the **first pass switch
+**How to run.** Open in Colab (badge above). It opens on a **T4 GPU** runtime; for the **first pass switch
 to a CPU runtime** (Runtime → Change runtime type; see *Passes* below), then **Runtime → Run all**. **After any disconnect, crash or runtime release, Run all again**: every stage
 reads Drive, skips finished work in seconds and resumes half-done work from its last checkpoint (at most
 5 minutes of any training is lost). No cell ever needs editing to resume; Colab may only ask you to
@@ -48,10 +48,13 @@ does only GPU work by default (`GPU_PASS_SKIPS_CPU = True` in the Settings cell)
 open loop, plus the gates and tuning if they are not done yet, because the GPU stages need them. The CPU-pool
 test flights (guidance laws, classical, RL policies, legacy RL) are left for a CPU runtime, which is cheaper
 for them. On a CPU runtime the GPU stages print what remains and skip. The suggested order is
-**CPU → L4 → CPU**: (1) a high-CPU CPU runtime for the gates, tuning and the guidance-law flights;
-(2) L4 for training and the MPPI flights; (3) a CPU runtime for the trained RL policies' flights, the analysis
+**CPU → T4 → CPU**: (1) a high-CPU CPU runtime for the gates, tuning and the guidance-law flights;
+(2) T4 for training and the MPPI flights; (3) a CPU runtime for the trained RL policies' flights, the analysis
 and the report. Each pass disconnects itself at the end, and its last cell prints what the next pass has to
 do. Repeat a pass if it was cut short. `GPU_PASS_SKIPS_CPU = False` flies everything on one runtime.
+**All GPU work runs on one GPU type, a T4** (`GPU_TYPE` in the Settings cell; the cheapest Colab GPU, and the
+work is a fixed number of steps and flights, so a slower GPU only takes longer). The first GPU session records it
+in `00_study/gpu_platform.json`; a session on any other GPU stops at setup and releases the runtime.
 
 **Tiers (decision D1).** `TIER = 1` (default) runs the gates, legacy RL re-evaluation, tuning, the A256
 arms (FNPEG, PredGuid, MPPI + filtered physics, v2 at FNPEG's load), ORB-1 block 1, the four non-JEPA
@@ -93,6 +96,8 @@ RUN_OVERRIDE = {}               # e.g. {"ORB1_block1": False} to skip a stage th
 AUTO_DISCONNECT = IN_COLAB      # release the runtime when the notebook finishes or a cell fails; False keeps it
 CPU_WORKERS = None              # guidance-law, policy and classical flights, one simulator per core (None = every core)
 GPU_WORKERS = None              # MPPI flights sharing the GPU (None = 6 GB each, 2 GB spare, at most 4)
+GPU_TYPE = "T4" if MODE == "full" else None   # the one GPU type of all GPU work (00_study/gpu_platform.json);
+                                # any other GPU is refused at setup
 GPU_PASS_SKIPS_CPU = True       # on a GPU runtime, leave the CPU-pool test flights for a (cheaper) CPU runtime;
                                 # False flies everything on whatever runtime this is
 RL_ON_KAGGLE = MODE == "full"   # every RL run (tuning and training) trains on Kaggle, one platform for all of them
@@ -154,6 +159,9 @@ CPUS = os.cpu_count() or 2
 GPU_MEM_GB = torch.cuda.get_device_properties(0).total_memory / 1e9 if DEVICE == "cuda" else 0.0
 CPU_WORKERS = CPU_WORKERS or (CPUS if MODE == "full" else min(2, CPUS))
 GPU_WORKERS = GPU_WORKERS or (max(1, min(4, CPUS, int((GPU_MEM_GB - 2) // 6))) if DEVICE == "cuda" else 1)
+if DEVICE == "cuda":                                                   # one GPU type for every model and MPPI flight
+    GPU_PLATFORM = S5.check_gpu_platform(L, RUNTIME, GPU_TYPE, {"torch": torch.__version__, "cuda": torch.version.cuda},
+                                         LOG)
 CAN_GPU = DEVICE == "cuda" or MODE == "smoke"       # GPU stages; in smoke mode the CPU stands in for the GPU
 CAN_CPU = not (GPU_PASS_SKIPS_CPU and DEVICE == "cuda")   # CPU-pool test flights (gates and tuning always run)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -179,7 +187,7 @@ LOG(f"MODE={MODE} TIER={TIER} v5 folder={V5_ROOT} device={DEVICE} ({RUNTIME}) cp
     f"repair: {REPAIR}")
 LOG("RUN this session: " + ", ".join(k for k, v in RUN.items() if v))
 if MODE == "full" and DEVICE != "cuda":
-    LOG("CPU pass: training, MPPI flights and open loop only report what remains (Runtime -> Change runtime type -> L4).")
+    LOG("CPU pass: training, MPPI flights and open loop only report what remains (Runtime -> Change runtime type -> T4).")
 if not CAN_CPU:
     LOG("GPU pass (GPU_PASS_SKIPS_CPU): the CPU-pool test flights only report what remains; the gates and tuning still "
         "run here if they are not done, because the GPU stages need them.")
@@ -377,7 +385,7 @@ REPORT = r"""
 S5.status(CFG, L, S5.all_stage_jobs(CFG, L, L3), RUNTIME)
 if S5.WAITING["cpu"] or S5.WAITING["gpu"]:
     print(f"NEXT PASS: {S5.WAITING['cpu']} flights wait for a CPU runtime, {S5.WAITING['gpu']} MPPI flights (and any "
-          "training) for a GPU runtime. Runtime -> Change runtime type, then Run all.")
+          f"training) for a {GPU_TYPE or 'GPU'} runtime. Runtime -> Change runtime type, then Run all.")
 if RUN["report"]:
     print("report:", R5.build_report(L))
 S5.update_manifest(L)
@@ -579,7 +587,7 @@ def build() -> str:
         c["id"] = f"v5-cell-{i:02d}"                 # stable ids: rebuilding gives the same file
     nb["metadata"] = {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
                       "language_info": {"name": "python"}, "accelerator": "GPU",
-                      "colab": {"gpuType": "L4", "provenance": []}}
+                      "colab": {"gpuType": "T4", "provenance": []}}
     path = os.path.join(SIM, NAME)
     nbf.validate(nb)
     nbf.write(nb, path)

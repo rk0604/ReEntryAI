@@ -223,6 +223,7 @@ def t1_suites(tmp: Path, workers: int) -> None:
     t1_ds1(nom)
     t1_as1(nom)
     t1_gpu_pass()
+    t1_gpu_lock()
 
 
 def t1_gpu_pass() -> None:
@@ -255,6 +256,38 @@ def t1_gpu_pass() -> None:
           and w2["gpu"] - w1["gpu"] == 4 and both == [("cpu", 9), ("mppi", 4)]
           and nb.count("S5.run_jobs(") == nb.count("can_cpu=CAN_CPU") == 10 and "GPU_PASS_SKIPS_CPU = True" in nb,
           f"(gpu pass {gpu_pass}, cpu pass {cpu_pass}, default {both})")
+
+
+def t1_gpu_lock() -> None:
+    """GPU_TYPE: the first GPU session fixes 00_study/gpu_platform.json; another GPU type, or one that is not the
+    required type, is refused without touching the file."""
+    from jepa import study_v5 as S5
+    with tempfile.TemporaryDirectory() as td:
+        L = S5.LayoutV5(td).make()
+        f = L.root / S5.GPU_PLATFORM
+        refused = []
+
+        def refuses(*a):
+            before = f.read_bytes() if f.exists() else None
+            try:
+                S5.check_gpu_platform(L, *a, log=lambda m: None)
+                return False
+            except RuntimeError:
+                return (f.read_bytes() if f.exists() else None) == before
+
+        refused.append(refuses("NVIDIA L4", "T4"))                       # not a T4, nothing recorded yet
+        none_yet = not f.exists()
+        d1 = S5.check_gpu_platform(L, "Tesla T4", "T4", {"torch": "2.4"}, log=lambda m: None)
+        d2 = S5.check_gpu_platform(L, "Tesla T4", "T4", {"torch": "2.5"}, log=lambda m: None)   # torch update: allowed
+        refused.append(refuses("NVIDIA L4", None))                       # no type required, but the study is on T4
+        refused.append(refuses("NVIDIA A100-SXM4-40GB", "T4"))
+        doc = json.loads(f.read_text())
+    nb = (SIM_DIR / "ReEntryAI_JEPA_v5.ipynb").read_text(encoding="utf-8")
+    check("GPU lock: the first T4 session records it, a later T4 session (even on newer torch) passes, an L4 or A100 "
+          "is refused with the file unchanged; the notebook requires a T4 and opens on one",
+          all(refused) and none_yet and d1["gpu"] == d2["gpu"] == doc["gpu"] == "Tesla T4"
+          and len(doc["sessions"]) == 2 and 'GPU_TYPE = \\"T4\\"' in nb and "S5.check_gpu_platform(" in nb
+          and '"gpuType": "T4"' in nb, f"(refused {refused}, sessions {len(doc['sessions'])})")
 
 
 def t1_as1(nom: dict) -> None:

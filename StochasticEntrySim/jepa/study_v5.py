@@ -1476,6 +1476,39 @@ def rl_cfg(cfg: StudyConfigV5, L: LayoutV5, arm: str, extra: Optional[dict] = No
     return RL.RLCfg(**kw)
 
 
+GPU_PLATFORM = "00_study/gpu_platform.json"
+
+
+def check_gpu_platform(L: LayoutV5, gpu_name: str, required: Optional[str] = None, extra: Optional[dict] = None,
+                       log=print) -> dict:
+    """The one GPU type of the study's Colab GPU work (E3 training, MPPI flights, open loop, timing).
+
+    required (e.g. "T4"): a GPU whose name does not contain it is refused. The first GPU session writes
+    00_study/gpu_platform.json; a later session on another GPU type raises, so no model trains and no MPPI arm
+    flies on other hardware than the rest. torch/CUDA versions are logged per session (Colab updates them; the
+    results do not depend on them beyond rounding), not locked. Raising releases the runtime (post_run_cell hook).
+    """
+    how = "Runtime -> Change runtime type -> " + (required or "that GPU") + ", then Run all"
+    if required and required.lower() not in gpu_name.lower():
+        raise RuntimeError(f"this runtime's GPU is {gpu_name!r}; the study's GPU work runs on a {required} only "
+                           f"(GPU_TYPE in the Settings cell). {how}.")
+    p = L.root / GPU_PLATFORM
+    seen = {"gpu": gpu_name, **(extra or {}), "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    if p.exists():
+        doc = json.loads(p.read_text())
+        if doc["gpu"] != gpu_name:
+            raise RuntimeError(f"this runtime's GPU is {gpu_name!r}, but the study's GPU work so far ran on "
+                               f"{doc['gpu']!r} ({GPU_PLATFORM}). Every E3 model and MPPI flight uses one GPU type: "
+                               f"{how}.")
+        doc["sessions"] = doc.get("sessions", []) + [seen]
+        L.write_json(p, doc)
+        return doc
+    doc = {"gpu": gpu_name, "since": seen["at"], "sessions": [seen]}
+    L.write_json(p, doc)
+    log(f"GPU fixed for the study's GPU work: {gpu_name} ({GPU_PLATFORM})")
+    return doc
+
+
 @dataclass
 class SessionLimit:
     """A session that must stop on time (Kaggle, jepa/kaggle_rl.md section 4): an RL run starts only if its wall-clock
