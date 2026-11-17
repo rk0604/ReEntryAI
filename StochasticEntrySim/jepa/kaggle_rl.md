@@ -132,6 +132,11 @@ One file, `v5_rl_inputs.json`, written by the Colab notebook's section 11 once F
 * Kaggle details to confirm on first use: whether a failed "Save & Run All" version keeps `/kaggle/working`
   (the hook saves before it ends either way), and how an attached notebook output is updated to its newest
   version (the setup cell prints which session it restored).
-* Calendar: ≤ ≈ 55 T4-hours of capped RL work ≈ 2 weeks of quota; T4 vs L4 speed is unmeasured.
+* Measured 2026-11-17 on a Colab T4 (`ReEntryAI_JEPA_v5_rl_cost.ipynb`, `jepa/rlcost_v5.py`; FNPEG at its
+  defaults): PPO 48,500 decisions/s (`ppo_hist`), 43,600 (`bcppo_fnpeg`), so every PPO run reaches its 200 M
+  decisions in ≈ 1.2–1.3 h, **before** the 3 h cap: the cap does not bind on a T4, and the decisions each run
+  gets do not depend on the GPU. FNPEG expert 212 s per 200-episode chunk (2 CPU cores), 89 s per 20-episode
+  chunk; DEV48 policy flights 6.7 s each. All Tier 1 RL: ≈ 30 T4-hours ≈ 54 Colab units, or ≈ 1 week of
+  Kaggle quota (per run: `dagger_fnpeg` 0.61 h, `bcppo_fnpeg` 1.87 h, `ppo_hist` 1.15 h).
 * E3 training and MPPI flights still need Colab T4 units; measure their rate in the first T4 pass before
   deciding anything else.
