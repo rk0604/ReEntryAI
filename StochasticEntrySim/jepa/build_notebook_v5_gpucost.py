@@ -1,0 +1,184 @@
+"""
+Build ReEntryAI_JEPA_v5_gpu_cost.ipynb: measure what v5's remaining GPU work except RL (E3 training, MPPI flights,
+open loop) costs on a Colab T4 (jepa/gpucost_v5.py). Edit this builder, never the .ipynb:
+
+    python jepa/build_notebook_v5_gpucost.py          (from StochasticEntrySim/)
+
+Colab rules (CLAUDE.md): opens on a T4 runtime (the study's GPU), saves its result to Drive, then releases the
+runtime by itself (also when a cell fails); AUTO_DISCONNECT = False keeps it. Outside Colab (the smoke test) it reads
+JEPA_V5_MODE=smoke, JEPA_V5_GPUCOST_ROOT, JEPA_V5_ROOT, JEPA_V3_ROOT and JEPA_WIDE_DATA.
+"""
+import os
+import sys
+
+import nbformat as nbf
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SIM = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+from build_notebooks_v3 import AUTO_DISCONNECT_CODE, DONE, DONE_MD  # noqa: E402
+
+NAME = "ReEntryAI_JEPA_v5_gpu_cost.ipynb"
+BADGE = ("[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)]"
+         "(https://colab.research.google.com/github/rk0604/ReEntryAI/blob/space-jepa5/StochasticEntrySim/" + NAME + ")")
+
+INTRO = f"""
+# SpaceJEPA v5 · What does the rest of the GPU work cost?
+
+{BADGE}
+
+A short measurement, not part of the study: it **reads** `MyDrive/ReEntryAI_jepa_v5/` (to see what is already done)
+and writes nothing there. It times the real study code on this runtime with the study's frozen settings: E3 model
+training, MPPI flights of every model kind (physics `mppi_filtered`, `v2single`, the three E3 arms, `r0_nojepa`), and
+the open-loop evaluation. Then it projects the hours and Colab units for all the GPU work the study still has to do,
+except RL (the RL cost notebook covers that).
+
+**How to run.** It opens on a **T4 GPU** runtime (keep it: T4 is the study's GPU). **Runtime → Run all.** About
+45–90 minutes (≈ 1.5–3 units). The result is printed at the end and saved to `MyDrive/ReEntryAI_v5_gpu_cost/`.
+**The notebook disconnects itself** when it finishes or a cell fails, so it never idles on paid units; set
+`AUTO_DISCONNECT = False` in the Setup cell to keep the runtime.
+
+The measured models are trained for only a few thousand steps, so they fly worse than the study's models, which
+changes flight lengths somewhat: treat the result as ±20 %.
+"""
+
+SETTINGS = r"""
+import os, sys
+IN_COLAB = "google.colab" in sys.modules
+MODE = os.environ.get("JEPA_V5_MODE", "full")        # "smoke": tiny sizes (the smoke test; numbers meaningless)
+TRAIN_STEPS = 2000                                   # E3 training steps timed per arm (a full model is 36,000)
+"""
+
+SETUP = r"""
+BRANCH = "space-jepa5"
+if IN_COLAB:
+    REPO = "/content/ReEntryAI_v5"
+    if not os.path.exists(REPO):
+        !git clone -q -b {BRANCH} https://github.com/rk0604/ReEntryAI.git {REPO}
+    else:
+        !git -C {REPO} pull -q origin {BRANCH}
+    %pip install -q pymsis
+    os.chdir(f"{REPO}/StochasticEntrySim")
+    from google.colab import drive
+    drive.mount("/content/drive")
+    DRIVE = "/content/drive/MyDrive"
+    OUT = f"{DRIVE}/ReEntryAI_v5_gpu_cost"
+    V5_ROOT, V3_ROOT = f"{DRIVE}/ReEntryAI_jepa_v5", f"{DRIVE}/ReEntryAI_jepa_v3"
+    DATA_CANDIDATES = [f"{DRIVE}/ReEntryAI_jepa_data/wide_6000/episodes_wide_6000.pkl",
+                       f"{DRIVE}/ReEntryAI_jepa_data/wide_6000"]
+    LOCAL_DATA = "/content/data"
+    SCRATCH = "/content/gpu_cost_scratch"
+else:
+    OUT = os.environ.get("JEPA_V5_GPUCOST_ROOT", "jepa_runs/v5_gpu_cost")
+    V5_ROOT = os.environ.get("JEPA_V5_ROOT", "")
+    V3_ROOT = os.environ.get("JEPA_V3_ROOT", f"jepa_runs/v3_{MODE}")
+    DATA_CANDIDATES = [os.environ.get("JEPA_WIDE_DATA", ""), "jepa_runs/episodes_wide_6000.pkl", "jepa_runs/wide_6000"]
+    LOCAL_DATA = os.path.join(OUT, "data")
+    SCRATCH = os.path.join(OUT, "scratch")
+
+import json, time
+from pathlib import Path
+sys.path.insert(0, os.getcwd())
+import torch
+from jepa import study_v4 as S4, study_v5 as S5, train_v2 as T2, gpucost_v5 as GC
+
+CFG = S5.StudyConfigV5.smoke() if MODE == "smoke" else S5.StudyConfigV5()
+if MODE == "smoke":
+    TRAIN_STEPS = int(CFG.e3_train["steps"])
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+GPU = torch.cuda.get_device_name(0) if DEVICE == "cuda" else "cpu"
+CPUS = os.cpu_count() or 2
+WORKERS = GC.gpu_workers(DEVICE)                      # the study notebook's GPU worker count
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+torch.set_num_threads(1 if DEVICE == "cuda" else max(1, CPUS // 2))
+L3 = S4.v3_layout(V3_ROOT)                            # read-only v3 folder (v2single's models)
+DATA_DIRS = [c if os.path.isdir(c) else os.path.dirname(c) for c in DATA_CANDIDATES if c and os.path.exists(c)]
+RO = [V3_ROOT] + DATA_DIRS + ([V5_ROOT] if V5_ROOT else [])
+L = S5.LayoutV5(SCRATCH, read_only=RO).make()         # scratch only: never the study folder
+os.makedirs(OUT, exist_ok=True)
+print(f"MODE={MODE} device={DEVICE} ({GPU}) cpus={CPUS} GPU workers={WORKERS}; git {S5._GIT.get()[:10]}; "
+      f"result -> {OUT}")
+if MODE == "full" and "T4" not in GPU:
+    print(f"NOTE: this runtime's GPU is {GPU!r}, not a T4: the projection applies to this GPU, not to a T4.")
+""" + AUTO_DISCONNECT_CODE
+
+DATA = r"""
+t0 = time.time()
+DATA_PATH = T2.local_copy(T2.find_wide_dataset(DATA_CANDIDATES, download_dir=LOCAL_DATA), LOCAL_DATA)
+DATA = S5.load_data_v5(CFG, DATA_PATH, DEVICE)
+M = {"hardware": GPU, "workers": WORKERS, "cpus": CPUS, "data_load_s": round(time.time() - t0, 1),
+     "train_steps": TRAIN_STEPS}
+print(f"{DATA['n_episodes']} flights loaded in {M['data_load_s']:.0f} s")
+"""
+
+TRAIN = r"""
+t0 = time.time()
+M["training"] = GC.measure_training(CFG, L, DATA, DEVICE, TRAIN_STEPS)
+print(f"training measured in {(time.time() - t0) / 60:.1f} min")
+"""
+
+FLY = r"""
+SMOKE = {} if MODE == "full" else dict(n_model=2, n_physics=2)
+t0 = time.time()
+M["mppi"] = GC.measure_mppi(CFG, L, L3, DEVICE, WORKERS, **SMOKE)
+M["open_loop"] = GC.measure_open_loop(CFG, L, DATA, DEVICE)
+print(f"flights and open loop measured in {(time.time() - t0) / 60:.1f} min")
+"""
+
+PROJECT = r"""
+LEFT = GC.study_left(CFG, V5_ROOT, L3, L)
+P = GC.project(CFG, M, LEFT)
+TEXT = GC.summary_text(M, LEFT, P)
+print(TEXT)
+stamp = time.strftime("%Y%m%d_%H%M")
+name = f"gpu_cost_{GPU.replace(' ', '_')}_{stamp}"
+Path(OUT, name + ".json").write_text(json.dumps({"measured": M, "left": LEFT, "projection": P,
+                                                 "git": S5._GIT.get()}, indent=1, default=str))
+Path(OUT, name + ".txt").write_text(TEXT)
+print(f"saved {OUT}/{name}.json and .txt")
+"""
+
+CELLS = [
+    ("md", INTRO),
+    ("md", "## 0. Settings"),
+    ("code", SETTINGS),
+    ("md", "## 1. Setup\n\nClone the `space-jepa5` code, mount Drive, a scratch folder on local disk, and the "
+           "auto-disconnect hook. A minute."),
+    ("code", SETUP),
+    ("md", "## 2. Data\n\nThe 6,000 training flights, copied to local disk and loaded (every GPU session of the study "
+           "does this once). A few minutes."),
+    ("code", DATA),
+    ("md", "## 3. E3 training\n\nEach of the four E3 arms trains 2,000 of its 36,000 steps with the study's settings. "
+           "10–20 minutes."),
+    ("code", TRAIN),
+    ("md", "## 4. MPPI flights and open loop\n\nOne lockstep batch per model kind on the study's GPU workers: "
+           "`mppi_filtered` and `v2single` on A256 and ORB-1 conditions, the three E3 arms and `r0_nojepa` on A256 "
+           "(the short-trained models), then one open-loop evaluation per E3 arm. 30–60 minutes."),
+    ("code", FLY),
+    ("md", "## 5. Projection\n\nReads what `MyDrive/ReEntryAI_jepa_v5/` still has to do (read only) and projects "
+           "the hours and Colab units of all its remaining GPU work except RL, plus its CPU-pool flights at the "
+           "study's own measured rates. Saved to `MyDrive/ReEntryAI_v5_gpu_cost/`."),
+    ("code", PROJECT),
+    ("md", DONE_MD),
+    ("code", DONE),
+]
+
+
+def build() -> str:
+    nb = nbf.v4.new_notebook()
+    nb["cells"] = [nbf.v4.new_markdown_cell(t.strip("\n")) if k == "md" else nbf.v4.new_code_cell(t.strip("\n"))
+                   for k, t in CELLS]
+    for i, c in enumerate(nb["cells"]):
+        c["id"] = f"v5g-cell-{i:02d}"
+    nb["metadata"] = {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+                      "language_info": {"name": "python"}, "accelerator": "GPU",
+                      "colab": {"gpuType": "T4", "provenance": []}}
+    path = os.path.join(SIM, NAME)
+    nbf.validate(nb)
+    nbf.write(nb, path)
+    print(f"wrote {path} ({len(CELLS)} cells)")
+    return path
+
+
+if __name__ == "__main__":
+    build()
