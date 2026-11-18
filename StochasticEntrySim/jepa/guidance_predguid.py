@@ -33,6 +33,7 @@ CD_EST, MASS_EI, S_REF); GMAX = 4.5 g; every other constant is Bairstow's Table 
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -721,9 +722,12 @@ _DESIGNS: Dict[tuple, Design] = {}
 
 
 def design_for(ic: dict, target_phi: float, target_lam: float, cfg: PredGuidConfig) -> Design:
+    # keyed on the whole configuration: the design's dry run flies the executive, which reads gmax_g, overcontrol,
+    # Q7F, Q19 and K_RHO_FILTER_GAIN too (audit C4, 2026-11-17; the old key listed six fields, safe only because every
+    # tuning configuration draws a different KA)
     key = (tuple(round(float(ic[k]), 6) for k in ("altitude_m", "velocity_mps", "gamma_deg", "chi_deg", "phi_deg",
                                                   "lambda_deg")), round(target_phi, 9), round(target_lam, 9),
-           cfg.sigma_max_deg, cfg.VFINAL, cfg.LAD, cfg.lod_fixed_frac, cfg.K44, cfg.KA)
+           json.dumps(asdict(cfg), sort_keys=True, default=repr))
     if key not in _DESIGNS:
         _DESIGNS[key] = design_final_phase(ic, target_phi, target_lam, cfg)
     return _DESIGNS[key]

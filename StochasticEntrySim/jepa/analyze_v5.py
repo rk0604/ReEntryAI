@@ -8,11 +8,13 @@ tables (T01-T14, CSV) and figures (F01-F10, PNG and PDF at 200 dpi) with caption
                       in one table (arm, load, suite, seed, case, atmosphere / target, metrics); v3 and v4 read-only
     cube, comp        A256 paired comparisons with analyze_v4.Boot (hierarchical bootstrap: seeds, then cases within
                       atmospheres; cached in 05_analysis/cache/ by comparison and input hash)
-    orb_paired        ORB-1 paired comparisons: each case one unit, cases resampled within training-seed strata
+    orb_paired        ORB-1 / DS1 / AS1 paired comparisons by case: two-stage bootstrap (training seeds, then cases
+                      within each seed) and the seed-level t-test (seed_t; audit A1, 2026-11-17)
     criteria          G1-G7, J-each / J-equiv / J-mech, R-each / R-imit / R-gap, Q1-Q3, D1-D2, A1-A2 (T05); a pass/fail
                       criterion is decided only when every paired flight of both arms exists (status "pending" before)
-    ds1_analysis      DS1 (density shear, section 3.4): paired v2single − X by case (atmospheres averaged), cases
-                      resampled within training-seed strata; each arm's change from A256 (T13, T13b)
+    ds1_analysis      DS1 (density shear, section 3.4): paired v2single − X by case (atmospheres averaged), seeds then
+                      cases resampled (orb_paired); each arm's change from A256 (T13, T13b)
+    seed_t            seed-level paired t-test, the 5 seeds as the units, next to every bootstrap verdict (T05)
     ClusterBoot       sensitivity analysis: the same bootstrap with each entry case resampled together with its four
                       atmospheres (the pooled A256 intervals treat the 256 conditions as independent)
     analyze           the tables, the figures, the criteria; returns a summary for the report
@@ -277,7 +279,8 @@ def n_pairs(XA: np.ndarray, XB: np.ndarray, atm: Optional[int] = None) -> Tuple[
 
 class Comparer:
     """Paired A256 comparisons A - B, pooled and per atmosphere, with per-seed tests (analyze_v4's scheme), the
-    number of paired flights present and expected, and (pooled) the clustered-case interval."""
+    number of paired flights present and expected, and (pooled) the clustered-case interval and the seed-level
+    t-test on the per-seed differences (seed_t; audit B1, 2026-11-17)."""
 
     def __init__(self, df, boot: A4.Boot, cases, cboot: Optional[A4.Boot] = None):
         self.df, self.boot, self.cases, self.cboot = df, boot, cases, cboot
@@ -306,9 +309,16 @@ class Comparer:
                                 "p_boot_clustered": rc["p_boot"]})
                 k, n = A4._holds(ps, np.sign(r["diff"]) if np.isfinite(r["diff"]) and r["diff"] != 0 else 1.0)
                 row.update({"seeds_holding": k, "n_seeds": n,
-                            "per_seed": json.dumps([round(float(p["diff"]), 4) for p in ps])})
+                            "per_seed": json.dumps([round(float(p["diff"]), 4) for p in ps]),
+                            **seed_t([p["diff"] for p in ps])})   # per_seed_tests: pp (success), raw (log miss)
             rows.append(row)
         return rows
+
+
+def _t_scaled(r, scale: float = 1.0) -> dict:
+    """The seed-level t keys of a result, the interval ends and mean times scale (100: fractions to pp)."""
+    return {k: (float(r.get(k, np.nan)) * (scale if k not in ("t_p", "t_n") else 1.0) if r.get(k) is not None
+                else np.nan) for k in T_KEYS}
 
 
 def _get(t: pd.DataFrame, id_: str, metric: str = "success5", atm: str = "all"):
@@ -319,13 +329,52 @@ def _get(t: pd.DataFrame, id_: str, metric: str = "success5", atm: str = "all"):
 
 
 # ============================================================================
-# ORB-1 comparisons (each case one unit; cases resampled within training-seed strata)
+# Seed-level t-test (audit A1/B1, v5_plan.md section 15, 2026-11-17)
 # ============================================================================
+T_KEYS = ("t_diff", "t_lo", "t_hi", "t_lo90", "t_hi90", "t_p", "t_n")
+
+
+def seed_t(diffs: Sequence[float]) -> dict:
+    """Paired t-test with each training seed (or seed pair) one unit: the mean of the per-seed differences, its 95% and
+    90% t-intervals and two-sided p (df = n - 1). The 5 seeds are the study's independent replications of a learned
+    arm, so this is the test whose units are what was replicated; the bootstraps are reported beside it and a verdict
+    the two disagree on is flagged (T05 boot_t_disagree). NaN when fewer than 2 seeds (both arms deterministic)."""
+    d = np.asarray([float(x) for x in diffs if x is not None and np.isfinite(float(x))], float)
+    n = len(d)
+    out = dict.fromkeys(T_KEYS, np.nan)
+    out["t_n"] = int(n)
+    if n:
+        out["t_diff"] = float(d.mean())
+    if n < 2:
+        return out
+    from scipy import stats
+    m, se = float(d.mean()), float(d.std(ddof=1) / math.sqrt(n))
+    if se == 0.0:
+        out.update({"t_lo": m, "t_hi": m, "t_lo90": m, "t_hi90": m, "t_p": 1.0 if m == 0.0 else 0.0})
+        return out
+    q95, q90 = float(stats.t.ppf(0.975, n - 1)), float(stats.t.ppf(0.95, n - 1))
+    out.update({"t_lo": m - q95 * se, "t_hi": m + q95 * se, "t_lo90": m - q90 * se, "t_hi90": m + q90 * se,
+                "t_p": float(2 * stats.t.sf(abs(m) / se, n - 1))})
+    return out
+
+
+# ============================================================================
+# ORB-1, DS1, AS1 comparisons (paired by case; case i flown by training seed i mod n_seeds)
+# ============================================================================
+ORB_BOOT = "two_stage_v2"           # cache tag: the scheme before 2026-11-17 resampled cases only (seeds held fixed)
+
+
 def orb_paired(L, key: str, a: np.ndarray, b: np.ndarray, strata: np.ndarray, n_boot: int) -> dict:
+    """Paired difference mean(a - b) over cases whose stratum is the training seed that flew them (case mod n_seeds).
+    Two-stage bootstrap (audit A1, 2026-11-17, the scheme of A256's analyze_v4.Boot): draw the seeds (strata) with
+    replacement, then the cases within each drawn seed with replacement; the statistic is the mean over every drawn
+    case. Holding the seeds fixed, as before, ignores the variation between a learned arm's 5 trained models and gave
+    up to 59% false positives at an 11 pp seed spread (v5_code_audit.md A1). Also returns the seed-level t-test on the
+    per-seed mean differences (seed_t), which stays at its nominal 5% with 5 seeds."""
     a, b, strata = np.asarray(a, float), np.asarray(b, float), np.asarray(strata, int)
     ok = np.isfinite(a) & np.isfinite(b)
     a, b, strata = a[ok], b[ok], strata[ok]
-    h = hashlib.sha1(json.dumps([key, n_boot]).encode())
+    h = hashlib.sha1(json.dumps([key, n_boot, ORB_BOOT]).encode())
     for x in (a, b, strata.astype(float)):
         h.update(np.ascontiguousarray(x).tobytes())
     h = h.hexdigest()
@@ -339,20 +388,33 @@ def orb_paired(L, key: str, a: np.ndarray, b: np.ndarray, strata: np.ndarray, n_
             pass
     n = len(a)
     if n == 0:
-        res = {"diff": np.nan, "ci_lo": np.nan, "ci_hi": np.nan, "p_boot": np.nan, "n": 0}
+        res = {"diff": np.nan, "ci_lo": np.nan, "ci_hi": np.nan, "p_boot": np.nan, "n": 0, "n_seeds": 0,
+               "seed_diffs": [], **dict.fromkeys(T_KEYS, np.nan)}
     else:
         d = a - b
+        u = np.unique(strata)
+        groups = [d[strata == s] for s in u]
+        S_ = len(u)
         rng = np.random.default_rng(zlib.crc32(key.encode()) & 0x7FFFFFFF)
-        tot = np.zeros(n_boot)
-        for s in np.unique(strata):
-            ds = d[strata == s]
-            tot += ds[rng.integers(0, len(ds), (n_boot, len(ds)))].sum(1)
-        v = tot / n
+        vals = []
+        for b0 in range(0, n_boot, 1000):
+            nb = min(1000, n_boot - b0)
+            pick = rng.integers(0, S_, (nb, S_))               # stage 1: the seeds
+            tot, cnt = np.zeros(nb), np.zeros(nb)
+            for k, g in enumerate(groups):                      # stage 2: cases within each drawn seed
+                sums = g[rng.integers(0, len(g), (nb, S_, len(g)))].sum(2)
+                sel = pick == k
+                tot += np.where(sel, sums, 0.0).sum(1)
+                cnt += sel.sum(1) * len(g)
+            vals.append(tot / cnt)
+        v = np.concatenate(vals)
         lo, hi = np.percentile(v, [2.5, 97.5])
         p = min(1.0, 2 * min((v <= 0).mean(), (v >= 0).mean()))
+        sd = [float(g.mean()) for g in groups]
         res = {"diff": float(d.mean()), "ci_lo": float(lo), "ci_hi": float(hi),
-               "p_boot": float(max(p, 1.0 / n_boot)), "n": int(n)}
-    L.write_json(path, {"key": key, "hash": h, "result": res})
+               "p_boot": float(max(p, 1.0 / n_boot)), "n": int(n), "n_seeds": int(S_),
+               "seed_diffs": [round(x, 6) for x in sd], **seed_t(sd)}
+    L.write_json(path, {"key": key, "hash": h, "scheme": ORB_BOOT, "result": res})
     return res
 
 
@@ -393,7 +455,8 @@ def shift_analysis(cfg, L, main: pd.DataFrame, suite: str, comparisons, base_atm
                 "complete": bool(len(p) == n_expected), "a_%": 100 * float(p[a].mean()),
                 "b_%": 100 * float(p[b].mean()), "diff_pp": 100 * r["diff"], "ci_lo_pp": 100 * r["ci_lo"],
                 "ci_hi_pp": 100 * r["ci_hi"], "p_boot": r["p_boot"], "n_cases": r["n"],
-                "per_atmosphere_pp": json.dumps({k: round(v, 2) for k, v in per_atm.items()})}
+                "per_atmosphere_pp": json.dumps({k: round(v, 2) for k, v in per_atm.items()}),
+                **_t_scaled(r, 100.0)}
 
     for id_, a, b in comparisons:
         c = paired(d, suite, id_, a, b, n_exp)
@@ -438,33 +501,6 @@ def as1_analysis(cfg, L, main: pd.DataFrame) -> dict:
     """AS1: shift_analysis against A256's nominal atmosphere (AS1 flies nominal air); A1 and A2 again on the
     conditions whose target is still inside the true vehicle's 4.5 g footprint."""
     return shift_analysis(cfg, L, main, "AS1", AS1_COMPARISONS, base_atmospheres=("nominal",), reach_ids=AS1_FAMILY)
-    piv = d.pivot_table(index=["case", "atmosphere"], columns="key", values="success_5km", aggfunc="first")
-    for id_, a, b in DS1_COMPARISONS:
-        if a not in piv or b not in piv:
-            continue
-        p = piv[[a, b]].astype(float).dropna()
-        if not len(p):
-            continue
-        cm = p.groupby(level="case").mean()
-        cases = cm.index.to_numpy()
-        r = orb_paired(L, f"v5|{id_}|DS1", cm[a].to_numpy(), cm[b].to_numpy(), cases % len(cfg.seeds), cfg.n_boot)
-        per_atm = {atm: 100 * float(g[a].mean() - g[b].mean()) for atm, g in p.groupby(level="atmosphere")}
-        out["comp"].append({"id": id_, "a": a, "b": b, "n_pairs": int(len(p)), "n_expected": n_exp,
-                            "complete": bool(len(p) == n_exp), "a_%": 100 * float(p[a].mean()),
-                            "b_%": 100 * float(p[b].mean()), "diff_pp": 100 * r["diff"], "ci_lo_pp": 100 * r["ci_lo"],
-                            "ci_hi_pp": 100 * r["ci_hi"], "p_boot": r["p_boot"], "n_cases": r["n"],
-                            "per_atmosphere_pp": json.dumps({k: round(v, 2) for k, v in per_atm.items()})})
-    a256 = main[main.suite == "A256"]
-    cases = sorted(d.case.unique())
-    for key in sorted(d.key.unique()):
-        x, y = d[d.key == key], a256[(a256.key == key) & a256.case.isin(cases)]
-        out["drop"].append({"arm": key, "DS1_success5_%": 100 * float(x.success_5km.mean()), "DS1_n": int(len(x)),
-                            "A256_success5_%": 100 * float(y.success_5km.mean()) if len(y) else np.nan,
-                            "A256_n": int(len(y)),
-                            "change_pp": 100 * float(x.success_5km.mean() - y.success_5km.mean()) if len(y) else np.nan,
-                            "DS1_median_miss_km": float(x.miss_km.median()),
-                            "A256_median_miss_km": float(y.miss_km.median()) if len(y) else np.nan})
-    return out
 
 
 # ============================================================================
@@ -518,18 +554,40 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
              as1: Optional[dict] = None) -> pd.DataFrame:
     """T05. A pass/fail criterion is decided only on complete data: until every paired flight of both arms exists
     its status is "pending", `met` stays empty and the measured text is marked PROVISIONAL (the analysis runs on
-    every "Run all", so without this a half-flown arm would show a verdict)."""
+    every "Run all", so without this a half-flown arm would show a verdict).
+
+    Every paired comparison also carries the seed-level t-test (seed_t: the 5 training seeds as the units; t_lo, t_hi,
+    t_p, t_n) next to its bootstrap. The verdict rule is the pre-registered one (the bootstrap, the seed rule, Holm);
+    boot_t_disagree flags a comparison whose bootstrap interval and seed-level t-interval reach different answers
+    (one excludes 0 and the other does not; for J-equiv, one lies inside the equivalence margin and the other does
+    not), so the paper can say so instead of a reviewer finding it (audit A1/B1, v5_plan.md section 15)."""
     rows = []
 
     def row(id_, fam, q, measured, met, value=np.nan, ci=(np.nan, np.nan), p=None, holding=None, valid=None,
-            status=None, r=None, pairs=None):
+            status=None, r=None, pairs=None, tt=None, equiv=None, fmt="{:+.1f}"):
         n, e = pairs if pairs is not None else (_n(r)[:2] if r is not None else (np.nan, np.nan))
         clo = float(r.get("ci_lo_clustered", np.nan)) if r is not None else np.nan
         chi = float(r.get("ci_hi_clustered", np.nan)) if r is not None else np.nan
+        tt = {k: (tt.get(k, np.nan) if tt is not None else np.nan) for k in T_KEYS}
+        tlo, thi = (tt["t_lo90"], tt["t_hi90"]) if equiv is not None else (tt["t_lo"], tt["t_hi"])
+        fin = lambda *x: all(v is not None and np.isfinite(float(v)) for v in x)
+        if equiv is not None:
+            b_ans = bool(-equiv < ci[0] and ci[1] < equiv) if fin(*ci) else None
+            t_ans = bool(-equiv < tlo and thi < equiv) if fin(tlo, thi) else None
+        else:
+            b_ans = bool(ci[0] > 0 or ci[1] < 0) if fin(*ci) else None
+            t_ans = bool(tlo > 0 or thi < 0) if fin(tlo, thi) else None
+        dis = None if b_ans is None or t_ans is None else bool(b_ans != t_ans)
+        if fin(tlo, thi):
+            measured += (f"; seed-level t ({int(tt['t_n'])} seeds{', 90%' if equiv is not None else ''}) "
+                         f"[{fmt.format(tlo)}, {fmt.format(thi)}]" + (" (DISAGREES with the bootstrap)" if dis else ""))
         rows.append({"id": id_, "family": fam, "question": q, "measured": measured, "value": value, "ci_lo": ci[0],
                      "ci_hi": ci[1], "p": p, "p_holm": None, "seeds_holding": holding, "met": met, "valid": valid,
                      "status": status, "n_pairs": n, "n_expected": e, "ci_lo_clustered": clo, "ci_hi_clustered": chi,
-                     "clustered_excludes_0": bool(clo > 0 or chi < 0) if np.isfinite(clo) and np.isfinite(chi) else None})
+                     "clustered_excludes_0": bool(clo > 0 or chi < 0) if np.isfinite(clo) and np.isfinite(chi) else None,
+                     "t_lo": tlo, "t_hi": thi, "t_p": tt["t_p"], "t_n": tt["t_n"],
+                     "t_excludes_0": (bool(tlo > 0 or thi < 0) if fin(tlo, thi) else None) if equiv is None else None,
+                     "boot_t_disagree": dis})
 
     def per_atm(t, id_, metric="success5", fmt="{:+.1f}"):
         return ", ".join(f"{ATM_LAB[a]} {fmt.format(r['diff'])} [{fmt.format(r['ci_lo'])}, {fmt.format(r['ci_hi'])}]"
@@ -559,7 +617,7 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
         row(id_, "RQ1", q, _prov(r) + s5_text(r) + clu(r) + "; " + per_atm(t04, id_)
             + (f"; B significantly better in {worse}" if worse else ""),
             met, r["diff"], (r["ci_lo"], r["ci_hi"]), r["p_boot"], f"{int(r['seeds_holding'])}/{int(r['n_seeds'])}",
-            status=None if done else "pending", r=r)
+            status=None if done else "pending", r=r, tt=_t_scaled(r))
     # G3: validity of the load comparison (decided with G4's flights)
     a = df[df.suite == "A256"]
     pk = {k: a[a.key == k].groupby("atmosphere").peak_g.mean() for k in ("fnpeg", "v2single@fnpeg_matched")}
@@ -600,7 +658,7 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
             row(id_, "RQ1", q, "not run", None, status="not run")
         else:
             row(id_, "RQ1", q, f"{_prov(r)}success@5km {r['diff']:+.1f} pp [{r['ci_lo']:+.1f}, {r['ci_hi']:+.1f}]"
-                f"{clu(r)}; {per_atm(t04, id_)}", None, r["diff"], (r["ci_lo"], r["ci_hi"]), r=r)
+                f"{clu(r)}; {per_atm(t04, id_)}", None, r["diff"], (r["ci_lo"], r["ci_hi"]), r=r, tt=_t_scaled(r))
     _holm(rows, ("G1", "G2", "G4", "G5"))
 
     # ---- RQ2 ----
@@ -619,7 +677,7 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
             f"(miss ratio ×{math.exp(r['diff']):.2f}), holds in {int(r['seeds_holding'])}/{int(r['n_seeds'])} seeds"
             + clu(r, "{:+.3f}") + "; " + per_atm(t06, id_, "log_miss", "{:+.3f}"), met, r["diff"],
             (r["ci_lo"], r["ci_hi"]), r["p_boot"], f"{int(r['seeds_holding'])}/{int(r['n_seeds'])}",
-            status=None if done else "pending", r=r)
+            status=None if done else "pending", r=r, tt=_t_scaled(r), fmt="{:+.3f}")
         jr.append(id_)
     _holm(rows, jr)
     r = _get(t06, "J-r0_nojepa", "log_miss")
@@ -631,7 +689,8 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
                                                                       else "inconclusive")
         row("J-equiv", "RQ2", f"Is r0_nojepa equivalent to R0? (90% CI inside ±{cfg.equiv_log})",
             f"{_prov(r)}90% CI [{r['ci90_lo']:+.3f}, {r['ci90_hi']:+.3f}]: {ans}", eq if done else None, r["diff"],
-            (r["ci90_lo"], r["ci90_hi"]), status=None if done else "pending", pairs=_n(r)[:2])
+            (r["ci90_lo"], r["ci90_hi"]), status=None if done else "pending", pairs=_n(r)[:2], tt=_t_scaled(r),
+            equiv=cfg.equiv_log, fmt="{:+.3f}")
     else:
         row("J-equiv", "RQ2", "Is r0_nojepa equivalent to R0?", "not run", None, status="not run")
     if mech.get("rho") is not None:
@@ -658,7 +717,7 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
         row(id_, "RQ3" if arm in S5.RL_TIER1 else "RQ3 (Tier 2, outside the Holm family)",
             f"Does v2 beat {arm}? (v2single − {arm}, seeds {list(rl_seeds)})", _prov(r) + s5_text(r) + clu(r), met,
             r["diff"], (r["ci_lo"], r["ci_hi"]), r["p_boot"], f"{int(r['seeds_holding'])}/{n}",
-            status=None if done else "pending", r=r)
+            status=None if done else "pending", r=r, tt=_t_scaled(r))
         if arm in S5.RL_TIER1:
             rr.append(id_)
     _holm(rows, rr)
@@ -667,7 +726,8 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
         row("R-imit", "RQ3", "Imitation gap (dagger_fnpeg − fnpeg, estimate)", "not run", None, status="not run")
     else:
         row("R-imit", "RQ3", "Imitation gap (dagger_fnpeg − fnpeg, estimate)", f"{_prov(r)}success@5km {r['diff']:+.1f} pp "
-            f"[{r['ci_lo']:+.1f}, {r['ci_hi']:+.1f}]{clu(r)}", None, r["diff"], (r["ci_lo"], r["ci_hi"]), r=r)
+            f"[{r['ci_lo']:+.1f}, {r['ci_hi']:+.1f}]{clu(r)}", None, r["diff"], (r["ci_lo"], r["ci_hi"]), r=r,
+            tt=_t_scaled(r))
     gaps = t07.attrs.get("gaps", {}) if t07 is not None else {}
     row("R-gap", "RQ3", "Sim-to-sim gap (success@5km fast env − full simulator, same policy and A256 cases)",
         "; ".join(f"{a} {v:+.1f} pp" for a, v in gaps.items()) or "not run", None,
@@ -703,8 +763,9 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
         met = bool(r["diff"] > 0 and r["ci_lo"] > 0) if done else None
         row(id_, "RQ4", q, ("" if done else f"PROVISIONAL ({int(r['n'])} of {n_b1} block-1 cases): ")
             + f"success@5km {100 * r['diff']:+.1f} pp [{100 * r['ci_lo']:+.1f}, {100 * r['ci_hi']:+.1f}] "
-            f"over {r['n']} cases", met, 100 * r["diff"], (100 * r["ci_lo"], 100 * r["ci_hi"]), r["p_boot"],
-            status=None if done else "pending", pairs=(int(r["n"]), n_b1))
+            f"over {r['n']} cases (seeds, then cases within each seed, resampled)", met, 100 * r["diff"],
+            (100 * r["ci_lo"], 100 * r["ci_hi"]), r["p_boot"], status=None if done else "pending",
+            pairs=(int(r["n"]), n_b1), tt=_t_scaled(r, 100.0))
         q3.append(id_)
     _holm(rows, q3)
     for id_, other in (("Q3a", "fnpeg"), ("Q3b", "predguid")):
@@ -731,7 +792,7 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
             + f"success@5km {c['diff_pp']:+.1f} pp [{c['ci_lo_pp']:+.1f}, {c['ci_hi_pp']:+.1f}] over {c['n_cases']} cases "
             f"(atmospheres averaged within a case); per atmosphere {c['per_atmosphere_pp']}", met, c["diff_pp"],
             (c["ci_lo_pp"], c["ci_hi_pp"]), c["p_boot"] if id_ in DS1_FAMILY else None,
-            status=None if done or id_ not in DS1_FAMILY else "pending", pairs=(c["n_pairs"], c["n_expected"]))
+            status=None if done or id_ not in DS1_FAMILY else "pending", pairs=(c["n_pairs"], c["n_expected"]), tt=c)
         if id_ in DS1_FAMILY:
             dfam.append(id_)
     _holm(rows, dfam)
@@ -758,7 +819,7 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
             + f"success@5km {c['diff_pp']:+.1f} pp [{c['ci_lo_pp']:+.1f}, {c['ci_hi_pp']:+.1f}] over {c['n_cases']} cases "
             f"(vehicles averaged within a case); per vehicle {c['per_atmosphere_pp']}", met, c["diff_pp"],
             (c["ci_lo_pp"], c["ci_hi_pp"]), c["p_boot"] if id_ in AS1_FAMILY else None,
-            status=None if done or id_ not in AS1_FAMILY else "pending", pairs=(c["n_pairs"], c["n_expected"]))
+            status=None if done or id_ not in AS1_FAMILY else "pending", pairs=(c["n_pairs"], c["n_expected"]), tt=c)
         if id_ in AS1_FAMILY:
             afam.append(id_)
             cr = comp.get(id_ + "-reach")
@@ -766,7 +827,7 @@ def criteria(cfg, df, t04, t06, t07, mech, orb: dict, gates: dict, seeds, rl_see
                 row(id_ + "-reach", "AS1 (estimate)", f"{id_} on the conditions whose target the true vehicle can still "
                     "reach within 4.5 g (sensitivity estimate)", f"success@5km {cr['diff_pp']:+.1f} pp "
                     f"[{cr['ci_lo_pp']:+.1f}, {cr['ci_hi_pp']:+.1f}] ({cr['n_pairs']} of {cr['n_expected']} reachable "
-                    "conditions flown by both)", None, cr["diff_pp"], (cr["ci_lo_pp"], cr["ci_hi_pp"]))
+                    "conditions flown by both)", None, cr["diff_pp"], (cr["ci_lo_pp"], cr["ci_hi_pp"]), tt=cr)
     _holm(rows, afam)
     drop = (as1 or {}).get("drop") or []
     if drop:
@@ -1098,7 +1159,8 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
                 sens.append({"id": id_, "comparison": f"v2single − {other}", "subset": name, "metric": col,
                              "n": r["n"], "v2single_%": 100 * a_[ok].mean() if ok.any() else np.nan,
                              "other_%": 100 * b_[ok].mean() if ok.any() else np.nan, "diff_pp": 100 * r["diff"],
-                             "ci_lo_pp": 100 * r["ci_lo"], "ci_hi_pp": 100 * r["ci_hi"], "p_boot": r["p_boot"]})
+                             "ci_lo_pp": 100 * r["ci_lo"], "ci_hi_pp": 100 * r["ci_hi"], "p_boot": r["p_boot"],
+                             "t_lo_pp": 100 * r["t_lo"], "t_hi_pp": 100 * r["t_hi"], "t_p": r["t_p"]})
         orb["sens"] = {i: [x for x in sens if x["id"] == i and x["subset"] != subsets[0][0]] for i in ("Q3a", "Q3b")}
     else:
         s8 = pd.DataFrame()
@@ -1107,12 +1169,13 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
            f"2/5/10 km, success@5km within the load limit (peak g ≤ {B.LOAD_OK_G:g}), the one-sided 90% Clopper–Pearson lower bound on P(miss ≤ 10 km) against {B.EM1_REQUIREMENT}, "
            "g-duration compliance (NASA-STD-3000 deconditioned crew) with its interval.", data)
     t08b = pd.DataFrame(sens, columns=["id", "comparison", "subset", "metric", "n", "v2single_%", "other_%", "diff_pp",
-                                       "ci_lo_pp", "ci_hi_pp", "p_boot"])
+                                       "ci_lo_pp", "ci_hi_pp", "p_boot", "t_lo_pp", "t_hi_pp", "t_p"])
     _table(L, caps, t08b.round(5), "T08b_rq4_q3_sensitivity",
            "RQ4, Q3 on ORB-1 block 1 and its sensitivity analyses (v5_plan.md section 15, 2026-11-11): the "
            "pre-registered pooled comparison; the cases whose target is reachable within 4.5 g at a constant bank "
            "(all of targets 1 and 2, few of target 0); success counted only when the flight also kept peak g ≤ "
-           f"{B.LOAD_OK_G:g}; and each target alone. Paired by case, cases resampled within training-seed strata; "
+           f"{B.LOAD_OK_G:g}; and each target alone. Paired by case; training seeds, then cases within each seed, resampled "
+           "(t_*: the seed-level t-test on the 5 per-seed differences); "
            "estimates with 95% intervals, no pass/fail. Target 0 is mostly unreachable under 4.5 g, so a controller "
            "that enforces the limit gives up range there and one with a soft limit can exceed it.", data)
     if any(k in orb for k in ("Q3a", "Q3b")):
@@ -1121,14 +1184,16 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
     # ---- T13 DS1 (density shear) ----
     ds = ds1_analysis(cfg, L, main)
     t13 = pd.DataFrame(ds["comp"], columns=["id", "a", "b", "n_pairs", "n_expected", "complete", "a_%", "b_%", "diff_pp",
-                                            "ci_lo_pp", "ci_hi_pp", "p_boot", "n_cases", "per_atmosphere_pp"])
+                                            "ci_lo_pp", "ci_hi_pp", "p_boot", "n_cases", "per_atmosphere_pp", "t_diff",
+                                            "t_lo", "t_hi", "t_p", "t_n"])
     t13b = pd.DataFrame(ds["drop"], columns=["arm", "DS1_success5_%", "DS1_n", "A256_success5_%", "A256_n", "change_pp",
                                              "DS1_median_miss_km", "A256_median_miss_km"])
     _table(L, caps, t13.round(5), "T13_ds1_density_shear",
            "DS1 (v5_plan.md section 3.4, added 2026-11-15): A256's 64 entry cases under four density profiles that "
            "change with altitude (two ±15% shears crossing over between 40 and 70 km, and two GRAM-like random "
            "profiles, the second with L/D × 0.92). Paired differences v2single − X in success@5km: each case's "
-           "atmospheres averaged, cases resampled within training-seed strata (a seeded arm flies seed case mod 5). "
+           "atmospheres averaged; training seeds, then cases within each seed, resampled (a seeded arm flies seed case "
+           "mod 5); t_*: the seed-level t-test on the 5 per-seed differences. "
            "D1 and D2 are their own Holm family; the rest are estimates.", data + " + configs/benchmark_v5/DS1.json")
     _table(L, caps, t13b.round(5), "T13b_ds1_vs_a256",
            "Each arm on DS1 against the same arm on A256's same 64 cases (constant errors): success@5km and median "
@@ -1139,14 +1204,16 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
     # ---- T14 AS1 (aerodynamic sensitivity) ----
     a1 = as1_analysis(cfg, L, main)
     t14 = pd.DataFrame(a1["comp"], columns=["id", "a", "b", "n_pairs", "n_expected", "complete", "a_%", "b_%", "diff_pp",
-                                            "ci_lo_pp", "ci_hi_pp", "p_boot", "n_cases", "per_atmosphere_pp"])
+                                            "ci_lo_pp", "ci_hi_pp", "p_boot", "n_cases", "per_atmosphere_pp", "t_diff",
+                                            "t_lo", "t_hi", "t_p", "t_n"])
     t14b = pd.DataFrame(a1["drop"], columns=["arm", "AS1_success5_%", "AS1_n", "A256_success5_%", "A256_n", "change_pp",
                                              "AS1_median_miss_km", "A256_median_miss_km"])
     _table(L, caps, t14.round(5), "T14_as1_aero_sensitivity",
            "AS1 (v5_plan.md section 3.4b, added 2026-11-15): A256's 64 entry cases in nominal air, the true vehicle on "
            "the published Orion trim aerodynamics (bibb_ld: lower L/D; bibb_ld_cd: lower L/D and CD) while every "
            "controller's model keeps the simulator's schedule. Paired differences v2single − X in success@5km: each "
-           "case's two vehicles averaged, cases resampled within training-seed strata. A1 and A2 are their own Holm "
+           "case's two vehicles averaged; training seeds, then cases within each seed, resampled (t_*: the seed-level "
+           "t-test). A1 and A2 are their own Holm "
            "family; the rest are estimates; '-reach' rows use only the conditions whose target is inside the true "
            "vehicle's 4.5 g constant-bank footprint (per_atmosphere_pp is per vehicle).",
            data + " + configs/benchmark_v5/AS1.json")
@@ -1181,6 +1248,9 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
     vf = t10.attrs.get("vf", {})
     _table(L, caps, t10.round(5), "T10_tuning", "DEV48 tuning (section 4.5): every configuration tried per method with "
            "its sampled settings and DEV48 scores (success@5km, mean log miss, mean peak g); chosen = the frozen choice. "
+           "PredGuid's Q7F, Q19, KA and K_RHO_FILTER_GAIN never change a DEV48 flight (its entries skip HUNTEST and "
+           "up-control; v5_plan.md section 14, audit C3), so its tuning is a search over LATBIAS, KLAT, overcontrol "
+           "and gmax_g. "
            + (f"FNPEG final speed Vf = {vf.get('vf_mps')} m/s (median at 7.6 km over {vf.get('n_flights')} classical "
               "DEV48 flights)." if vf else ""), "03_tuning/")
 

@@ -176,11 +176,15 @@ def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
                 met += " (invalid: G3)"
             if _status(r) == "met" and str(getattr(r, "clustered_excludes_0", "")).lower() == "false":
                 met += " (not with clustered cases)"
+            if _status(r) in ("met", "not met") and str(getattr(r, "boot_t_disagree", "")).lower() == "true":
+                met += " (seed-level t disagrees)"
             rows.append([escape(str(r.id)), escape(str(r.question)), escape(str(r.measured)), _f(r.p_holm, "{:.3g}"), met])
         d.table(rows, [0.8, 1.8, 3.1, 0.6, 0.6])
         d.note("Met: yes / no are decided on complete data only; pending = flights still missing (numbers provisional); "
                "estimate = reported with its interval, no pass/fail. \"Cases clustered across atmospheres\" is the "
-               "sensitivity interval that resamples each entry case together with its four atmospheres.")
+               "sensitivity interval that resamples each entry case together with its four atmospheres. \"Seed-level t\" "
+               "treats the 5 training seeds as the units; \"(seed-level t disagrees)\" marks a verdict whose t-interval "
+               "reaches the other answer.")
 
     def fig(k):
         if k in Fg:
@@ -278,11 +282,14 @@ def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
         "miss ≤ 10 km. <b>log miss</b> = ln(max(miss, 0.01 km)); failures keep their miss at termination.",
         "<b>Paired comparisons</b>: the unit is one condition, paired across arms by entry state and MPPI noise stream "
         "(common random numbers). Deterministic arms are broadcast over seeds; RL comparisons pair seeds 0–4. ORB-1, "
-        "DS1 and AS1: a seeded arm flies seed case mod 5 and cases are resampled within those strata.",
+        "DS1 and AS1: a seeded arm flies seed case mod 5.",
         f"<b>Uncertainty</b>: hierarchical bootstrap, {cfg.get('n_boot')} resamples (seeds, then cases within each "
-        "atmosphere), 95% percentile intervals (90% for TOST); ORB-1: cases resampled within training-seed strata; "
-        "per-seed exact McNemar and sign tests; Holm within each family. Sensitivity: the same bootstrap with each "
-        "entry case resampled together with its four atmospheres (the 256 conditions come from 64 entry cases).",
+        "atmosphere), 95% percentile intervals (90% for TOST); ORB-1, DS1 and AS1: seeds, then cases within each "
+        "seed; per-seed exact McNemar and sign tests; Holm within each family. Beside every bootstrap, the "
+        "<b>seed-level t-test</b>: the 5 per-seed differences as the units (t with 4 degrees of freedom), because the "
+        "5 trained models are what was replicated and a bootstrap over 5 seeds is too narrow; a verdict the two "
+        "disagree on is marked. Sensitivity: the same bootstrap with each entry case resampled together with its four "
+        "atmospheres (the 256 conditions come from 64 entry cases).",
         "<b>Within the load limit</b>: success@5km and peak g ≤ 4.6 (the 4.5 g limit plus the 0.1 g margin of G3 and of "
         "the tuning objective).",
         "<b>Verdicts</b>: a pass/fail criterion is decided only when every paired flight of both arms exists; before "

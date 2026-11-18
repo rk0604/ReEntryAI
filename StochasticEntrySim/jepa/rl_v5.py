@@ -217,7 +217,8 @@ class RLCfg:
     bc_episodes: int = 2000
     bc_epochs: int = 40
     sup_batch: int = 4096
-    expert_beta_1hz: float = 0.9            # fnpeg's filter at 1 Hz; ^5 at the fast env's 5 s decisions
+    expert_beta_1hz: float = 0.9            # fnpeg's 1 Hz filter when fnpeg_cfg has no tuned filter_beta; ^5 at the
+                                            # fast env's 5 s decisions
     # bookkeeping
     save_every_s: float = 300.0
     save_every_updates: int = 0             # > 0: also every n updates (the smoke test's deterministic resume)
@@ -380,7 +381,7 @@ def ppo_train(L, d: Path, cfg: RLCfg, device, label: str, actor: Optional[Actor]
             r = curve.rows[-1]
             log(f"  [{label}] update {update} {step:,} decisions: return {r['ep_return']:.3f} "
                 f"success@5km {r['success_5km_fast']:.3f} ({(elapsed + time.time() - t0) / 60:.1f} min)")
-        _maybe_snapshot(L, d, actor, step, cfg, snaps)
+        _maybe_snapshot(L, d, actor, step, cfg, snaps, elapsed + time.time() - t0)
         due = time.time() - t_save > cfg.save_every_s or (cfg.save_every_updates and update % cfg.save_every_updates == 0)
         if due:
             elapsed += time.time() - t0
@@ -390,6 +391,7 @@ def ppo_train(L, d: Path, cfg: RLCfg, device, label: str, actor: Optional[Actor]
             fail_point(stage, update)
     elapsed += time.time() - t0
     t0 = time.time()
+    _maybe_snapshot(L, d, actor, step, cfg, snaps, elapsed, final=True)
     save()
     save_policy(L, d / "policy.pt", actor, {"label": label, "decisions": step, "updates": update,
                                             "train_s": round(elapsed, 1), "cfg": asdict(cfg)})
@@ -425,17 +427,30 @@ def _ppo_update(actor: Actor, vf: nn.Module, opt, cfg: RLCfg, gen, ref: Optional
             opt.step()
 
 
-def _snapshot_marks(cfg: RLCfg) -> List[int]:
+def _snapshot_marks(cfg: RLCfg) -> List[float]:
+    """The budget fractions (i + 1) / curve_points at which the learning-curve snapshots are saved."""
     if cfg.curve_points <= 0:
         return []
-    return [int(cfg.budget_decisions * (i + 1) / cfg.curve_points) for i in range(cfg.curve_points)]
+    return [(i + 1) / cfg.curve_points for i in range(cfg.curve_points)]
 
 
-def _maybe_snapshot(L, d: Path, actor: Actor, step: int, cfg: RLCfg, marks: List[int]) -> None:
+def _maybe_snapshot(L, d: Path, actor: Actor, step: int, cfg: RLCfg, marks: List[float], elapsed_s: float,
+                    final: bool = False) -> None:
+    """Snapshot i once the run has used fraction marks[i] of EITHER budget, decisions or wall-clock, whichever comes
+    first (a run ends at whichever budget runs out, so this spaces the points over the run it actually had; marks by
+    decisions alone left a wall-clock-limited run without its later points: audit C8, 2026-11-17). final=True (after
+    the training loop): every point not reached yet is the final policy, so each run has all its points and the last
+    one is the policy that is flown. Snapshots are measurements only; training does not read them."""
     for i, m in enumerate(marks):
         p = d / "snapshots" / f"policy_{i + 1}of{len(marks)}.pt"
-        if step >= m and not p.exists():
-            save_policy(L, p, actor, {"decisions": step, "point": i + 1})
+        if p.exists():
+            continue
+        by_dec = step >= int(cfg.budget_decisions * m)
+        by_time = elapsed_s >= cfg.budget_hours * 3600 * m
+        why = "decisions" if by_dec else ("wall_clock" if by_time else ("final" if final else None))
+        if why:
+            save_policy(L, p, actor, {"decisions": step, "point": i + 1, "trigger": why,
+                                      "elapsed_s": round(float(elapsed_s), 1)})
 
 
 # ============================================================================
@@ -543,7 +558,7 @@ def sac_train(L, d: Path, cfg: RLCfg, device, label: str, log=print, stage: str 
                 update += 1
         if curve.n >= N:
             curve.flush(step, update, elapsed + time.time() - t0, alpha=float(log_alpha.exp()))
-        _maybe_snapshot(L, d, actor, step, cfg, snaps)
+        _maybe_snapshot(L, d, actor, step, cfg, snaps, elapsed + time.time() - t0)
         due = time.time() - t_save > cfg.save_every_s or (cfg.save_every_updates and update > 0
                                                           and update % cfg.save_every_updates == 0)
         if due:
@@ -554,6 +569,7 @@ def sac_train(L, d: Path, cfg: RLCfg, device, label: str, log=print, stage: str 
             fail_point(stage, update)
     elapsed += time.time() - t0
     t0 = time.time()
+    _maybe_snapshot(L, d, actor, step, cfg, snaps, elapsed, final=True)
     save()
     save_policy(L, d / "policy.pt", actor, {"label": label, "decisions": step, "updates": update,
                                             "train_s": round(elapsed, 1), "cfg": asdict(cfg)})
@@ -598,12 +614,14 @@ def _load_shards(folder: Path, B: dict, cap: int, n_shard: int) -> Tuple[int, bo
 # The expert in the fast env, DAgger, BC
 # ============================================================================
 class FastExpert:
-    """fnpeg on fast-env flights at the env's 5 s decisions (filters at beta^5); one FNPEG flight per env row."""
+    """fnpeg on fast-env flights at the env's 5 s decisions (filters at beta^5, beta = the tuned FNPEG's 1 Hz value
+    in fnpeg_cfg, else cfg.expert_beta_1hz); one FNPEG flight per env row."""
 
     def __init__(self, env: RF.FastEntryEnv, cfg: RLCfg, fnpeg_cfg: Optional[dict] = None):
         from jepa.guidance_fnpeg import FNPEG, FNPEGConfig
         fc = dict(fnpeg_cfg or {})
-        fc["filter_beta"] = float(cfg.expert_beta_1hz) ** float(env.cfg.dt_s)
+        b1 = fc.get("filter_beta")
+        fc["filter_beta"] = float(cfg.expert_beta_1hz if b1 is None else b1) ** float(env.cfg.dt_s)
         self.law = FNPEG(FNPEGConfig(**fc))
         self.env = env
         self.flights = [self.law.new_flight(float(p), float(l)) for p, l in zip(env.phi_t.cpu(), env.lam_t.cpu())]
@@ -815,20 +833,31 @@ def hardware_info(device) -> dict:
             "cuda": torch.version.cuda, "platform": os.environ.get("JEPA_V5_RL_PLATFORM", "")}
 
 
-# the fields a run may not change between its start and a resume (the CPU model may: a cloud VM is not chosen)
-HW_SAME = ("gpu", "torch", "cuda", "platform")
+# the fields a run may not change between its start and a resume. torch and CUDA are logged, not locked: Colab
+# updates them between sessions without asking, and a lock would strand a half-trained run (the GPU type is locked
+# here and by study_v5.check_gpu_platform; v5_plan.md section 15, 2026-11-17). The CPU model may change too.
+HW_SAME = ("gpu", "platform")
+HW_LOGGED = ("torch", "cuda", "cpu", "cpu_count")
 
 
-def check_hardware(L, d: Path, device) -> dict:
-    """hardware.json at a run's first start; a resume on other hardware (GPU type, torch, CUDA, platform) raises."""
+def check_hardware(L, d: Path, device, log=print) -> dict:
+    """hardware.json at a run's first start; a resume on another GPU type or platform raises. A resume with other
+    torch/CUDA versions (or CPU) is logged and appended to hardware.json's "resumes"."""
     hw = hardware_info(device)
     p = Path(d) / "hardware.json"
     if p.exists():
         have = json.loads(p.read_text())
         diff = {k: (have.get(k), hw.get(k)) for k in HW_SAME if have.get(k) != hw.get(k)}
         if diff:
-            raise RuntimeError(f"RL run {d} started on other hardware and may not resume here (one platform for every "
-                               f"RL run, jepa/kaggle_rl.md): {diff}")
+            raise RuntimeError(f"RL run {d} started on other hardware and may not resume here (one GPU type for every "
+                               f"RL run): {diff}")
+        last = {**have, **(have.get("resumes") or [{}])[-1]}
+        changed = {k: (last.get(k), hw.get(k)) for k in HW_LOGGED if last.get(k) != hw.get(k)}
+        if changed:
+            log(f"[RL] {Path(d).name}: resumed with {changed} (logged in hardware.json, not locked)")
+            have["resumes"] = list(have.get("resumes") or []) + [{**{k: hw.get(k) for k in HW_LOGGED},
+                                                                  "at": time.strftime("%Y-%m-%d %H:%M:%S")}]
+            L.write_json(p, have)
         return have
     L.write_json(p, hw)
     return hw
@@ -846,7 +875,7 @@ def train_rl_dir(L, d: Path, arm: str, cfg: RLCfg, device, fnpeg_cfg: Optional[d
         p = d / "run.json"
         return json.loads(p.read_text()) if p.exists() else {"arm": arm, "seed": cfg.seed}
     L.guard(d).mkdir(parents=True, exist_ok=True)
-    hw = check_hardware(L, d, device)
+    hw = check_hardware(L, d, device, log)
     label = label or f"{arm} seed {cfg.seed}"
     t0 = time.time()
     if arm == "dagger_fnpeg":

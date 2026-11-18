@@ -1,5 +1,7 @@
 # v5 RL training on Kaggle (ground truth; built 2026-11-16)
 
+> **Retired on 2026-11-17 (`jepa/v5_plan.md` section 15).** Every RL run now tunes and trains in the Colab notebook on the study's one GPU type, an L4 (`ReEntryAI_JEPA_v5.ipynb` sections 6 and 11). The Colab notebook no longer has `RL_ON_KAGGLE` or any Kaggle step. `kaggle_v5.py`, its notebook and smoke check 16 are kept so the record stays complete and any earlier Kaggle state could still be checked; they are not part of the run.
+
 Built as: `jepa/kaggle_v5.py` (export, inputs, platform, restore, pack, import), `study_v5.SessionLimit` (no run
 starts that cannot finish before the session ends), `rl_v5.check_hardware` (a run never resumes on other hardware),
 `jepa/build_notebook_v5_kaggle.py` → `ReEntryAI_JEPA_v5_kaggle_rl.ipynb`, the Colab notebook's `RL_ON_KAGGLE`

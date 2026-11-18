@@ -251,12 +251,20 @@ def t1_gpu_pass() -> None:
         S5.run_cpu, S5.run_mppi, S5.done_ids = saved
         S5.WAITING.update(before)
     nb = (SIM_DIR / "ReEntryAI_JEPA_v5.ipynb").read_text(encoding="utf-8")
+    src = ["".join(c["source"]) for c in json.loads(nb)["cells"] if c["cell_type"] == "code"]
+    at = lambda txt: [i for i, c in enumerate(src) if txt in c]
+    end = at('release_runtime("GPU pass finished')
+    gpu_work = at("S5.run_jobs(") + at("S5.train_e3_stage(") + at("S5.train_rl_stage(") + at("S5.tune_rl(")         + at("S5.open_loop_stage(") + at("S5.timing_stage(")
+    cpu_after = at("A5.analyze(") + at("R5.build_report(")
+    order = len(end) == 1 and max(gpu_work) < end[0] < min(cpu_after) and all(
+        "if not CAN_CPU" in src[i] or "elif RUN" in src[i] or "if CAN_CPU" in src[i] for i in cpu_after)
     check("GPU pass skips the CPU-pool flights (5 counted as waiting), a CPU pass the MPPI flights (4), the default "
-          "flies both; every notebook flight stage passes can_cpu",
+          "flies both; every notebook flight stage passes can_cpu; one cell after every GPU stage releases a GPU "
+          "pass's runtime before the analysis and the report, which run only on a CPU runtime",
           gpu_pass == [("mppi", 4)] and w1["cpu"] - before["cpu"] == 5 and cpu_pass == [("cpu", 9)]
           and w2["gpu"] - w1["gpu"] == 4 and both == [("cpu", 9), ("mppi", 4)]
-          and nb.count("S5.run_jobs(") == nb.count("can_cpu=CAN_CPU") == 10 and "GPU_PASS_SKIPS_CPU = True" in nb,
-          f"(gpu pass {gpu_pass}, cpu pass {cpu_pass}, default {both})")
+          and nb.count("S5.run_jobs(") == nb.count("can_cpu=CAN_CPU") == 10 and "GPU_PASS_SKIPS_CPU = True" in nb
+          and order, f"(gpu pass {gpu_pass}, cpu pass {cpu_pass}, default {both}, release cell {end})")
 
 
 def t1_gpu_lock() -> None:
@@ -276,19 +284,21 @@ def t1_gpu_lock() -> None:
             except RuntimeError:
                 return (f.read_bytes() if f.exists() else None) == before
 
-        refused.append(refuses("NVIDIA L4", "T4"))                       # not a T4, nothing recorded yet
+        refused.append(refuses("Tesla T4", "L4"))                        # not an L4, nothing recorded yet
+        refused.append(refuses("NVIDIA L40S", "L4"))                     # "L4" only as a whole word
         none_yet = not f.exists()
-        d1 = S5.check_gpu_platform(L, "Tesla T4", "T4", {"torch": "2.4"}, log=lambda m: None)
-        d2 = S5.check_gpu_platform(L, "Tesla T4", "T4", {"torch": "2.5"}, log=lambda m: None)   # torch update: allowed
-        refused.append(refuses("NVIDIA L4", None))                       # no type required, but the study is on T4
-        refused.append(refuses("NVIDIA A100-SXM4-40GB", "T4"))
+        d1 = S5.check_gpu_platform(L, "NVIDIA L4", "L4", {"torch": "2.4"}, log=lambda m: None)
+        d2 = S5.check_gpu_platform(L, "NVIDIA L4", "L4", {"torch": "2.5"}, log=lambda m: None)   # torch update: allowed
+        refused.append(refuses("Tesla T4", None))                        # no type required, but the study is on L4
+        refused.append(refuses("NVIDIA A100-SXM4-40GB", "L4"))
         doc = json.loads(f.read_text())
     nb = (SIM_DIR / "ReEntryAI_JEPA_v5.ipynb").read_text(encoding="utf-8")
-    check("GPU lock: the first T4 session records it, a later T4 session (even on newer torch) passes, an L4 or A100 "
-          "is refused with the file unchanged; the notebook requires a T4 and opens on one",
-          all(refused) and none_yet and d1["gpu"] == d2["gpu"] == doc["gpu"] == "Tesla T4"
-          and len(doc["sessions"]) == 2 and 'GPU_TYPE = \\"T4\\"' in nb and "S5.check_gpu_platform(" in nb
-          and '"gpuType": "T4"' in nb, f"(refused {refused}, sessions {len(doc['sessions'])})")
+    check("GPU lock: the first L4 session records it, a later L4 session (even on newer torch) passes, a T4, L40S or "
+          "A100 is refused with the file unchanged; the notebook requires an L4, opens on one and has no Kaggle path",
+          all(refused) and none_yet and d1["gpu"] == d2["gpu"] == doc["gpu"] == "NVIDIA L4"
+          and len(doc["sessions"]) == 2 and 'GPU_TYPE = \\"L4\\"' in nb and "S5.check_gpu_platform(" in nb
+          and '"gpuType": "L4"' in nb and "RL_ON_KAGGLE" not in nb and "kaggle_v5" not in nb,
+          f"(refused {refused}, sessions {len(doc['sessions'])})")
 
 
 def t1_v4_amendment() -> None:

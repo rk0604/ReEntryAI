@@ -593,6 +593,18 @@ def is_tuned(L: LayoutV5, method: str) -> bool:
     return (L.tuning / method / "chosen.json").exists()
 
 
+def fnpeg_filter_beta(L: LayoutV5, cfg: StudyConfigV5) -> float:
+    """FNPEG's 1 Hz filter beta as tuned (chosen.json), else its default: mppi_filtered's filter and the RL experts'
+    (DAgger, BC) use the same value, so E2 and E4 compare against the law that was actually tuned (audit A2)."""
+    b = tuned(L, "fnpeg", cfg).get("filter_beta")
+    return float(_law_defaults("fnpeg")["filter_beta"] if b is None else b)
+
+
+def adapter_kw(model: dict) -> dict:
+    """Extra settings of a model dict for fly_v5.load_adapter_v5 (mppi_filtered's beta)."""
+    return {"beta": float(model["beta"])} if model.get("beta") is not None else {}
+
+
 def _vf(L: LayoutV5) -> dict:
     p = L.tuning / "fnpeg" / "vf.json"
     return {"vf_mps": float(json.loads(p.read_text())["vf_mps"])} if p.exists() else {}
@@ -625,9 +637,11 @@ def arm_job(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, cond: dict, arm: str,
         seed = int(cfg.rl_seeds[int(cond.get("train_seed", cond["case"])) % len(cfg.rl_seeds)])
     if seed is None:
         seed = orb1_seed(cfg, cond)
-    if arm == "mppi_filtered":
-        return mppi_job(cfg, cond, arm, G, cfg.g_primary, seed, {"kind": "physics_filtered", "ckpt": None,
-                                                                 "members": None}, stage)
+    if arm == "mppi_filtered":       # FNPEG's tuned filter (beta from its chosen.json): E2 changes only the planner
+        model = {"kind": "physics_filtered", "ckpt": None, "members": None, "beta": fnpeg_filter_beta(L, cfg)}
+        j = mppi_job(cfg, cond, arm, G, cfg.g_primary, seed, model, stage)
+        j["untuned"] = not is_tuned(L, "fnpeg")          # waits for FNPEG's tuning, as FNPEG's own test flights do
+        return j
     if arm == "mppi_truth":
         return mppi_job(cfg, cond, arm, G, cfg.g_primary, seed, {"kind": "physics_truth", "ckpt": None,
                                                                  "members": None}, stage)
@@ -816,7 +830,8 @@ def _cpu_worker(arg) -> int:
 def _mppi_worker(arg) -> int:
     shard, model, device, mppi, max_rows, chunk, root, ro, threads, verbose, prog = arg
     torch.set_num_threads(int(threads))
-    adapter = F5.load_adapter_v5(model["kind"], model.get("ckpt"), device, model.get("members"), chunk, keep_only=True)
+    adapter = F5.load_adapter_v5(model["kind"], model.get("ckpt"), device, model.get("members"), chunk, keep_only=True,
+                                 **adapter_kw(model))
     L = LayoutV5(root, ro)
 
     def report(p):
@@ -889,12 +904,18 @@ def run_mppi(cfg: StudyConfigV5, jobs: Sequence[dict], L: LayoutV5, device: str 
     for j in jobs:
         m = j["model"]
         gs.setdefault((j["suite"], j["controller"], j["load"], j["seed"], m["kind"], m.get("ckpt"),
-                       tuple(m["members"]) if m.get("members") is not None else None), []).append(j)
-    ready = [(k, g) for k, g in gs.items() if g[0]["model"].get("ckpt") is None or os.path.exists(g[0]["model"]["ckpt"])]
+                       tuple(m["members"]) if m.get("members") is not None else None, m.get("beta"),
+                       bool(j.get("untuned"))), []).append(j)
+    untuned = [(k, g) for k, g in gs.items() if g[0].get("untuned")]
+    n_tune = sum(F5.flight_id_v5(j) not in done for _, g in untuned for j in g)
+    WAITING["tuning"] += n_tune
+    ready = [(k, g) for k, g in gs.items() if not g[0].get("untuned")
+             and (g[0]["model"].get("ckpt") is None or os.path.exists(g[0]["model"]["ckpt"]))]
     n_all = sum(len(g) for _, g in ready)
     n_done0 = sum(F5.flight_id_v5(j) in done for _, g in ready for j in g)
-    log(f"[{label}] {n_done0}/{n_all} done in {len(ready)} model runs ({len(gs) - len(ready)} wait for training); "
-        f"{workers} worker(s) on {device}")
+    n_train = len(gs) - len(ready) - len(untuned)
+    log(f"[{label}] {n_done0}/{n_all} done in {len(ready)} model runs ({n_train} wait for training"
+        + (f"; {n_tune} flights wait for FNPEG's tuning" if n_tune else "") + f"); {workers} worker(s) on {device}")
     mppi = cfg.mppi()
     pool, t_all, n_flown = None, time.time(), 0
     ro = [str(p) for p in L.read_only]
@@ -942,7 +963,8 @@ def run_mppi(cfg: StudyConfigV5, jobs: Sequence[dict], L: LayoutV5, device: str 
     return n_flown
 
 
-WAITING = {"cpu": 0, "gpu": 0}      # flights left for another runtime by run_jobs in this session (the notebook's notes)
+WAITING = {"cpu": 0, "gpu": 0, "tuning": 0}   # flights left for another runtime (cpu, gpu) or for FNPEG's tuning
+                                              # (mppi_filtered) by run_jobs in this session (the notebook's notes)
 
 
 def run_jobs(cfg: StudyConfigV5, jobs: Sequence[dict], L: LayoutV5, device: str = "cpu", cpu_workers: int = 1,
@@ -966,6 +988,27 @@ def run_jobs(cfg: StudyConfigV5, jobs: Sequence[dict], L: LayoutV5, device: str 
         WAITING["gpu"] += k
         log(f"[{label}] {k} MPPI flights wait for a GPU runtime")
     return n
+
+
+GATE_NAMES = ("S0", "V1", "V2", "V3", "V4", "E0")
+
+
+def gates_missing(L: LayoutV5) -> List[str]:
+    """Gates with no cached verdict yet (01_checks/<gate>.done). They are CPU work: a GPU pass refuses to run them."""
+    return [g for g in GATE_NAMES if _gate_done(L, g) is None]
+
+
+def next_pass_note(gpu_type: Optional[str] = None) -> str:
+    """What the next pass has to do, from the counts run_jobs left in WAITING this session ("" when nothing)."""
+    w, parts = WAITING, []
+    if w["cpu"]:
+        parts.append(f"{w['cpu']} CPU-pool flights wait for a CPU runtime")
+    if w["gpu"]:
+        parts.append(f"{w['gpu']} MPPI flights (and any training) wait for a {gpu_type or 'GPU'} runtime")
+    if w.get("tuning"):
+        parts.append(f"{w['tuning']} mppi_filtered flights wait for FNPEG's tuning (a CPU pass), then a "
+                     f"{gpu_type or 'GPU'} runtime")
+    return ("NEXT PASS: " + "; ".join(parts) + ". Runtime -> Change runtime type, then Run all.") if parts else ""
 
 
 # ============================================================================
@@ -1516,15 +1559,18 @@ GPU_PLATFORM = "00_study/gpu_platform.json"
 
 def check_gpu_platform(L: LayoutV5, gpu_name: str, required: Optional[str] = None, extra: Optional[dict] = None,
                        log=print) -> dict:
-    """The one GPU type of the study's Colab GPU work (E3 training, MPPI flights, open loop, timing).
+    """The one GPU type of the study's Colab GPU work (E3 training, RL tuning and training, MPPI flights, open loop,
+    timing).
 
-    required (e.g. "T4"): a GPU whose name does not contain it is refused. The first GPU session writes
-    00_study/gpu_platform.json; a later session on another GPU type raises, so no model trains and no MPPI arm
-    flies on other hardware than the rest. torch/CUDA versions are logged per session (Colab updates them; the
-    results do not depend on them beyond rounding), not locked. Raising releases the runtime (post_run_cell hook).
+    required (e.g. "L4"): a GPU whose name does not contain it as a whole word is refused ("NVIDIA L4" passes,
+    "NVIDIA L40S" does not). The first GPU session writes 00_study/gpu_platform.json; a later session on another GPU
+    type raises, so no model or policy trains and no MPPI arm flies on other hardware than the rest. torch/CUDA
+    versions are logged per session (Colab updates them; the results do not depend on them beyond rounding), not
+    locked. Raising releases the runtime (post_run_cell hook).
     """
+    import re
     how = "Runtime -> Change runtime type -> " + (required or "that GPU") + ", then Run all"
-    if required and required.lower() not in gpu_name.lower():
+    if required and not re.search(rf"\b{re.escape(required)}\b", gpu_name, re.IGNORECASE):
         raise RuntimeError(f"this runtime's GPU is {gpu_name!r}; the study's GPU work runs on a {required} only "
                            f"(GPU_TYPE in the Settings cell). {how}.")
     p = L.root / GPU_PLATFORM
@@ -1533,8 +1579,8 @@ def check_gpu_platform(L: LayoutV5, gpu_name: str, required: Optional[str] = Non
         doc = json.loads(p.read_text())
         if doc["gpu"] != gpu_name:
             raise RuntimeError(f"this runtime's GPU is {gpu_name!r}, but the study's GPU work so far ran on "
-                               f"{doc['gpu']!r} ({GPU_PLATFORM}). Every E3 model and MPPI flight uses one GPU type: "
-                               f"{how}.")
+                               f"{doc['gpu']!r} ({GPU_PLATFORM}). Every E3 model, RL policy and MPPI flight uses "
+                               f"one GPU type: {how}.")
         doc["sessions"] = doc.get("sessions", []) + [seen]
         L.write_json(p, doc)
         return doc
@@ -1723,9 +1769,13 @@ def legacy_inventory(cfg: StudyConfigV5, L: LayoutV5, legacy_root: Optional[str]
 
 def legacy_jobs(cfg: StudyConfigV5, L: LayoutV5, finals: Sequence[dict]) -> List[dict]:
     import re
-    jobs = []
+    jobs, seen = [], {}
     for r in finals:
         name = "rl_legacy_" + re.sub(r"[^A-Za-z0-9_]+", "_", Path(r["path"]).stem)
+        if name in seen and seen[name] != r["path"]:     # two models would share one arm name and its flight ids
+            raise ValueError(f"legacy models {seen[name]!r} and {r['path']!r} both become arm {name!r}: rename one "
+                             "(audit C6)")
+        seen[name] = r["path"]
         kw = _legacy_env_kwargs(r["path"])
         for suite in ("HELD256", "A256"):
             jobs += [policy_job(c, name, "legacy", r["path"], None, legacy=True, env_kwargs=kw)
@@ -1919,6 +1969,8 @@ def timing_stage(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, device: str, log
                 ms = _classical_step_ms(classical_job(cond, "timing"), screen=arm == "classical")
             else:
                 j = arm_job(cfg, L, L3, cond, arm, "timing")
+                if j.get("untuned"):                     # timed once tuned (the cache would keep the defaults')
+                    continue
                 law = F5.make_law(j["model"]["kind"], j["model"]["cfg"])
                 ms = []
                 rec = F5.run_guidance_lockstep([j], law, verbose=False)[0]
@@ -1935,6 +1987,8 @@ def timing_stage(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, device: str, log
                 if (arm, dv) in done:
                     continue
                 j = arm_job(cfg, L, L3, cond, arm, "timing", cfg.seeds[0])
+                if j.get("untuned"):
+                    continue
                 ms = _mppi_plan_ms(cfg, j, dv)
                 rows.append({"arm": arm, "device": dv, "ms_median": float(np.median(ms)),
                              "ms_p99": float(np.percentile(ms, 99)), "params": _params(j["model"])})
@@ -2009,7 +2063,7 @@ def _mppi_plan_ms(cfg: StudyConfigV5, job: dict, device: str) -> List[float]:
     F.finish = keep
     try:
         m = job["model"]
-        ad = F5.load_adapter_v5(m["kind"], m.get("ckpt"), device, m.get("members"), cfg.v2_chunk)
+        ad = F5.load_adapter_v5(m["kind"], m.get("ckpt"), device, m.get("members"), cfg.v2_chunk, **adapter_kw(m))
         F4.run_lockstep_v4([job], ad, cfg.mppi(), verbose=False)
     finally:
         F.finish = orig

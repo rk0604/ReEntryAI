@@ -325,7 +325,8 @@ v4's E0b (statistical re-fly of v3) already covers GPU nondeterminism; v5 cites 
   100).
 * Filters: K_D ← β·K_D + (1 − β)·D_meas/D_model, same for L, using the measured aerodynamic
   accelerations the v2 encoder also sees (`cD_meas`, `cL_meas` inputs); active from 0.05 g; the
-  predictor multiplies modeled D and L by K_D and K_L along the whole prediction. β tuned.
+  predictor multiplies modeled D and L by K_D and K_L along the whole prediction. β tuned; the tuned β is
+  also `mppi_filtered`'s filter and the DAgger/BC expert's (§15, 2026-11-17).
 * Cadence: 1 Hz while aero acceleration ≥ 1.52 m/s² (Lu), else hold the current bank. If 1 Hz is too
   slow on Colab even batched, use 2 s and record it in §15 before any test flight.
 
@@ -339,7 +340,7 @@ appendix defines one (record). Log the active phase per guidance cycle.
 
 | Arm | What | Suites | Flights |
 |---|---|---|---|
-| `mppi_filtered` | v4's `mppi_nominal` with the physics model's density and lift scales set every decision from FNPEG's filters (density_scale = K_D, lift_scale = K_L / K_D, mass 1). Same planner and settings as v2. The direct competitor to "implicit system identification from history." | A256 (5 noise indices), ORB-1 | 1,280 + ≤ 3,000 |
+| `mppi_filtered` | v4's `mppi_nominal` with the physics model's density and lift scales set every decision from FNPEG's filters (density_scale = K_D, lift_scale = K_L / K_D, mass 1), at FNPEG's tuned β (its flights wait for FNPEG's tuning; §15, 2026-11-17). Same planner and settings as v2. The direct competitor to "implicit system identification from history." | A256 (5 noise indices), ORB-1 | 1,280 + ≤ 3,000 |
 | `v2single` | v3's v2 checkpoints, member 0 (the v3 `v2single` arm), 4.5 g | ORB-1 (A256 exists in v3) | ≤ 3,000 |
 | `v2single@fnpeg_matched` | same model, per-condition soft g limit = `fnpeg`'s realized peak g on that condition (as v4's matched arm) | A256 | 1,280 |
 | `mppi_truth` | exploratory ceiling (v4 arm) | ORB-1 block 1 | 1,000 |
@@ -463,12 +464,18 @@ heat load, RCS fuel, reversals, planning ms), plus:
 * A256: exactly v4 §6 (hierarchical bootstrap 10,000 resamples over seeds then cases within
   atmospheres, 95% percentile intervals, per-seed McNemar and sign tests, Holm within each family, TOST
   with 90% intervals).
-* ORB-1: each case is one unit; learned arms have one seed per case, so bootstrap cases within seed
-  blocks; Q1 uses exact Clopper–Pearson; Q3 uses block 1 paired by case.
+* ORB-1: each case is one unit; learned arms have one seed per case, so the bootstrap draws the seed
+  blocks with replacement and then cases within each drawn block (two-stage; since 2026-11-17, §15; before,
+  cases within fixed blocks); Q1 uses exact Clopper–Pearson; Q3 uses block 1 paired by case.
 * RL arms: seeds 0–4; "holds in a seed" needs 4 of 5, as for the learned models (since 2026-11-15, §15;
   was seeds 0–2 and 3 of 3).
 * DS1 (§3.4, added 2026-11-15): each case is one unit (its four atmospheres averaged); learned arms have
-  one seed per case (case mod 5), so cases are resampled within those seed strata, as on ORB-1.
+  one seed per case (case mod 5), so the seeds and then the cases within each seed are resampled, as on
+  ORB-1 (AS1 likewise).
+* Seed-level t-test (added 2026-11-17, §15, before any comparison had data): every paired comparison also
+  reports the t-test on its per-seed differences (the 5 training seeds as the units, 4 df), next to its
+  bootstrap. Verdicts follow the rules below; a verdict the t-interval does not support is marked in T05
+  (`boot_t_disagree`) and in the report.
 * Every estimate is reported with its interval, including failures. Secondary metrics are exploratory.
 * Added 2026-11-11 (§15), no criterion changed:
   * **Verdicts need complete data.** The analysis runs on every "Run all". A pass/fail criterion is decided
@@ -535,7 +542,7 @@ heat load, RCS fuel, reversals, planning ms), plus:
 | # | Question | Passes if |
 |---|---|---|
 | Q1 | accuracy requirement, per arm | requirement LCB ≥ 0.99865 over the flights the arm flew (descriptive pass/fail, no p-value) |
-| Q2 | crew g limits, per arm | fraction of g-duration-compliant flights with a Clopper–Pearson interval (descriptive) |
+| Q2 | crew g limits, per arm | fraction of g-duration-compliant flights with a two-sided 95% Clopper–Pearson interval (descriptive) |
 | Q3 | v2 vs the published laws on the standard scenario (Holm over 2) | success@5km `v2single − fnpeg` and `v2single − predguid` on block 1, > 0 with 95% CI excluding 0 and Holm p < 0.05 |
 
 Added 2026-11-11 (§15), estimates only (table T08b): Q3 again (a) on the load-feasible cases (the frozen
@@ -578,12 +585,15 @@ Statistics as DS1 (§6). AS1 is a separate family, so it cannot change any RQ1�
 
 Built by `jepa/build_notebook_v5.py` (reuse `AUTO_DISCONNECT_CODE`, `DONE_MD`, `DONE` from
 `build_notebooks_v3.py` and v4's Settings-cell pattern: `MODE`, `RUN` per stage, `AUTO_DISCONNECT`,
-`CPU_WORKERS`, `GPU_WORKERS`). Colab metadata: GPU, T4 (L4 until 2026-11-17, §15). **Resume rule as v4: after any disconnect, Run
+`CPU_WORKERS`, `GPU_WORKERS`). Colab metadata: GPU, L4 (a T4 for part of 2026-11-17, before any GPU work;
+§15). **Resume rule as v4: after any disconnect, Run
 all continues where it stopped**; nothing finished is redone. CPU-only runtimes skip GPU stages with a
-message, so analysis and report can run cheaply. Since 2026-11-16 (§15) a GPU runtime by default skips the
-CPU-pool test flights with a message (`GPU_PASS_SKIPS_CPU = True` in the Settings cell; the gates and tuning
-still run there if not done, because the GPU stages need them), so the run is done in passes the user switches
-by hand, CPU → T4 → CPU, each releasing the runtime at its end and printing what the next pass must do.
+message. Since 2026-11-16 (§15) a GPU runtime skips the CPU-pool test flights (`GPU_PASS_SKIPS_CPU = True` in
+the Settings cell), and since 2026-11-17 every CPU stage: the gates and S0 (a GPU pass refuses to start if they
+are not done), FNPEG/PredGuid tuning, the analysis and the report; section 15b releases a GPU pass's runtime once
+its GPU work is done. RL tuning's DEV48 scoring flights are the exception and fly in the GPU pass. The run is done
+in passes the user switches by hand, CPU → L4 → CPU, each releasing the runtime at its end and printing what the
+next pass must do.
 
 | # | Section | Resume behavior |
 |---|---|---|
@@ -857,6 +867,17 @@ lowest mean peak g). RL tuning runs at 10 % of the budget on the fast env and is
 full-simulator flights; RL tuning starts only once FNPEG is chosen (the expert of two methods).
 Untuned guidance flights are never written as test flights (`untuned` jobs wait).
 
+**PredGuid's tuning is a 4-D search on DEV48** (added 2026-11-17, audit C3, §15). Every DEV48 flight goes initial
+roll → ballistic → final, so four of the eight ranges never change a command there: with Q7F, Q19, KA and K_ρ's
+filter gain all at the low end, or all at the high end, each of the 48 DEV48 conditions flies bit-identically to
+the defaults (commanded bank, trajectory and miss). Only the logged density estimate differs: K_ρ's gain sets it,
+and only the up-control predictor reads it. Q7F and Q19 act in HUNTEST and up-control only. The initial roll's
+D > KA test comes out the same for every KA in the range. LATBIAS at its high end, the positive control, changes
+39 of the 48 (miss −2.4 to +4.4 km). So the tuning searches LATBIAS, KLAT, overcontrol and GMAX. The ranges and the
+24 configurations stay as frozen. The chosen values of the other four are random draws that DEV48 could not
+rank, and they would matter only on a test entry that enters HUNTEST or up-control. Each flight records its
+phase sequence (`predguid_phases`).
+
 **E3 models (`jepa/models_v5.py`).** Each arm's width is the one whose parameter count is closest to
 R0's (bisection): R0 has 2,454,531 parameters; `mlp_direct` 4 hidden layers of width 831 over the flattened 120 s window (2,454,781, +0.01 %), `gru_direct` 2-layer GRU, hidden 449 (2,454,690, +0.01 %), `gru_pi` 2-layer GRU, hidden 441, with v2's state-aware PI prober (hidden 128) (2,455,767, +0.05 %), `r0_nojepa` = R0 (2,454,531). Training: R0's recipe (36,000 steps, batch 256, AdamW lr 6e-4 → 2e-5
 cosine, 1,000 warm-up, weight decay 0.05, clip 1, curriculum 24/48/96 steps at 0/20/50 %, AMP), free-running
@@ -877,7 +898,9 @@ no latent prediction loss, no SIGReg; saved as a v2 checkpoint, flown by v4's V2
 * Policy: MLP 256-256 with a running observation normalizer. DAgger and BC → PPO: "magsign" head
   (|σ| Gaussian on a sigmoid mean, sign Bernoulli), so reversals are not averaged away; PPO: Gaussian on
   σ (tanh MLP); SAC: tanh-squashed Gaussian (ReLU MLP).
-* DAgger expert = FNPEG on the fast env's flights at 5 s decisions, filters at β^5.
+* DAgger expert = FNPEG on the fast env's flights at 5 s decisions, filters at β^5 with β the tuned FNPEG's
+  (`fnpeg_cfg["filter_beta"]`; `RLCfg.expert_beta_1hz = 0.9` only when the chosen configuration has none,
+  i.e. configuration 0; §15, 2026-11-17).
 * `ppo_matched`: PPO in the full simulator, complete episodes per update (50), the world models' 6,000
   episodes.
 * Fast-env evaluation (`fast_eval.json`): the training distribution (2,048 episodes) and the A256 cases
@@ -887,8 +910,9 @@ no latent prediction loss, no SIGReg; saved as a v2 checkpoint, flown by v4's V2
 flights are v4's (E0b-corrected); R-each pairs RL seed k with `v2single` seed k (seeds 0–4 since
 2026-11-15; were 0–2); Holm as §8; `met`
 requires p_Holm < 0.05 and the seed rule; J-mech uses 300 s to go (the longest available if 300 s is
-missing). ORB-1 Q1/Q2 per arm with Clopper–Pearson (90 %), Q3 by a stratified paired bootstrap over
-cases. Landing errors are drawn in the nominal entry frame (downrange/crossrange of the nominal EI).
+missing). ORB-1 Q1 per arm with the one-sided 90% Clopper–Pearson lower bound, Q2 with a two-sided 95%
+Clopper–Pearson interval (the code's; this line said 90% until 2026-11-17, §15), Q3 by a two-stage paired
+bootstrap (training seeds, then cases within each seed) with the seed-level t-test beside it. Landing errors are drawn in the nominal entry frame (downrange/crossrange of the nominal EI).
 
 **Throughput (smoke, 2026-11-14).** Measured on this laptop's CPU (12 logical cores) in the smoke study of
 check 10 while check 14's study ran beside it, so every number is pessimistic; smoke models are tiny (the
@@ -1257,6 +1281,76 @@ saturated.
   still raises; a V4 verdict cached under the old rule is re-scored from the same flights (V4.json keeps
   `pass_before_amendment`). No flight is flown again. Consequences stated in §16 (PredGuid's per-case misses are
   rounding-sensitive; its DEV48 tuning choice is partly chance). Smoke check 1.
+* **2026-11-17, all GPU work on an L4, RL included; Kaggle dropped (user decision; replaces the T4 entry
+  above and the 2026-11-16 Kaggle entry).** `GPU_TYPE = "L4"` (Settings cell, full mode). E3 training, RL tuning
+  and training, MPPI flights, open loop and GPU timing all run on Colab's L4 (`00_study/gpu_platform.json`, fixed
+  by the first GPU session; `study_v5.check_gpu_platform` matches the type as a whole word, so an L40S is
+  refused). Reasons: (1) RQ2's reference R0 trained and flew on an L4 in v4 (native bf16, TF32), so the E3 arms,
+  `r0_nojepa` above all, now share its GPU type and numeric path; on a T4 they would have run emulated bf16
+  without TF32 (audit B2), a confound of the arm meant to isolate the JEPA objective. (2) Every RL run now trains
+  on the same GPU type as the learned models, in the notebook (`RL_ON_KAGGLE` and the notebook's Kaggle steps are
+  removed; `kaggle_v5.py`, its notebook and smoke check 16 stay in the repository, retired). The RL resume lock
+  (`rl_v5.HW_SAME`) now locks the GPU type and platform tag only; torch, CUDA and CPU changes are logged in the
+  run's `hardware.json` (`resumes`), the policy `check_gpu_platform` already had, because Colab updates torch
+  between sessions and a lock would strand a half-trained run. Cost: about 2.7× the T4's units per hour; budget,
+  not a study setting. No GPU session and no RL run had started (`00_study` has no `gpu_platform.json`), so the
+  study folder frozen on 2026-11-16 continues. Smoke check 1.
+* **2026-11-17, a GPU pass does only GPU work and then releases the runtime (user request; notebook only).**
+  On a GPU runtime the notebook skips every CPU stage: FNPEG/PredGuid tuning, the CPU-pool flights, the analysis
+  and the report; it refuses to start (and so releases the runtime) if gate S0 or V1–V4/E0 is not done. A new
+  cell after the last GPU stage (section 15b) writes the status, prints what the next pass must do and releases
+  the runtime, so no CPU stage runs on the GPU. The one exception is RL tuning's DEV48 scoring: each RL
+  configuration's 48 full-simulator flights fly in the GPU pass, between trainings. GPU work that needs a CPU
+  result first waits and is counted (`mppi_filtered` and RL: FNPEG's tuning; `v2single@fnpeg_matched`: FNPEG's
+  A256 flights). Smoke check 1 checks the order.
+* **2026-11-17, `mppi_filtered` and the RL experts use FNPEG's tuned filter β (audit A2; before any of these
+  arms ran).** §4.1 says "β tuned" and `mppi_filtered` is "FNPEG's filters" (§4.2), but the code used β = 0.9 for
+  both `mppi_filtered` (`FilteredPhysicsAdapter`) and the DAgger/BC expert (`FastExpert` overwrote the tuned
+  value with `RLCfg.expert_beta_1hz`). Now `mppi_filtered`'s model carries `fnpeg_filter_beta` (from
+  `03_tuning/fnpeg/chosen.json`, FNPEG's default 0.9 if the chosen configuration has none), its flights wait for
+  FNPEG's tuning like FNPEG's own, the adapter cache is keyed on β, and the expert keeps the tuned β^5. So G5
+  compares v2 with the estimator FNPEG actually uses, and R-imit measures imitation, not an expert mismatch.
+  Flight ids are unchanged (β is not part of them); no `mppi_filtered` or RL flight existed (E0 flies frozen
+  filters only).
+* **2026-11-17, ORB-1/DS1/AS1 bootstrap resamples the training seeds; a seed-level t-test beside every paired
+  verdict (audit A1 and B1; analysis only, before any v5 comparison had data: FNPEG and PredGuid are still
+  being tuned and no MPPI flight has run).** On ORB-1, DS1 and AS1 each case is flown by one seed of a learned
+  arm (case mod 5). `orb_paired` resampled cases within those seed blocks but kept the 5 seeds fixed, so its
+  interval ignored the variation between the 5 trained models. In a simulated null (the recipe no better than the
+  comparator, `v5_code_audit.md` A1) it rejected 5.2%, 15.5%, 35.8% and 58.5% of the time on 1,000 cases at a
+  per-seed spread (SD) of 0, 2.8, 5.7 and 11.3 pp. Now it is two-stage, A256's scheme: draw the seeds with
+  replacement, then the cases within each drawn seed. Same null: 1.3%, 3.3%, 9.7%, 14.3% on 1,000 cases and
+  0.8–3.0% on 64. With 5 seeds a bootstrap is still too narrow when the seeds differ a lot, so every paired
+  comparison (A256's G, J, R families and J-equiv included, B1) also reports the t-test on its per-seed
+  differences (5 units, 4 df; 3.7–5.3% in the same simulation). The verdict rules of §8 are unchanged (bootstrap,
+  seed rule, Holm); T05 carries `t_lo`, `t_hi`, `t_p`, `boot_t_disagree`, and the report marks a verdict the
+  t-interval does not support "(seed-level t disagrees)". Why report rather than gate: §8's rules were fixed
+  before the study, the t-test is a sensitivity analysis in the style of the clustered intervals (2026-11-11),
+  and a marked disagreement tells the reader exactly which verdicts rest on the 5-seed bootstrap alone. The
+  bootstrap cache is keyed on the new scheme, so nothing cached under the old one is reused. Also removed: dead
+  code after `as1_analysis`'s return.
+* **2026-11-17, ORB-1 Q2's interval is 95% (audit C1; text corrected to the code).** §14 said "Q1/Q2 per arm with
+  Clopper–Pearson (90 %)". Q2's interval (`benchmark_v5.score`) has always been two-sided 95%; Q1's bound is
+  one-sided 90% (`requirement_lcb`), as §8.4 says. Q2 is descriptive; nothing else changes.
+* **2026-11-17, RL learning-curve snapshots at fractions of either budget (audit C8; before any RL run).** The 5
+  snapshots were placed at fractions of `budget_decisions` only, so a run that stopped at its wall-clock cap first
+  would lose its later points. Now snapshot i is saved once the run has used (i + 1)/5 of its decisions or of its
+  wall time, whichever comes first, and any point not reached when training ends is the final policy (the one
+  flown). Each snapshot records its trigger (`decisions`, `wall_clock` or `final`), its decisions and its elapsed
+  time; F05 plots decisions. Snapshots are measurements and do not affect training.
+* **2026-11-17, three defensive fixes that change no result (audit C4, C6, C9).** (C4) PredGuid's final-phase
+  design cache is keyed on the whole configuration, not six of its fields: the design's dry run also reads gmax_g,
+  overcontrol, Q7F, Q19 and K_ρ, which tuning varies. The old key was safe only because every tuning configuration
+  draws a different KA; flights before and after are bit-identical (6 DEV48 conditions × 6 configurations in one
+  process). (C6) `legacy_jobs` raises if two legacy models would get the same arm name (the study's 5 have
+  distinct names). (C9) `models_v2.amp_dtype`'s docstring says fp16 on a T4; recent torch gives a T4 emulated bf16 (the L4 native bf16). The correction is a comment at its use in `models_v5.train_e3`, because `models_v2.py` stays byte-identical to the v4 commit (smoke check 11).
+* **2026-11-17, PredGuid's tuning is effectively 4-D (audit C3; documentation only).** On the tuning's own ground
+  truth (all 48 DEV48 conditions, 12 cases × 4 atmospheres, flown as `tune_guidance` flies them), Q7F, Q19, KA
+  and K_RHO_FILTER_GAIN, all four at the low or all at the high end of their ranges, leave every flight
+  bit-identical to the defaults, except the logged density estimate (`dec_Krho_est`, `predguid_Krho_final`), which
+  no phase flown on DEV48 reads. LATBIAS at its high end, the positive control, changes 39 of 48. Every DEV48 flight
+  goes initial roll → ballistic → final. `PREDGUID_SPACE` is not changed, because tuning had started (§14 says
+  what this means for T10).
 
 ---
 
@@ -1272,19 +1366,49 @@ in their own Holm family so that RQ1–RQ4 are unchanged, and AS1 (§3.4b) one M
 error (the published Orion lift and drag). v5 still does not test winds, navigation errors or sensor
 noise, and its results do not carry over to them.
 
-**RL trained on other hardware than the learned models** (added 2026-11-16, §15; `jepa/kaggle_rl.md`). Every
-RL run trained on one Kaggle T4 in one pinned environment, each capped at 3 h of wall time (or its decision
-budget); the world models and E3 models trained on Colab GPUs (v5's own GPU work, E3 training and MPPI
-flights included, on one GPU type, a T4: `00_study/gpu_platform.json`, §15 2026-11-17). The RL arms are comparable with each other; the
-cap is hardware-dependent, so each run's decisions reached are reported (T07), and a faster GPU could have given
-the RL arms more training within the same cap.
+**RL runs are capped in wall time** (added 2026-11-16, rewritten 2026-11-17, §15). Every RL run tuned and
+trained on the study's one GPU type, an L4 (`00_study/gpu_platform.json`), the GPU type of the E3 models and of
+v4's R0; each run stops at its decision budget or its wall-time cap (3 h; `ppo_matched` 24 h), whichever comes
+first. The RL arms are comparable with each other; the cap depends on the hardware, so each run's decisions
+reached are reported (T07), and a faster GPU could have given the RL arms more training within the same cap.
 
-**PredGuid's misses depend on rounding** (added 2026-11-17, §15). PredGuid's bank reversals fire on the
-first guidance cycle the crossrange crosses a deadband, so near the end of a flight a microscopic difference (a
-platform's last-digit rounding, or 1e-8 of the entry speed) can move a reversal by one 2 s cycle and the landing by
-up to about 3 km. Its per-case misses are therefore partly chance (all study flights ran on one platform, Colab, so
-they are reproducible there); paired comparisons over 256 cases average this out, but single-case results and
-PredGuid's DEV48 tuning choice (12 cases per configuration) carry it. Gate V4 was amended for this reason.
+**Single landings depend on rounding** (added 2026-11-17, §15; extended the same day, `v5_code_audit.md` B3).
+PredGuid's bank reversals fire on the first guidance cycle the crossrange crosses a deadband, so near the end of a
+flight a microscopic difference (a platform's last-digit rounding, or 1e-8 of the entry speed) can move a reversal
+by one 2 s cycle and the landing by up to about 3 km. The other arms are less sensitive but not immune: FNPEG's
+landings moved by up to 0.43 km on one platform from 1e-8 of the entry speed (0.72 km across Windows and Linux),
+an MPPI flight with a learned model by about 0.5 km (measured with a smoke-test model), and the classical
+controller by under 0.01 km. An MPPI flight also depends on which flights share its lockstep batch (0.55 km for
+the smoke-test model, 0.25 m for `mppi_filtered`), so MPPI flights re-flown after a disconnect in the middle of a
+model run differ from an uninterrupted run. Resume is bit-exact for the guidance laws and the classical
+controller (a flight alone and in a batch are identical); an RL policy's commands can differ in float32's last
+digit with its batch (4e-7° in a check, the landing unchanged). Per-case misses are therefore partly chance. Paired comparisons over 256
+or more conditions average this out (the noise has no direction), but single-case results, the DEV48 tuning
+choices of PredGuid and FNPEG among near-tied configurations (12 cases per configuration), and success near the
+5 km threshold carry it. Gate V4 was amended for this reason.
+
+**Five seeds** (added 2026-11-17, §15). Each learned arm has 5 training seeds, and a verdict about a training
+recipe rests on those 5. The pre-registered bootstraps resample them, but with 5 clusters a bootstrap interval is
+too narrow when the seeds differ: in a simulated null with a per-seed spread of 5.7 or 11.3 pp, ORB-1's
+two-stage bootstrap rejected 9.7% or 14.3% of the time instead of 5%, and A256's about 11% at 11 pp
+(`v5_code_audit.md` A1, B1). The seed-level t-test beside each verdict (T05) holds its 5%; where it disagrees
+with the bootstrap, the report says so.
+
+**Heating is evaluated at the nominal density** (added 2026-11-17, `v5_code_audit.md` C7). The density knobs act
+on the aerodynamic forces only: `density_scale` through the reference area (since v1, so v1–v4 are the same) and
+DS1's altitude profile through the density in the equations of motion. The heating model
+(`math_3d.nominal_heating_envelope_from_state`) and the RL heat-margin feature read the standard atmosphere's
+density at the altitude flown. So peak heat rate and heat load in every table are the heating of the trajectory
+each arm flew, evaluated at nominal density, not the heating in the perturbed atmosphere: convective heating goes
+as √ρ, so a ±12% density error (A256's mismatch atmospheres) is about ±6% in heat rate, DS1's ±15% shears about
+±7%. On ORB-1 `density_scale` also carries the drag-coefficient dispersion, which should not change heating at
+all. No criterion uses heating. It was kept for continuity with v1–v4 (the simulator is not changed in v5).
+
+**PredGuid is tuned in 4 of its 8 settings** (added 2026-11-17, `v5_code_audit.md` C3, §14). DEV48's entries
+never reach PredGuid's HUNTEST or up-control phases, so Q7F, Q19, KA and K_ρ's filter gain cannot change a DEV48
+score. The tuning chose LATBIAS, KLAT, overcontrol and GMAX, and the other four are random draws from their
+ranges. A test entry that does reach those phases flies them with untuned values. Each flight records its phase
+sequence (`predguid_phases`).
 
 **One simulator, no flight data** (added 2026-11-15; `jepa/simulator_fidelity_audit.md`; AS1, §3.4b,
 tests the lift excess named here, with values read off published figures). Every
@@ -1327,7 +1451,8 @@ bootstrap treats the conditions as independent; the clustered intervals show how
 
 **RQ2's key arm changes two things.** `r0_nojepa` removes the JEPA losses and also trains end to end
 instead of in two stages, and each non-JEPA model's learning rate is picked from three values on one
-seed. A difference between it and R0 cannot be assigned to the objective alone.
+seed. A difference between it and R0 cannot be assigned to the objective alone. Both train and fly on an L4
+(R0 in v4, the E3 arms in v5, §15 2026-11-17), with the torch and CUDA versions of their sessions.
 
 **RL trains in a simplified simulator.** The policies learn in the fast environment (the physics port)
 and are tested in the full simulator, with five seeds per method (three before 2026-11-15); the gap

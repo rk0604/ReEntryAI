@@ -394,7 +394,7 @@ def load_adapter_v5(kind: str, ckpt: Optional[str] = None, device: str = "cpu", 
     """fly_v4.load_adapter_v4's kinds, plus physics_filtered(_frozen) and the E3 model kinds."""
     if kind in ("v1", "v2", "physics_nominal", "physics_truth", "prior"):
         return F4.load_adapter_v4(kind, ckpt, device, members, chunk, keep_only)
-    key = (kind, str(ckpt), str(device))
+    key = (kind, str(ckpt), str(device), tuple(sorted(kw.items())))   # kw: mppi_filtered's beta (audit A2)
     if keep_only:
         for k in [k for k in _ADAPTERS if k != key]:
             del _ADAPTERS[k]

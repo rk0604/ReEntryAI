@@ -390,6 +390,10 @@ def train_e3(model: nn.Module, ds_tr, ds_va, cfg: E3TrainCfg, device, L, state_p
     model.to(device)
     c2 = _cfg_v2(cfg)
     opt = torch.optim.AdamW(param_groups(model, cfg.weight_decay), lr=cfg.lr, betas=(0.9, 0.98))
+    # models_v2.amp_dtype returns bf16 whenever torch.cuda.is_bf16_supported() is True: native on the study's L4
+    # (and R0's, v4), emulated on a T4, which recent torch also reports as supported. Its docstring's "fp16 on older
+    # ones (T4)" is wrong; models_v2.py stays byte-identical to v4 (smoke check 11), so the correction is here
+    # (audit C9, 2026-11-17). fp16, and with it the GradScaler, only where torch reports no bf16 at all.
     dt_amp = V.amp_dtype(device) if cfg.amp else None
     scaler = torch.amp.GradScaler(device.type, enabled=dt_amp == torch.float16)
     gen = torch.Generator(device=ds_tr.device).manual_seed(int(seed) * 7919 + 11)

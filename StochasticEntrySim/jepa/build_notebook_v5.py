@@ -35,26 +35,32 @@ INTRO = f"""
 
 {BADGE}
 
-**How to run.** Open in Colab (badge above). It opens on a **T4 GPU** runtime; for the **first pass switch
-to a CPU runtime** (Runtime → Change runtime type; see *Passes* below), then **Runtime → Run all**. **After any disconnect, crash or runtime release, Run all again**: every stage
+**How to run.** Open in Colab (badge above). It opens on an **L4 GPU** runtime; for a **CPU pass switch
+to a CPU runtime** (Runtime → Change runtime type; see *Passes* below), then **Runtime → Run all**. Nothing in
+the notebook needs editing for either pass. **After any disconnect, crash or runtime release, Run all again**: every stage
 reads Drive, skips finished work in seconds and resumes half-done work from its last checkpoint (at most
 5 minutes of any training is lost). No cell ever needs editing to resume; Colab may only ask you to
 re-authorize the Drive mount. The notebook **disconnects itself** when the last cell finishes or a cell
 fails (so it never idles on paid compute units); set `AUTO_DISCONNECT = False` in the Settings cell to
 keep the runtime.
 
-**Passes (switch the runtime type yourself; nothing switches it for you).** On a GPU runtime the notebook
-does only GPU work by default (`GPU_PASS_SKIPS_CPU = True` in the Settings cell): training, MPPI flights and
-open loop, plus the gates and tuning if they are not done yet, because the GPU stages need them. The CPU-pool
-test flights (guidance laws, classical, RL policies, legacy RL) are left for a CPU runtime, which is cheaper
-for them. On a CPU runtime the GPU stages print what remains and skip. The suggested order is
-**CPU → T4 → CPU**: (1) a high-CPU CPU runtime for the gates, tuning and the guidance-law flights;
-(2) T4 for training and the MPPI flights; (3) a CPU runtime for the trained RL policies' flights, the analysis
-and the report. Each pass disconnects itself at the end, and its last cell prints what the next pass has to
-do. Repeat a pass if it was cut short. `GPU_PASS_SKIPS_CPU = False` flies everything on one runtime.
-**All GPU work runs on one GPU type, a T4** (`GPU_TYPE` in the Settings cell; the cheapest Colab GPU, and the
-work is a fixed number of steps and flights, so a slower GPU only takes longer). The first GPU session records it
-in `00_study/gpu_platform.json`; a session on any other GPU stops at setup and releases the runtime.
+**Passes (switch the runtime type yourself; nothing switches it for you).** On the L4 the notebook does only GPU
+work (`GPU_PASS_SKIPS_CPU = True` in the Settings cell): E3 training, RL tuning and training, MPPI flights, open
+loop and the timing table. Every CPU stage (gates, guidance-law tuning, the CPU-pool test flights of the guidance
+laws, classical, RL policies and legacy RL, the analysis and the report) waits for a CPU runtime, which is cheaper
+for it, and **a GPU pass releases the runtime as soon as its GPU work is done** (section 15b), so no CPU stage ever
+runs on the GPU. RL tuning's DEV48 scoring flights are the one exception: each RL configuration's score needs its
+48 full-simulator flights before the next step, so they fly inside the GPU pass (minutes per configuration). On a
+CPU runtime the GPU stages print what remains and skip. The order is **CPU → L4 → CPU**: (1) a high-CPU CPU
+runtime for the gates, tuning and the guidance-law flights; (2) the L4 for training, RL and the MPPI flights;
+(3) a CPU runtime for the trained RL policies' flights, the analysis and the report. Each pass disconnects itself
+at the end and prints what the next pass has to do. Repeat a pass if it was cut short. GPU work that needs a CPU
+result first (`mppi_filtered` and RL need FNPEG's tuning; `v2single@fnpeg_matched` needs FNPEG's A256 flights)
+waits and is listed. `GPU_PASS_SKIPS_CPU = False` runs everything on one runtime.
+**All GPU work runs on one GPU type, an L4** (`GPU_TYPE` in the Settings cell): v4's R0 was trained and flown on an
+L4, so RQ2's comparison with R0 runs on the same GPU type and numeric path (native bf16, TF32). The first GPU session
+records it in `00_study/gpu_platform.json`; a session on any other GPU stops at setup and releases the runtime.
+RL trains here too (it moved back from Kaggle on 2026-11-17, `jepa/v5_plan.md` §15).
 
 **Tiers (decision D1).** `TIER = 1` (default) runs the gates, legacy RL re-evaluation, tuning, the A256
 arms (FNPEG, PredGuid, MPPI + filtered physics, v2 at FNPEG's load), ORB-1 block 1, the four non-JEPA
@@ -96,12 +102,10 @@ RUN_OVERRIDE = {}               # e.g. {"ORB1_block1": False} to skip a stage th
 AUTO_DISCONNECT = IN_COLAB      # release the runtime when the notebook finishes or a cell fails; False keeps it
 CPU_WORKERS = None              # guidance-law, policy and classical flights, one simulator per core (None = every core)
 GPU_WORKERS = None              # MPPI flights sharing the GPU (None = 6 GB each, 2 GB spare, at most 4)
-GPU_TYPE = "T4" if MODE == "full" else None   # the one GPU type of all GPU work (00_study/gpu_platform.json);
-                                # any other GPU is refused at setup
-GPU_PASS_SKIPS_CPU = True       # on a GPU runtime, leave the CPU-pool test flights for a (cheaper) CPU runtime;
-                                # False flies everything on whatever runtime this is
-RL_ON_KAGGLE = MODE == "full"   # every RL run (tuning and training) trains on Kaggle, one platform for all of them
-                                # (jepa/kaggle_rl.md); this notebook only exports the inputs and imports the results
+GPU_TYPE = "L4" if MODE == "full" else None   # the one GPU type of all GPU work, RL included
+                                # (00_study/gpu_platform.json); any other GPU is refused at setup
+GPU_PASS_SKIPS_CPU = True       # on a GPU runtime, do only GPU work and release the runtime when it is done (15b);
+                                # the CPU stages wait for a (cheaper) CPU runtime. False runs everything here
 """
 
 SETUP = r"""
@@ -163,7 +167,8 @@ if DEVICE == "cuda":                                                   # one GPU
     GPU_PLATFORM = S5.check_gpu_platform(L, RUNTIME, GPU_TYPE, {"torch": torch.__version__, "cuda": torch.version.cuda},
                                          LOG)
 CAN_GPU = DEVICE == "cuda" or MODE == "smoke"       # GPU stages; in smoke mode the CPU stands in for the GPU
-CAN_CPU = not (GPU_PASS_SKIPS_CPU and DEVICE == "cuda")   # CPU-pool test flights (gates and tuning always run)
+CAN_CPU = not (GPU_PASS_SKIPS_CPU and DEVICE == "cuda")   # CPU stages: gates, guidance tuning, CPU-pool flights,
+                                                          # analysis, report (False: a GPU pass, section 15b)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 if DEVICE == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -189,10 +194,11 @@ LOG("RUN this session: " + ", ".join(k for k, v in RUN.items() if v))
 for _a in FROZEN.get("amendments", []):
     LOG(f"amendment {_a['date']}: {_a['key']} {_a['from']:.4g} -> {_a['to']:.4g} (v5_plan.md section 15)")
 if MODE == "full" and DEVICE != "cuda":
-    LOG("CPU pass: training, MPPI flights and open loop only report what remains (Runtime -> Change runtime type -> T4).")
+    LOG(f"CPU pass: training, RL, MPPI flights and open loop only report what remains (Runtime -> Change runtime "
+        f"type -> {GPU_TYPE}).")
 if not CAN_CPU:
-    LOG("GPU pass (GPU_PASS_SKIPS_CPU): the CPU-pool test flights only report what remains; the gates and tuning still "
-        "run here if they are not done, because the GPU stages need them.")
+    LOG("GPU pass (GPU_PASS_SKIPS_CPU): only GPU work runs; every CPU stage reports what remains, and section 15b "
+        "releases the runtime when the GPU work is done.")
 """
 
 STATUS = r"""
@@ -209,6 +215,9 @@ print(f"{ST['flights_done']}/{ST['flights_total']} flights, {ST['trainings_done'
 BENCH = r"""
 if RUN["benchmark"]:
     log = L.logger("benchmark")
+    if not CAN_CPU and not (L.checks / "S0.done").exists():
+        raise RuntimeError("gate S0 is not done yet and is CPU work: run a CPU pass first (Runtime -> Change runtime "
+                           "type -> CPU, then Run all). This GPU runtime is released now.")
     S0 = S5.gate_s0(CFG, L, None if (L.checks / "S0.done").exists() else need_data(), log)
     log(f"[benchmark] gate S0 pass={S0.get('pass')}, checksums={S0.get('checksums')}, "
         f"targets inside the footprint={S0.get('targets_inside')}, "
@@ -222,7 +231,7 @@ LEGACY = r"""
 if RUN["legacy"]:
     log = L.logger("legacy")
     FINALS = S5.legacy_inventory(CFG, L, LEGACY_ROOT if LEGACY_ROOT and os.path.isdir(LEGACY_ROOT) else None, log)
-    if FINALS:
+    if FINALS and CAN_CPU:
         try:
             import stable_baselines3
         except ImportError:
@@ -230,16 +239,18 @@ if RUN["legacy"]:
                 %pip install -q stable-baselines3
             else:
                 raise
-        if CAN_CPU:
-            S5.run_cpu(CFG, S5.legacy_jobs(CFG, L, FINALS), L, CPU_WORKERS, log, "legacy RL")
-        else:
-            log("legacy RL flights wait for a CPU runtime (GPU_PASS_SKIPS_CPU)")
+        S5.run_cpu(CFG, S5.legacy_jobs(CFG, L, FINALS), L, CPU_WORKERS, log, "legacy RL")
+    elif FINALS:
+        log("legacy RL flights wait for a CPU runtime (GPU_PASS_SKIPS_CPU)")
     display(pd.read_csv(L.study / "legacy_rl_inventory.csv").head(30))
 """
 
 GATES = r"""
 if RUN["gates"]:
     log = L.logger("gates")
+    if not CAN_CPU and S5.gates_missing(L):
+        raise RuntimeError(f"gate(s) {S5.gates_missing(L)} are not done yet and fly on the CPU: run a CPU pass first "
+                           "(Runtime -> Change runtime type -> CPU, then Run all). This GPU runtime is released now.")
     GATES = S5.gates(CFG, L, L3, CPU_WORKERS, log)
     display(pd.DataFrame([{"gate": k, "pass": v.get("pass"), **{x: y for x, y in v.items()
                            if isinstance(y, (int, float, bool)) and x != "pass"}} for k, v in GATES.items()]))
@@ -252,11 +263,12 @@ if RUN["gates"]:
 TUNING = r"""
 if RUN["tuning"]:
     log = L.logger("tuning")
-    TUNED = S5.tune_guidance(CFG, L, CPU_WORKERS, log)
+    if CAN_CPU:
+        TUNED = S5.tune_guidance(CFG, L, CPU_WORKERS, log)
+    elif not (S5.is_tuned(L, "fnpeg") and S5.is_tuned(L, "predguid")):
+        log("FNPEG / PredGuid tuning waits for a CPU runtime (GPU_PASS_SKIPS_CPU); mppi_filtered and RL wait for it")
     RL_ARMS = list(S5.RL_TIER1) + (list(S5.RL_TIER2) if CFG.tier >= 2 else [])
-    if RL_ON_KAGGLE:
-        log("RL tuning runs on Kaggle (ReEntryAI_JEPA_v5_kaggle_rl.ipynb); section 11 exports its inputs")
-    elif CAN_GPU:
+    if CAN_GPU:                         # trains on the GPU; each configuration's 48 DEV48 scoring flights fly here
         S5.tune_rl(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log)
     else:
         log("RL tuning waits for a GPU runtime")
@@ -301,22 +313,12 @@ E4_TRAIN = r"""
 RL_ARMS = list(S5.RL_TIER1) + (list(S5.RL_TIER2) if RUN["tier2_rl"] else [])
 if RUN["E4_train"]:
     log = L.logger("E4_train")
-    if RL_ON_KAGGLE:
-        from jepa import kaggle_v5 as K
-        K_IN = K.export_inputs(L, log)
-        if K_IN:
-            log(f"Kaggle input: {K_IN} (upload it once as a Kaggle dataset; jepa/kaggle_rl.md)")
-        K_FROM = K.kaggle_dir(L) / "from_kaggle"
-        if (K_FROM / K.STATE_TAR).exists():
-            K.import_rl(L, K_FROM, log)
-        else:
-            log(f"no Kaggle RL results yet: put the newest session's {K.STATE_TAR} and {K.MANIFEST} in {K_FROM}")
-        done = sum((L.policy_dir(a, s) / "policy.pt").exists() for a in RL_ARMS for s in CFG.rl_seeds)
-        log(f"RL policies on Drive: {done}/{len(RL_ARMS) * len(CFG.rl_seeds)}; their flights wait for the rest")
-    elif CAN_GPU:
+    if CAN_GPU:
         S5.train_rl_stage(CFG, L, RL_ARMS, DEVICE, log)
     else:
         log("RL training waits for a GPU runtime")
+    done = sum((L.policy_dir(a, s) / "policy.pt").exists() for a in RL_ARMS for s in CFG.rl_seeds)
+    log(f"RL policies on Drive: {done}/{len(RL_ARMS) * len(CFG.rl_seeds)}")
     p = L.policy_dir(RL_ARMS[0], CFG.rl_seeds[0]) / "F_curves.png"
     if p.exists():
         display(Image(str(p)))
@@ -366,10 +368,29 @@ if RUN["open_loop"]:
         log("open loop waits for a GPU runtime")
 """
 
+TIMING = r"""
+if RUN["timing"]:
+    if CAN_GPU:
+        S5.timing_stage(CFG, L, L3, DEVICE, L.logger("timing"))
+    else:
+        L.logger("timing")(f"the timing table waits for a {GPU_TYPE} runtime (its MPPI arms are timed on the GPU)")
+"""
+
+GPU_END = r"""
+if not CAN_CPU:                         # a GPU pass: its GPU work is done; everything after this is CPU work
+    S5.status(CFG, L, S5.all_stage_jobs(CFG, L, L3), RUNTIME)
+    S5.update_manifest(L)
+    print(S5.next_pass_note(GPU_TYPE) or "NEXT PASS: a CPU runtime for the analysis and the report.")
+    print("The analysis and the report run on the next CPU pass (Runtime -> Change runtime type -> CPU, then Run all).")
+    release_runtime("GPU pass finished: the CPU stages wait for a CPU runtime")
+else:
+    print("CPU runtime: continuing with the analysis and the report")
+"""
+
 ANALYSIS = r"""
-if RUN["timing"] and (CAN_GPU or MODE == "smoke"):
-    S5.timing_stage(CFG, L, L3, DEVICE, L.logger("timing"))
-if RUN["analysis"]:
+if RUN["analysis"] and not CAN_CPU:
+    print("the analysis waits for a CPU runtime (GPU_PASS_SKIPS_CPU)")
+elif RUN["analysis"]:
     t0 = time.time()
     R = A5.analyze(CFG, L, L3, L4, log=L.logger("analysis"))
     pd.set_option("display.max_colwidth", 140)
@@ -384,14 +405,16 @@ if RUN["analysis"]:
 """
 
 REPORT = r"""
-S5.status(CFG, L, S5.all_stage_jobs(CFG, L, L3), RUNTIME)
-if S5.WAITING["cpu"] or S5.WAITING["gpu"]:
-    print(f"NEXT PASS: {S5.WAITING['cpu']} flights wait for a CPU runtime, {S5.WAITING['gpu']} MPPI flights (and any "
-          f"training) for a {GPU_TYPE or 'GPU'} runtime. Runtime -> Change runtime type, then Run all.")
-if RUN["report"]:
-    print("report:", R5.build_report(L))
-S5.update_manifest(L)
-print(open(L.study / "README.md", encoding="utf-8").read()[:3000])
+if CAN_CPU:
+    S5.status(CFG, L, S5.all_stage_jobs(CFG, L, L3), RUNTIME)
+    if S5.next_pass_note(GPU_TYPE):
+        print(S5.next_pass_note(GPU_TYPE))
+    if RUN["report"]:
+        print("report:", R5.build_report(L))
+    S5.update_manifest(L)
+    print(open(L.study / "README.md", encoding="utf-8").read()[:3000])
+else:
+    print("the report waits for a CPU runtime (GPU_PASS_SKIPS_CPU)")
 """
 
 CELLS = [
@@ -461,14 +484,15 @@ Vf from the DEV48 classical flights, then random search: 24 configurations each 
 (configuration 0 = the defaults), then 12 more around each law's best (`refine.json` records them), and 12 per RL
 method at a reduced budget. Objective: success@5km, then mean log miss, subject to mean peak g ≤ 4.6 g. Each
 configuration's DEV48 score is saved as `03_tuning/<method>/config_<j>.json` when its flights are done;
-`chosen.json` freezes the choice. Test flights of a method wait until it is chosen.
+`chosen.json` freezes the choice. Test flights of a method wait until it is chosen. FNPEG and PredGuid tune on a CPU
+runtime; RL tunes on the GPU once FNPEG is chosen (each RL configuration's 48 scoring flights fly in the same pass).
 """),
     ("code", TUNING),
     ("md", r"""
 ## 7. A256: FNPEG, PredGuid, MPPI + filtered physics, v2 at FNPEG's load
 
-The guidance laws on a CPU pool (one lockstep batch per task), `mppi_filtered` for 5 noise indices on the GPU, then
-`v2single@fnpeg_matched` (soft g limit = FNPEG's realized peak g on each condition). One JSON + `.npz` per flight
+The guidance laws on a CPU pool (one lockstep batch per task), `mppi_filtered` for 5 noise indices on the GPU (its
+filter uses FNPEG's tuned β, so it waits for FNPEG's tuning), then `v2single@fnpeg_matched` (soft g limit = FNPEG's realized peak g on each condition). One JSON + `.npz` per flight
 the moment it lands; finished flights are skipped.
 """),
     ("code", A256),
@@ -501,13 +525,12 @@ environment (ppo_matched: the full simulator). Checkpoints every 5 minutes with 
 state; learning curves redrawn at each; `policy.pt` marks a run done; then each policy's fast-environment success
 (the fast side of the fast-vs-full gap).
 
-**In the full study every RL run trains on Kaggle** (`RL_ON_KAGGLE`, `jepa/kaggle_rl.md`): one platform and one
-GPU type for all RL tuning and training, so the RL arms stay comparable. This cell (any runtime, cheap) then
-(1) writes `00_study/kaggle/to_kaggle/v5_rl_inputs.json` once FNPEG is tuned: upload it once as a Kaggle dataset
-for `ReEntryAI_JEPA_v5_kaggle_rl.ipynb`; (2) imports the RL results: download the newest Kaggle session's
-`v5_rl_state.tar` and `v5_rl_manifest.json` (that notebook's Output tab) into `00_study/kaggle/from_kaggle/` on
-Drive and run this cell. Every file is checked against its sha256, only finished runs are imported, and a file
-that differs from one already on Drive stops the import before anything is written.
+**Every RL run (tuning and training) trains here, on the study's one GPU type** (the L4,
+`00_study/gpu_platform.json`), so the RL arms share one platform with each other and with the E3 models. Kaggle is no
+longer used (2026-11-17, `jepa/v5_plan.md` §15). The DAgger and BC experts use FNPEG's **tuned** filter β (from its
+`chosen.json`), so RL is compared with the law that was tuned. A run resumes on any later L4 session; a newer torch or
+CUDA there is logged in the run's `hardware.json`, not refused. RL is the largest GPU cost of the study: check the
+units left before a long pass (the status cell's projection).
 """),
     ("code", E4_TRAIN),
     ("md", r"""
@@ -562,13 +585,29 @@ Footprint error of each E3 model and seed on the test split from 400 to 50 s to 
 """),
     ("code", OPEN_LOOP),
     ("md", r"""
-## 15. Compute per decision, then the analysis
+## 15. Compute per decision (GPU runtime)
 
-RQ5's timing table (one flight per arm, single CPU thread and GPU), then every table T01–T14, figure F01–F10 (PNG
-and PDF, 200 dpi), `captions.json` and the criteria (G1–G7, J, R, Q, D, A). The timing table has the classical
-controller twice: as flown, and with its diagnostic interval heat screen off (`classical_noscreen`). Bootstrap results are cached by comparison
-and input hash. Runs on any runtime and reports whatever exists: a criterion whose flights are not all there is
-shown as **pending** with provisional numbers, never as met or not met.
+RQ5's timing table: one flight per arm, single CPU thread, and on the GPU for the MPPI arms. The classical controller
+appears twice: as flown, and with its diagnostic interval heat screen off (`classical_noscreen`). A law is timed once
+it is tuned, an RL arm once its seed-0 policy exists. Cached per (arm, device).
+"""),
+    ("code", TIMING),
+    ("md", r"""
+## 15b. A GPU pass ends here
+
+On a GPU pass (`GPU_PASS_SKIPS_CPU`) every GPU stage is above. This cell records the status, prints what the next
+pass has to do and **releases the runtime**, so the analysis, the report and the CPU-pool flights never run on (and
+pay for) the GPU. On a CPU runtime it does nothing.
+"""),
+    ("code", GPU_END),
+    ("md", r"""
+## 15c. Analysis (CPU runtime)
+
+Every table T01–T14, figure F01–F10 (PNG and PDF, 200 dpi), `captions.json` and the criteria (G1–G7, J, R, Q, D,
+A). Each paired comparison reports a two-stage bootstrap (seeds, then cases within each seed's stratum) and a
+seed-level t-interval (the 5 training seeds as the units); a verdict the two disagree on is flagged. Bootstrap
+results are cached by comparison and input hash. Reports whatever exists: a criterion whose flights are not all
+there is shown as **pending** with provisional numbers, never as met or not met.
 """),
     ("code", ANALYSIS),
     ("md", r"""
@@ -592,7 +631,7 @@ def build() -> str:
         c["id"] = f"v5-cell-{i:02d}"                 # stable ids: rebuilding gives the same file
     nb["metadata"] = {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
                       "language_info": {"name": "python"}, "accelerator": "GPU",
-                      "colab": {"gpuType": "T4", "provenance": []}}
+                      "colab": {"gpuType": "L4", "provenance": []}}
     path = os.path.join(SIM, NAME)
     nbf.validate(nb)
     nbf.write(nb, path)
