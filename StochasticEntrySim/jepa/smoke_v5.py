@@ -1295,9 +1295,12 @@ def t16_kaggle(work: Path) -> None:
     from jepa import study_v5 as S5
     subprocess.run([sys.executable, "jepa/build_notebook_v5_kaggle.py"], check=True, capture_output=True)
     nb = (SIM_DIR / "ReEntryAI_JEPA_v5.ipynb").read_text(encoding="utf-8")
-    check("Colab notebook: RL_ON_KAGGLE in full mode; RL tuning and training then only export and import",
-          'RL_ON_KAGGLE = MODE == \\"full\\"' in nb and "K.export_inputs(L, log)" in nb and "K.import_rl(L, K_FROM, log)"
-          in nb and "if RL_ON_KAGGLE:" in nb)
+    # Kaggle is retired (2026-11-17): the Colab notebook tunes and trains RL itself on its L4; kaggle_v5 and its
+    # notebook stay as a tested by-hand route, checked below
+    check("Colab notebook: no Kaggle step; RL tuning and training run in the notebook on the GPU",
+          "RL_ON_KAGGLE" not in nb and "K.export_inputs" not in nb and "K.import_rl" not in nb
+          and "S5.tune_rl(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log)" in nb
+          and "S5.train_rl_stage(CFG, L, RL_ARMS, DEVICE, log)" in nb)
     src = work / "v5_smoke"
     if not (src / "03_tuning" / "fnpeg" / "chosen.json").exists():
         check("Kaggle check needs check 10's smoke study (FNPEG tuned)", False, f"({src})")
