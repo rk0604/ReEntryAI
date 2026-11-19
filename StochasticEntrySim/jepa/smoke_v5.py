@@ -1094,9 +1094,11 @@ def t13_repair(root: Path, work: Path, fx: dict) -> None:
 
 
 # in the notebook's stage order (Part B, 2026-11-18: RL imitation on the CPU in cell 6b, E3, then GPU RL last), so
-# each lands in a stage the earlier runs have not finished: legacy flights, DAgger (cell 6b, iteration 1), E3
-# training, E3 flights, the A256 MPPI arms, PPO (cell 15; the smoke saves every 2 updates), E4 flights
-FAILS = ["cpu_flights:3", "rl_train:1", "e3_train:4", "mppi_flights:1", "mppi_flights:2", "rl_train:2",
+# each lands in a stage the earlier runs have not finished: legacy flights, two DAgger runs (cell 6b, each at its
+# iteration 1: the first run's resume skips its saved iteration, the next DAgger run stops there), E3 training,
+# E3 flights, the A256 MPPI arms, the E4 flights. The smoke's PPO runs (cell 15) end before their first 30 s
+# checkpoint, so they reach no fail point; PPO's resume is check 6's.
+FAILS = ["cpu_flights:3", "rl_train:1", "rl_train:1", "e3_train:4", "mppi_flights:1", "mppi_flights:2",
          "cpu_flights:2"]
 
 
@@ -1717,6 +1719,85 @@ def t18_rl_gates(tmp: Path) -> None:
         check("18. ParallelExpert (2 processes) labels == FastExpert labels, through episode resets",
               same and n_reset > 0, f"({n_reset} rows reset in {n_dec} decisions)")
 
+        # (a2) fnpeg's memory follows the command flown (2026-11-19): with a learner flying the opposite sign on a
+        # random half of the rows, the synced labels inside fnpeg's reversal deadband keep the flown sign (none
+        # contradicts it), an unsynced fnpeg's labels do contradict it, and ParallelExpert's synced labels are
+        # FastExpert's
+        env_a, env_b = RL.make_env(rc, 5, "cpu", n_envs=4), RL.make_env(rc, 5, "cpu", n_envs=4)
+        fs, fn = RL.FastExpert(env_a, rc), RL.FastExpert(env_a, rc)
+        pe = RL.ParallelExpert(env_b, rc, None, 2)
+        g2 = torch.Generator().manual_seed(0)
+        last = torch.full((4,), float("nan"))
+        dis_s = dis_n = n_in = n_dec2 = 0
+        same2 = True
+        try:
+            while n_dec2 < 200 and not (n_in >= 20 and dis_n >= 1):
+                n_dec2 += 1
+                pre = np.array([f.sign for f in fs.flights])
+                o = env_a.obs()
+                a_s, a_n, a_p = fs.label(), fn.label(), pe.label()
+                same2 &= bool(torch.equal(a_s, a_p))
+                dec = np.array([f.decided for f in fs.flights])
+                herr, vel = o[:, 6].double().numpy() * math.pi, o[:, 1].double().numpy() * 11000.0
+                la = last.numpy()
+                inside = ((np.abs(herr) < 0.8 * np.radians(1.0 + 5.2e-4 * vel)) & (pre != 0) & dec
+                          & (np.abs(la) > 0.05))
+                ms, mn = inside & (np.abs(a_s.numpy()) > 0.05), inside & (np.abs(a_n.numpy()) > 0.05)
+                dis_s += int((np.sign(a_s.numpy()) != np.sign(la))[ms].sum())
+                dis_n += int((np.sign(a_n.numpy()) != np.sign(la))[mn].sum())
+                n_in += int(ms.sum())
+                mix = torch.rand(4, generator=g2) < 0.5
+                act = torch.where(mix, a_s, -a_s)
+                _, _, da, _ = env_a.step(act)
+                _, _, db2, _ = env_b.step(act)
+                same2 &= bool(torch.equal(da, db2))
+                rows = torch.nonzero(~mix).flatten().tolist()
+                fs.sync(rows, act)
+                pe.sync(rows, act)
+                last = act.clone()
+                idx = torch.nonzero(da).flatten()
+                if len(idx):
+                    for e in (fs, fn, pe):
+                        e.reset_rows(idx)
+                    last[idx] = float("nan")
+        finally:
+            pe.close()
+        check("18. DAgger's fnpeg follows the command flown: inside its reversal deadband no synced label contradicts "
+              "the flown sign, unsynced ones do; ParallelExpert's synced labels == FastExpert's",
+              same2 and n_in >= 20 and dis_s == 0 and dis_n >= 1,
+              f"({n_in} states inside the deadband in {n_dec2} decisions: {dis_s} synced vs {dis_n} unsynced "
+              f"contradictions)")
+
+        # (a3) _rollouts: fnpeg flying alone syncs nothing (its labels unchanged); BC's DART noise syncs every row
+        # and reaches the flown bank while the labels stay fnpeg's; DAgger syncs the learner's rows only
+        class _Expert:
+            def __init__(self, n):
+                self.n, self.calls, self.rows = n, 0, 0
+
+            def label(self):
+                return torch.full((self.n,), 0.3)
+
+            def sync(self, rows, act):
+                self.calls += 1
+                self.rows += len(list(rows))
+
+            def reset_rows(self, rows):
+                pass
+
+        env_c = RL.make_env(rc, 7, "cpu", n_envs=2)
+        g3, cpu = torch.Generator().manual_seed(1), torch.device("cpu")
+        e0, e1, e2 = _Expert(2), _Expert(2), _Expert(2)
+        O0, A0, s0 = RL._rollouts(env_c, e0, None, 1.0, 2, g3, cpu)
+        O1, A1, s1 = RL._rollouts(env_c, e1, None, 1.0, 2, g3, cpu, noise_std=0.1)
+        O2, A2, s2 = RL._rollouts(env_c, e2, RL.Actor(hidden=(8,), kind="magsign"), 0.5, 2, g3, cpu)
+        ok3 = (e0.calls == 0 and e1.calls == len(A1) // 2 and e1.rows == len(A1) and bool(np.all(A1 == np.float32(0.3)))
+               and float(np.mean(np.abs(O0[:, 9] - 0.3) < 1e-3)) > 0.8 and float(np.mean(np.abs(O1[:, 9] - 0.3) < 1e-3)) < 0.2
+               and s1["noise_std"] == 0.1 and s0["noise_std"] == 0.0
+               and e2.calls == len(A2) // 2 and 0 < e2.rows < len(A2))
+        check("18. rollouts: fnpeg alone syncs nothing; DART noise syncs every row, moves the flown bank and leaves the "
+              "labels fnpeg's; DAgger syncs only the learner's rows", ok3,
+              f"(syncs {e0.calls}, {e1.calls}/{len(A1) // 2}, {e2.rows}/{len(A2)} rows)")
+
         # (b) the gates' pilots on the CPU, their files and the cost projection
         L.write_json(L.tuning / "fnpeg" / "chosen.json", {"method": "fnpeg", "config": S5.tuned(L, "fnpeg", cfg)})
         t0 = time.time()
@@ -1729,16 +1810,23 @@ def t18_rl_gates(tmp: Path) -> None:
         fit = S5._read_json(pil / "dagger_fnpeg" / "fit.json") or {}
         cp = S5._read_json(L.checks / "rl_cost_projection.json") or {"arms": {}}
         bc_ok = all((docs[(k, "bcppo_fnpeg")] or {}).get("passed") for k in ("RV1", "RV2"))
+        pdocs = [S5._read_json(pil / a / "pilot.json") or {} for a in ("dagger_fnpeg", "bcppo_fnpeg")]
+        cf = S5._read_json(pil / "bcppo_fnpeg" / "clone_fit.json") or {}
+        ref_ok = all(p.get("fnpeg_fast", {}).get("episodes", 0) >= cfg.fast_eval_episodes
+                     and p["rv2"]["expert_success_fast"] == p["fnpeg_fast"]["success_5km_fast"]
+                     and p["fast"]["episodes"] >= cfg.fast_eval_episodes for p in pdocs)
+        dart_ok = cf.get("bc_noise_deg") == RL.RLCfg().bc_noise_deg > 0 and "demo_success_fast" in cf
         ok = (all(d is not None and isinstance(d.get("passed"), bool) and d.get("reason") for d in docs.values())
               and {"sign_acc", "bank_err_deg", "always_positive", "current_bank_sign"} <= set(fit.get("val", {}))
               and (pil / "ppo_hist_ppo" / "pilot.json").exists() and (pil / "bcppo_fnpeg" / "clone.pt").exists()
               and S5.rl_gate_path(L, "RV3", "bcppo_fnpeg").exists() == bool(bc_ok)
               and "total_h" in cp["arms"].get("dagger_fnpeg", {}) and "total_h" in cp["arms"].get("ppo_hist", {})
-              and set(g) == {"dagger_fnpeg", "bcppo_fnpeg", "ppo_hist"})
+              and set(g) == {"dagger_fnpeg", "bcppo_fnpeg", "ppo_hist"} and ref_ok and dart_ok)
         passed = {f"{k[0]} {k[1]}": (d or {}).get("passed") for k, d in docs.items()}
         check("18. RL gates: the pilots write RV1/RV2 (DAgger, BC) and RV3 (ppo_hist; BC's only after its RV1-RV2) "
-              "with the held-out sign accuracy, bank error and trivial baselines; rl_cost_projection.json",
-              ok, f"({passed}, {time.time() - t0:.0f}s)")
+              "with the held-out sign accuracy, bank error and trivial baselines; RV2 against fnpeg flown on the "
+              "policy's own evaluation episodes; BC's clone made from DART-noise demonstrations; "
+              "rl_cost_projection.json", ok, f"({passed}, ref {ref_ok}, dart {dart_ok}, {time.time() - t0:.0f}s)")
         if not ok:
             print("\n".join(logs[-40:]))
         n_files = len(list(L.checks.rglob("*")))

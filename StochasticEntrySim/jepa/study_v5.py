@@ -2065,7 +2065,8 @@ def rl_gates_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device:
                 if lim is not None and not lim.may_start(0.5, log, f"RL gate pilot {arm}"):
                     return out
                 d = pil / arm
-                doc = RL.imitation_pilot(L, d, arm, _pilot_cfg(cfg, L, arm, arm, workers), "cpu", fn, log)
+                doc = RL.imitation_pilot(L, d, arm, _pilot_cfg(cfg, L, arm, arm, workers), "cpu", fn, log,
+                                         n_eval=min(512, int(cfg.fast_eval_episodes)))
                 _gate_doc(L, "RV1", arm, doc["rv1"], d)
                 _gate_doc(L, "RV2", arm, doc["rv2"], d)
             if "RV3" in need and can_gpu and not rl_gate_path(L, "RV3", arm).exists():
