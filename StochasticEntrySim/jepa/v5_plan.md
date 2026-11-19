@@ -1375,7 +1375,8 @@ saturated.
   `SessionLimit` now also gates every E3 model, pilot set and flight group: nothing starts that would not fit; when
   the budget is used up the summary is written and the runtime released. (6) **Order of a GPU pass**: E3 training,
   E3 flights, the MPPI flights (A256, matched, ORB-1, DS1, AS1), open loop, timing, then RL last (cell 15), so a
-  slow or failing RL arm never holds up the rest. (7) **RL tunes and trains only after its competence gates pass**
+  slow or failing RL arm never holds up the rest; DS1's and AS1's RL flights, which wait in cells 11 and 11b for the
+  policies, fly in cell 15a. (7) **RL tunes and trains only after its competence gates pass**
   (`01_checks/RV1_<arm>.json`, `RV2`, `RV3`; DAgger RV1 + RV2, BC → PPO RV1–RV3, PPO RV3); until then each arm
   waits with a note. The gates and the supervised-fit fix are the next entry's subject (Part B). (8) **DAgger's
   first tuning is deprecated, not deleted.** Configurations 0–9 scored 0–2.1 % success@5km against FNPEG's 100 %;

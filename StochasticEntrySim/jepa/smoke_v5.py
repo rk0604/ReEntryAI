@@ -1373,7 +1373,7 @@ def t16_kaggle(work: Path) -> None:
     try:
         res = K.import_rl(Ld, fk, log=lambda *a: None)
         pols = all((Ld.policy_dir(a, s) / "policy.pt").exists() for a in S5.RL_TIER1 for s in cfg.rl_seeds)
-        chosen = all((Ld.tuning / f"rl_{a}" / "chosen.json").exists() for a in S5.RL_TIER1)
+        chosen = all((Ld.tuning / S5.rl_method(a) / "chosen.json").exists() for a in S5.RL_TIER1)
         no_state = not any(p.name.startswith("train_state") for p in drive.rglob("*"))
         tune_fl = any((drive / "04_flights" / "results" / "DEV48").glob("tune_*"))
         res2 = K.import_rl(Ld, fk, log=lambda *a: None)

@@ -126,7 +126,7 @@ LOG(f"session {SEQ}: MODE={MODE} device={DEVICE} ({GPU}) cpus={CPUS} git={GIT[:1
 TUNE = r"""
 S5.tune_rl(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, LOG, limit=LIMIT)
 for a in RL_ARMS:
-    p = L.tuning / f"rl_{a}" / "chosen.json"
+    p = L.tuning / S5.rl_method(a) / "chosen.json"
     print(a, "->", json.loads(p.read_text())["score"] if p.exists() else "not chosen yet")
 """
 
@@ -145,7 +145,7 @@ for a in RL_ARMS:
                      "decisions": r.get("decisions"), "train_h": round((r.get("train_s") or 0) / 3600, 2),
                      "gpu": (r.get("hardware") or {}).get("gpu")})
 display(pd.DataFrame(rows))
-n_tuned = sum((L.tuning / f"rl_{a}" / "chosen.json").exists() for a in RL_ARMS)
+n_tuned = sum((L.tuning / S5.rl_method(a) / "chosen.json").exists() for a in RL_ARMS)
 n_done = sum(r["done"] for r in rows)
 if n_tuned == len(RL_ARMS) and n_done == len(rows):
     print("RL COMPLETE: download v5_rl_state.tar and v5_rl_manifest.json (Output) into "

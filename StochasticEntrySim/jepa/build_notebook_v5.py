@@ -389,6 +389,12 @@ if RUN["E4_fly"]:
     log = L.logger("E4_fly")
     with RG.stage("E4 flights", log):
         S5.run_jobs(CFG, S5.jobs_e4(CFG, L, L3, RL_ARMS), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "E4", can_cpu=CAN_CPU)
+# DS1's and AS1's RL flights (cells 11 and 11b ran before RL trained in cell 15; their other flights are done)
+for name, run_it, jobs_fn in (("DS1", RUN["DS1"], S5.jobs_ds1), ("AS1", RUN["AS1"], S5.jobs_as1)):
+    if run_it:
+        log = L.logger(name)
+        with RG.stage(f"{name} RL flights", log):
+            S5.run_jobs(CFG, jobs_fn(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, f"{name} (after RL)", can_cpu=CAN_CPU)
 """
 
 DS1 = r"""
@@ -681,7 +687,8 @@ units left before a long pass (the status cell's projection).
 ## 15a. E4 flights
 
 Every RL policy in the full simulator on A256 (deterministic, one flight per condition and training seed) and its
-snapshots on the DEV48 learning-curve cases.
+snapshots on the DEV48 learning-curve cases; then DS1's and AS1's RL flights, which waited in sections 11 and 11b for
+the policies (RL trains last, in section 15).
 """),
     ("code", E4_FLY),
     ("md", r"""
