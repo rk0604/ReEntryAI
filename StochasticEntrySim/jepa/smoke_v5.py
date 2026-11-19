@@ -266,7 +266,7 @@ def t1_gpu_pass() -> None:
           "pass's runtime before the analysis and the report, which run only on a CPU runtime",
           gpu_pass == [("mppi", 4)] and w1["cpu"] - before["cpu"] == 5 and cpu_pass == [("cpu", 9)]
           and w2["gpu"] - w1["gpu"] == 4 and both == [("cpu", 9), ("mppi", 4)]
-          and nb.count("S5.run_jobs(") == nb.count("can_cpu=CAN_CPU") == 10 and "GPU_PASS_SKIPS_CPU = True" in nb
+          and nb.count("S5.run_jobs(") == nb.count("can_cpu=CAN_CPU") == 11 and "GPU_PASS_SKIPS_CPU = True" in nb
           and order, f"(gpu pass {gpu_pass}, cpu pass {cpu_pass}, default {both}, release cell {end})")
 
 
@@ -1093,9 +1093,10 @@ def t13_repair(root: Path, work: Path, fx: dict) -> None:
     shutil.rmtree(c, ignore_errors=True)
 
 
-# in the notebook's stage order (2026-11-18: E3 first, RL last), so each lands in a stage the earlier runs have not
-# finished: legacy flights, E3 training, E3 flights, the A256 MPPI arms, RL tuning (DAgger), E4 training, E4 flights
-FAILS = ["cpu_flights:3", "e3_train:4", "mppi_flights:1", "mppi_flights:2", "rl_train:1", "rl_train:1",
+# in the notebook's stage order (Part B, 2026-11-18: RL imitation on the CPU in cell 6b, E3, then GPU RL last), so
+# each lands in a stage the earlier runs have not finished: legacy flights, DAgger (cell 6b, iteration 1), E3
+# training, E3 flights, the A256 MPPI arms, PPO (cell 15; the smoke saves every 2 updates), E4 flights
+FAILS = ["cpu_flights:3", "rl_train:1", "e3_train:4", "mppi_flights:1", "mppi_flights:2", "rl_train:2",
          "cpu_flights:2"]
 
 

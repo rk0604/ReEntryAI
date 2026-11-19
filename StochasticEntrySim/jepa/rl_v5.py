@@ -1170,9 +1170,10 @@ def rv3(rows: Sequence[dict], actor: nn.Module) -> dict:
     return {"passed": bool(ok), "finite": bool(finite), "return_first": float(np.mean(ret[:k])) if ret else None,
             "return_last": float(np.mean(ret[-k:])) if ret else None, "max_success_5km_fast": succ,
             "curve_rows": len(ret),
-            "reason": (f"return {np.mean(ret[:k]) if ret else float('nan'):.3f} -> "
-                       f"{np.mean(ret[-k:]) if ret else float('nan'):.3f} ({'rises' if rise else 'does not rise'}), "
-                       f"best success@5km {succ:.3f}, {'no NaN' if finite else 'NaN'}")}
+            "reason": ((f"return {np.mean(ret[:k]):.3f} -> {np.mean(ret[-k:]):.3f} "
+                        f"({'rises' if rise else 'does not rise'})" if ret else
+                        "no learning-curve row with a finished episode (the return cannot rise)")
+                       + f", best success@5km {succ:.3f}, {'no NaN' if finite else 'NaN'}")}
 
 
 def ppo_pilot(L, d: Path, arm: str, cfg: RLCfg, device, clone: Optional[Path] = None, log=print) -> dict:
