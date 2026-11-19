@@ -57,6 +57,7 @@ from jepa import fly_v3 as F
 from jepa import fly_v4 as F4
 from jepa import fly_v5 as F5
 from jepa import models_v5 as M5
+from jepa import runguard_v5 as RG
 from jepa import study_v3 as S
 from jepa import study_v4 as S4
 from jepa import testset_v3 as TS
@@ -92,7 +93,9 @@ AMENDMENTS = {
 }
 
 # Approximate Colab compute units per hour by runtime (the status cell's projection only).
-UNITS_PER_HOUR = {"A100": 11.8, "L4": 4.8, "T4": 1.8, "V100": 4.9, "cpu": 0.08}
+UNITS_PER_HOUR = {"A100": 11.8, "L4": 1.98, "T4": 1.8, "V100": 4.9, "cpu": 0.08}   # L4: the rate Colab showed the
+                                                                                # user (2026-11-17), was 4.8
+NOTEBOOK_REV = 2        # ReEntryAI_JEPA_v5.ipynb's revision; an older copy of the notebook stops at its status cell
 
 
 # ============================================================================
@@ -305,6 +308,7 @@ class LayoutV5(S4.LayoutV4):
         if os.path.getsize(tmp) != len(data):
             raise OSError(f"short write: {tmp} has {os.path.getsize(tmp)} of {len(data)} bytes")
         os.replace(tmp, path)
+        RG.touch(f"wrote {path.name}")
 
     def save_large(self, data: bytes, path) -> None:
         """Large files: local disk first, then a copy to the Drive .tmp name, size check, rename."""
@@ -325,6 +329,7 @@ class LayoutV5(S4.LayoutV4):
             raise OSError(f"short copy: {tmp} has {os.path.getsize(tmp)} of {len(data)} bytes")
         os.replace(tmp, path)
         local.unlink(missing_ok=True)
+        RG.touch(f"wrote {path.name}")
 
     def torch_save(self, obj, path) -> None:
         buf = io.BytesIO()
@@ -342,8 +347,7 @@ class LayoutV5(S4.LayoutV4):
         """print + append to 00_study/logs/<stage>.log (Colab's cell output is lost on a disconnect, the log is not)."""
         path = self.guard(self.logs / f"{stage}.log")
 
-        def log(*args):
-            msg = " ".join(str(a) for a in args)
+        def emit(msg: str):
             print(msg, flush=True)
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -351,6 +355,13 @@ class LayoutV5(S4.LayoutV4):
                     f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
             except OSError:
                 pass
+
+        def log(*args):
+            msg = " ".join(str(a) for a in args)
+            RG.touch(f"[{stage}] {msg[:150]}")          # a study log line is progress (the watchdog)
+            emit(msg)
+
+        log.quiet = lambda *args: emit(" ".join(str(a) for a in args))   # "still waiting" lines: not progress
         return log
 
     def mark_done(self, path, artifacts: Sequence = (), info: Optional[dict] = None) -> None:
@@ -390,7 +401,10 @@ def repair(L: LayoutV5, log=print) -> dict:
             last = 0.0
     out = {"tmp_deleted": 0, "json_deleted": 0, "done_removed": 0, "files_seen": 0}
     res_root = _norm(L.flights / "results")
-    for dirpath, _dirs, files in os.walk(L.root):
+    for dirpath, dirs, files in os.walk(L.root):
+        if "DEPRECATED.md" in files:          # a deprecated folder (section 15, 2026-11-18): left exactly as it is
+            dirs[:] = []
+            continue
         for name in files:
             out["files_seen"] += 1
             p = os.path.join(dirpath, name)
@@ -808,42 +822,152 @@ def _relabel(job: dict, rec: dict) -> dict:
     return rec
 
 
-def _cpu_worker(arg) -> int:
-    """Pool task: classical flights one by one, or one lockstep batch of guidance-law / policy flights."""
-    shard, root, ro = arg
-    torch.set_num_threads(1)
-    L = LayoutV5(root, ro)
+FAULT_ENV = "JEPA_V5_FAULT"      # smoke test only: "flight:<controller>" makes that arm's flights raise
+
+
+def _fault(shard: Sequence[dict]) -> None:
+    want = os.environ.get(FAULT_ENV, "")
+    if want.startswith("flight:") and shard and shard[0]["controller"] == want.split(":", 1)[1]:
+        raise RuntimeError(f"injected flight fault ({FAULT_ENV}={want}, smoke test)")
+
+
+def _checked_writer(L: LayoutV5) -> Callable[[dict], None]:
+    """L.write_flight, refusing a landed flight whose miss is not a number (the flight is retried, then recorded)."""
+    def write(rec: dict) -> None:
+        r = rec["result"]
+        if r.get("outcome") == "drogue" and not np.isfinite(float(r.get("miss_km", np.nan))):
+            raise FloatingPointError(f"{r.get('flight_id')}: landed with a non-finite miss_km")
+        L.write_flight(rec)
+    return write
+
+
+def _not_done(L: LayoutV5, shard: Sequence[dict]) -> List[dict]:
+    return [j for j in shard if not L.result_path(F5.flight_id_v5(j)).exists()]
+
+
+def _err(j: dict, e: BaseException) -> List[str]:
+    return [F5.flight_id_v5(j), f"{type(e).__name__}: {str(e)[:300]}"]
+
+
+def _fly_cpu(shard: Sequence[dict], L: LayoutV5) -> None:
+    _fault(shard)
     m = shard[0]["model"]
+    write = _checked_writer(L)
     if m["kind"] == "classical":
         with F5.with_interval_fields():
             for j in shard:
-                L.write_flight(_relabel(j, F4.fly_classical_v4(j)))
-        return len(shard)
+                write(_relabel(j, F4.fly_classical_v4(j)))
+        return
     if m["kind"] in ("policy", "legacy_rl"):
         law = F5.make_law("policy", {"path": m["path"], "legacy": m["kind"] == "legacy_rl"})
     else:
         law = F5.make_law(m["kind"], m["cfg"])
-    F5.run_guidance_lockstep(shard, law, on_done=L.write_flight, verbose=False)
-    return len(shard)
+    F5.run_guidance_lockstep(shard, law, on_done=write, verbose=False)
 
 
-def _mppi_worker(arg) -> int:
+def _cpu_worker(arg) -> dict:
+    """Pool task: classical flights one by one, or one lockstep batch of guidance-law / policy flights. A batch that
+    raises is retried flight by flight (the guidance laws and classical are batch-independent, v5_plan.md section 16);
+    a flight that raises again is returned as an error, not written."""
+    shard, root, ro = arg
+    torch.set_num_threads(1)
+    L = LayoutV5(root, ro)
+    try:
+        _fly_cpu(shard, L)
+        return {"n": len(shard), "errors": []}
+    except Exception:
+        errors = []
+        for j in _not_done(L, shard):
+            try:
+                _fly_cpu([j], L)
+            except Exception as e:
+                errors.append(_err(j, e))
+        return {"n": len(shard) - len(errors), "errors": errors}
+
+
+def _mppi_worker(arg) -> dict:
+    """One lockstep shard of MPPI flights. A shard that raises is retried once on its flights not yet written; the
+    flights it still cannot fly are returned as errors."""
     shard, model, device, mppi, max_rows, chunk, root, ro, threads, verbose, prog = arg
     torch.set_num_threads(int(threads))
-    adapter = F5.load_adapter_v5(model["kind"], model.get("ckpt"), device, model.get("members"), chunk, keep_only=True,
-                                 **adapter_kw(model))
     L = LayoutV5(root, ro)
 
     def report(p):
+        RG.touch("mppi round")
         if prog:
             try:
                 S.atomic_bytes(prog, json.dumps(p).encode())
             except OSError:
                 pass
 
-    F5.run_mppi_v5(shard, adapter, mppi, n_sub=int(mppi.get("n_sub", 2)), max_rows=max_rows, on_done=L.write_flight,
-                   verbose=verbose, progress=report)
-    return len(shard)
+    def fly(js):
+        _fault(js)
+        adapter = F5.load_adapter_v5(model["kind"], model.get("ckpt"), device, model.get("members"), chunk,
+                                     keep_only=True, **adapter_kw(model))
+        F5.run_mppi_v5(js, adapter, mppi, n_sub=int(mppi.get("n_sub", 2)), max_rows=max_rows,
+                       on_done=_checked_writer(L), verbose=verbose, progress=report)
+
+    try:
+        fly(shard)
+        return {"n": len(shard), "errors": []}
+    except Exception:
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        rest = _not_done(L, shard)
+        try:
+            fly(rest)
+            return {"n": len(shard), "errors": []}
+        except Exception as e:
+            left = _not_done(L, shard)
+            return {"n": len(shard) - len(left), "errors": [_err(j, e) for j in left]}
+
+
+class _FlightErrors:
+    """A run_cpu / run_mppi call's flight errors: each one recorded in 04_flights/errors/, and the call stopped
+    (StageFailed) when more than max_frac of its first n_first flights error. Poor accuracy is never an error."""
+
+    def __init__(self, L: LayoutV5, label: str, log, n_first: int = 50, max_frac: float = 0.10):
+        self.L, self.label, self.log, self.n_first, self.max_frac = L, label, log, n_first, max_frac
+        self.seen, self.err_first, self.errors = 0, 0, []
+
+    def add(self, res: dict) -> None:
+        errs = res.get("errors", [])
+        k = int(res.get("n", 0)) + len(errs)
+        if self.seen < self.n_first:
+            take = min(k, self.n_first - self.seen)
+            self.err_first += min(len(errs), take)
+            self.seen += take
+        for fid, msg in errs:
+            self.errors.append(fid)
+            try:
+                self.L.write_json(self.L.flights / "errors" / f"{fid}.json",
+                                  {"flight_id": fid, "error": msg, "stage": self.label,
+                                   "time": time.strftime("%Y-%m-%d %H:%M:%S"), "git_commit": _GIT.get()})
+            except Exception:
+                pass
+            self.log(f"  [{self.label}] flight error (after one retry): {fid}: {msg}")
+
+    def too_many(self, finished: bool = False) -> bool:
+        if not self.err_first or not (self.seen >= self.n_first or finished):
+            return False
+        return self.err_first > self.max_frac * self.seen
+
+    def close(self, finished: bool = True) -> None:
+        if self.errors:
+            RG.SUMMARY.failure("flights", self.label, f"{len(self.errors)} flight(s) failed after one retry "
+                               f"(04_flights/errors/)")
+            RG.SUMMARY.write()
+        if self.too_many(finished):
+            msg = (f"{self.err_first} of the first {self.seen} flights raised errors (more than "
+                   f"{self.max_frac:.0%}): stage stopped")
+            RG.record_failure(self.L, self.L.checks / f"stage_{_safe(self.label)}_failed.json",
+                              {"stage": self.label, "reason": msg, "errors": self.errors[:50],
+                               "git_commit": _GIT.get()}, "stage", self.label, self.log)
+            raise RG.StageFailed(f"[{self.label}] {msg}")
+
+
+def _safe(s: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in s)
 
 
 def _cpu_key(j: dict) -> str:
@@ -876,22 +1000,36 @@ def run_cpu(cfg: StudyConfigV5, jobs: Sequence[dict], L: LayoutV5, workers: int 
         tasks += [g[i:i + n] for i in range(0, len(g), n)]
     ro = [str(p) for p in L.read_only]
     args = [(t, str(L.root), ro) for t in tasks]
+    lim = SESSION["limit"]
+    if lim is not None and not lim.may_start(0.0, log, f"{label} flights"):
+        return 0
     t0, n = time.time(), 0
+    errs = _FlightErrors(L, label, log)
     pool = mp.get_context("spawn").Pool(int(workers)) if workers > 1 else None
     it = pool.imap(_cpu_worker, args) if pool else map(_cpu_worker, args)
     step = max(1, len(tasks) // 20)
+    stopped = False
     try:
         for i, k in enumerate(it, 1):
-            n += k
+            n += k["n"]
+            errs.add(k)
             _COUNT["cpu"] += 1
             fail_point("cpu_flights", _COUNT["cpu"])
+            if errs.too_many():
+                stopped = True
+                break
             if i % step == 0 or i == len(tasks):
                 el = time.time() - t0
-                log(f"  [{label}] {n}/{len(todo)} flights in {el / 60:.1f} min (~{el / n * (len(todo) - n) / 60:.0f} min left)")
+                log(f"  [{label}] {n}/{len(todo)} flights in {el / 60:.1f} min "
+                    f"(~{el / max(n, 1) * (len(todo) - n) / 60:.0f} min left)")
     finally:
         if pool is not None:
-            pool.close()
+            if stopped:
+                pool.terminate()
+            else:
+                pool.close()
             pool.join()
+    errs.close(finished=True)
     return n
 
 
@@ -919,11 +1057,16 @@ def run_mppi(cfg: StudyConfigV5, jobs: Sequence[dict], L: LayoutV5, device: str 
     mppi = cfg.mppi()
     pool, t_all, n_flown = None, time.time(), 0
     ro = [str(p) for p in L.read_only]
+    errs = _FlightErrors(L, label, log)
+    lim = SESSION["limit"]
+    stopped = False
     try:
         for key, g in ready:
             todo = [j for j in g if F5.flight_id_v5(j) not in done]
             if not todo:
                 continue
+            if lim is not None and not lim.may_start(0.0, log, f"{label} {key[1]} seed {key[3]}"):
+                break
             if pool is None and workers > 1:
                 pool = mp.get_context("spawn").Pool(int(workers))
             suite, arm, load, seed, kind = key[:5]
@@ -938,17 +1081,21 @@ def run_mppi(cfg: StudyConfigV5, jobs: Sequence[dict], L: LayoutV5, device: str 
             args = [(sh, g[0]["model"], device, mppi, rows, cfg.v2_chunk, str(L.root), ro, threads, pool is None,
                      str(pf) if pool is not None else None) for sh, pf in zip(shards, progs)]
             if pool is None:
-                for a in args:
-                    _mppi_worker(a)
+                outs = [_mppi_worker(a) for a in args]
             else:
                 res = pool.map_async(_mppi_worker, args)
                 while True:
                     try:
-                        res.get(timeout=report_every_s)
+                        outs = res.get(timeout=report_every_s)
                         break
-                    except mp.TimeoutError:
-                        log(f"    ... {suite} {arm} {load} seed {seed}: {(time.time() - t0) / 60:.0f} min, "
-                            f"{S._progress_line(progs, len(todo))}")
+                    except mp.TimeoutError:          # a waiting line is not progress (the workers' rounds are)
+                        RG.quiet(log)(f"    ... {suite} {arm} {load} seed {seed}: {(time.time() - t0) / 60:.0f} "
+                                      f"min, {S._progress_line(progs, len(todo))}")
+            for o in outs:
+                errs.add(o)
+            if errs.too_many():
+                stopped = True
+                break
             n_flown += len(todo)
             _COUNT["mppi"] += 1
             fail_point("mppi_flights", _COUNT["mppi"])
@@ -958,8 +1105,12 @@ def run_mppi(cfg: StudyConfigV5, jobs: Sequence[dict], L: LayoutV5, device: str 
                 f"min; {left} left in this call (~{el / n_flown * left / 60:.0f} min)")
     finally:
         if pool is not None:
-            pool.close()
+            if stopped:
+                pool.terminate()
+            else:
+                pool.close()
             pool.join()
+    errs.close(finished=True)
     return n_flown
 
 
@@ -1547,7 +1698,7 @@ def _choose_method(cfg, L, m: str, n: int, log=print) -> Optional[dict]:
 def rl_cfg(cfg: StudyConfigV5, L: LayoutV5, arm: str, extra: Optional[dict] = None):
     from jepa import rl_v5 as RL
     base_arm = "ppo_hist" if arm == "ppo_matched" else arm        # ppo_matched reuses ppo_hist's tuned settings
-    t = tuned(L, f"rl_{base_arm}", cfg) if base_arm in RL_SPACES else {}
+    t = tuned(L, rl_method(base_arm), cfg) if base_arm in RL_SPACES else {}
     kw = {**cfg.rl, **cfg.rl_arms.get(arm, {}), **t, **(extra or {})}
     if "hidden" in kw:
         kw["hidden"] = tuple(kw["hidden"])
@@ -1638,7 +1789,7 @@ def tune_rl(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, w
     for arm in arms:
         if arm not in RL_SPACES:
             continue
-        m = f"rl_{arm}"
+        m = rl_method(arm)
         n = int(cfg.rl_tune_n.get(arm, 1))
         if (L.tuning / m / "chosen.json").exists():
             out[arm] = json.loads((L.tuning / m / "chosen.json").read_text())
@@ -1659,7 +1810,8 @@ def tune_rl(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, w
                                                          extra_s=n_dev * 90.0 / max(1, int(workers))):
                 return out
             RL.train_rl_dir(L, d, arm, RL.RLCfg(**kw), device, fn, log, label=f"tune {arm} config {j}")
-            js = [policy_job(cd, f"tune_{arm}_c{j:02d}", "tuning", str(d / "policy.pt"), 0)
+            js = [policy_job(cd, f"tune_{arm}{RL_TUNE_SUFFIX.get(arm, '')}_c{j:02d}", "tuning",
+                             str(d / "policy.pt"), 0)
                   for cd in conditions(cfg, "DEV48")]
             run_cpu(cfg, js, L, workers, log, f"tuning {arm}")
             rs = _results(L, js)
@@ -1671,6 +1823,180 @@ def tune_rl(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, w
                 limit.done()
         out[arm] = _choose_method(cfg, L, m, n, log)
     return out
+
+
+# ============================================================================
+# Unattended runs (2026-11-18, v5_plan.md section 15): session budget, notebook revision, deprecated DAgger tuning,
+# RL competence gates
+# ============================================================================
+SESSION: Dict[str, Optional[SessionLimit]] = {"limit": None}   # this session's budget (the notebook's Setup cell)
+
+
+def set_session_limit(limit: Optional[SessionLimit]) -> None:
+    """The SessionLimit every stage checks before it starts a model, a run or a group of flights."""
+    SESSION["limit"] = limit
+    RG.STATE["limit"] = limit
+
+
+# DAgger's first tuning (configurations 0-10, 2026-11-16/17) used a supervised fit that underfitted (section 15,
+# 2026-11-18): its results stay where they are, marked DEPRECATED.md, and the refit tuning writes under new keys.
+RL_TUNE_KEY = {"dagger_fnpeg": "rl_dagger_fnpeg_fit2"}
+RL_TUNE_SUFFIX = {"dagger_fnpeg": "_fit2"}
+DEPRECATED_TUNING = ("rl_dagger_fnpeg",)
+DEPRECATED_FLIGHT_PREFIX = ("tune_dagger_fnpeg_c",)
+DEPRECATION_NOTE = """# DEPRECATED (2026-11-18)
+
+This folder holds DAgger's first DEV48 tuning (configurations 0-10). Its supervised fit underfitted: sup_batch 4096
+x 20-50 epochs is about 10-250 gradient steps, and BC used PPO's learning rate. Configurations 0-9 scored 0-2.1 %
+success@5km against FNPEG's 100 %. An offline refit (300 epochs, lr 1e-3) reached 0.86 sign accuracy and 7 deg bank
+error, so the policies here measure the bug, not DAgger.
+
+Kept as it is (nothing deleted or moved). The study ignores it: repair and the analysis skip it, and the report
+lists it under deviations. The refit tuning writes 03_tuning/rl_dagger_fnpeg_fit2/ and
+04_flights/*/DEV48/tune_dagger_fnpeg_fit2_cNN/. See jepa/v5_plan.md section 15, entry 2026-11-18.
+
+Marked by commit {commit}.
+"""
+
+
+def rl_method(arm: str) -> str:
+    """The 03_tuning key of an RL arm's tuning."""
+    return RL_TUNE_KEY.get(arm, f"rl_{arm}")
+
+
+def deprecated_dirs(L: LayoutV5) -> List[Path]:
+    """The folders of the deprecated DAgger tuning (03_tuning/rl_dagger_fnpeg, its DEV48 flights) that exist."""
+    out = [L.tuning / m for m in DEPRECATED_TUNING if (L.tuning / m).is_dir()]
+    for sub in ("results", "telemetry"):
+        d = L.flights / sub / "DEV48"
+        if d.is_dir():
+            out += sorted(e for e in d.iterdir() if e.is_dir() and e.name.startswith(DEPRECATED_FLIGHT_PREFIX))
+    return out
+
+
+def is_deprecated(path) -> bool:
+    """True for a path inside a folder marked DEPRECATED.md (by mark_deprecated)."""
+    p = Path(path)
+    return any((q / "DEPRECATED.md").exists() for q in [p, *p.parents][:6])
+
+
+def mark_deprecated(L: LayoutV5, log=print) -> List[str]:
+    """Write DEPRECATED.md into each deprecated folder that has none yet (idempotent); nothing else changes."""
+    out = []
+    for d in deprecated_dirs(L):
+        f = d / "DEPRECATED.md"
+        if not f.exists():
+            L.atomic_bytes(f, DEPRECATION_NOTE.format(commit=_GIT.get()).encode())
+            out.append(os.path.relpath(d, L.root))
+    if out:
+        log(f"[setup] marked deprecated (section 15, 2026-11-18): {out}")
+    return out
+
+
+def deprecated_list(L: LayoutV5) -> List[str]:
+    """The deprecated folders (relative), for the analysis' and report's deviations list."""
+    return [os.path.relpath(d, L.root).replace(os.sep, "/") for d in deprecated_dirs(L)
+            if (d / "DEPRECATED.md").exists()]
+
+
+NB_GUARD_ENV = "JEPA_V5_NB_GUARD"
+_NB = {"rev": None}
+
+
+def notebook_check(rev) -> None:
+    """The notebook's Setup cell: its NOTEBOOK_REV must be this code's. An older copy stops here (the post_run_cell
+    hook then releases the runtime)."""
+    if rev != NOTEBOOK_REV:
+        raise RuntimeError(f"this notebook is revision {rev}, the code on space-jepa5 is revision {NOTEBOOK_REV}: it is "
+                           f"an old copy. Open the notebook from GitHub (the 'Open in Colab' badge in jepa/v5_plan.md "
+                           f"or the repo), not a downloaded or Drive copy, then Run all.")
+    _NB["rev"] = rev
+
+
+def notebook_guard() -> None:
+    """In Colab (or with JEPA_V5_NB_GUARD=1): refuse to run study cells from a notebook whose Setup cell did not pass
+    notebook_check (an old notebook that pulled the new code)."""
+    active = "google.colab" in sys.modules or os.environ.get(NB_GUARD_ENV) == "1"
+    if active and _NB["rev"] != NOTEBOOK_REV:
+        raise RuntimeError(f"this notebook is an old copy (its Setup cell does not check revision {NOTEBOOK_REV}). "
+                           f"Open the notebook from GitHub, not a downloaded or Drive copy, then Run all.")
+
+
+# RL competence gates (section 15, 2026-11-18): an RL arm tunes and trains only once its gates passed.
+RL_GATES = {"dagger_fnpeg": ("RV1", "RV2"), "bcppo_fnpeg": ("RV1", "RV2", "RV3"), "ppo_hist": ("RV3",),
+            "ppo_matched": ("RV3",), "sac_hist": ("RV3",)}
+RL_GATE_ARM = {"ppo_matched": "ppo_hist"}       # ppo_matched uses ppo_hist's gate and tuned settings
+
+
+def rl_gate_path(L: LayoutV5, gate: str, arm: str) -> Path:
+    return L.checks / f"{gate}_{RL_GATE_ARM.get(arm, arm)}.json"
+
+
+RL_GATES_PASS_ENV = "JEPA_V5_RL_GATES_PASS"   # smoke test only ("1"): the notebook's RL stages run ungated, so the
+                                              # smoke study still trains and flies every RL arm (tiny, meaningless)
+
+
+def rl_gate(L: LayoutV5, arm: str) -> Tuple[bool, str]:
+    """(passed, note): whether every competence gate of an RL arm has passed (01_checks/RV*_<arm>.json)."""
+    if os.environ.get(RL_GATES_PASS_ENV) == "1":
+        return True, f"{arm}: gates bypassed ({RL_GATES_PASS_ENV}=1, smoke test)"
+    missing, failed = [], []
+    for g in RL_GATES.get(arm, ()):
+        doc = _read_json(rl_gate_path(L, g, arm))
+        if doc is None:
+            missing.append(g)
+        elif not doc.get("passed"):
+            failed.append(f"{g} ({doc.get('reason', 'failed')})")
+    if failed:
+        return False, f"{arm}: gate {', '.join(failed)} failed; it does not tune or train (section 15, 2026-11-18)"
+    if missing:
+        return False, f"{arm} waits for its competence gate(s) {', '.join(missing)} (01_checks/)"
+    return True, f"{arm}: gates {', '.join(RL_GATES.get(arm, ())) or '(none)'} passed"
+
+
+def rl_imitation_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, workers: int, log=print,
+                       can_cpu: bool = True) -> dict:
+    """The CPU part of the imitation arms (DAgger's labelling, fit and scoring; BC's dataset and clone). Waits for
+    the supervised-fit fix (section 15, 2026-11-18): until then it only says so."""
+    out = {}
+    for arm in arms:
+        if arm in ("dagger_fnpeg", "bcppo_fnpeg"):
+            out[arm] = "waits for the supervised-fit fix (section 15, 2026-11-18)"
+            log(f"[RL imitation] {arm}: {out[arm]}")
+    return out
+
+
+def rl_gates_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, workers: int, log=print,
+                   can_cpu: bool = True, can_gpu: bool = False) -> dict:
+    """RV1-RV2 (can_cpu: the imitation arms, CPU) and RV3 (can_gpu: the PPO pilot) per RL arm
+    (01_checks/RV*_<arm>.json). Waits for the supervised-fit fix: until then it reports each arm's state."""
+    out = {}
+    for arm in arms:
+        ok, note = rl_gate(L, arm)
+        out[arm] = {"passed": ok, "note": note}
+        log(f"[RL gates] {note}")
+    return out
+
+
+def rl_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, workers: int, log=print,
+             can_gpu: bool = True) -> dict:
+    """RL tuning and training (the GPU pass's last stage), only for arms whose competence gates passed."""
+    ready, waiting = [], {}
+    for arm in arms:
+        ok, note = rl_gate(L, arm)
+        if ok:
+            ready.append(arm)
+        else:
+            waiting[arm] = note
+            log(f"[RL] {note}")
+    if not ready or not can_gpu:
+        if ready:
+            log(f"[RL] {ready} wait for a GPU runtime")
+        return {"ready": ready, "waiting": waiting}
+    lim = SESSION["limit"]
+    tune_rl(cfg, L, ready, device, workers, log, limit=lim)
+    train_rl_stage(cfg, L, ready, device, log, limit=lim)
+    return {"ready": ready, "waiting": waiting}
 
 
 # ============================================================================
@@ -1690,19 +2016,56 @@ def load_data_v5(cfg: StudyConfigV5, data_path: str, device) -> dict:
     return data
 
 
+def e3_failed(L: LayoutV5, arm: str, seed: int) -> Optional[dict]:
+    """The failed.json of an E3 model stopped by its early-stop rule (models_v5.TrainingStopped), or None."""
+    return _read_json(L.model_dir(arm, seed) / "failed.json")
+
+
+def _e3_hours(L: LayoutV5, cfg: StudyConfigV5, arm: str) -> float:
+    """A finished model's training time of this arm (the session budget's estimate; 0 before the first one)."""
+    for s in cfg.seeds:
+        info = _read_json(L.model_dir(arm, s) / "model.json")
+        if info and info.get("train_s"):
+            return float(info["train_s"]) / 3600.0
+    return 0.0
+
+
 def train_e3_stage(cfg: StudyConfigV5, L: LayoutV5, data_fn: Callable[[], dict], device, log=print) -> List[dict]:
-    """Every E3 arm: learning-rate pilots on seed 0, then seeds (seed-major within the arm)."""
+    """
+    Every E3 arm: learning-rate pilots on seed 0, then seeds (seed-major within the arm). A model stopped by its
+    early-stop rule (non-finite loss, validation loss diverging or not falling; models_v5.train_e3) gets failed.json
+    in its folder and is skipped from then on (delete the file to train it again); the other models go on. Being
+    worse than R0 never stops a model: that is RQ2's answer. A model starts only if the session budget allows it.
+    """
     out = []
     todo = [(a, s) for a in cfg.e3_arms for s in cfg.seeds if not L.ckpt(a, s).exists()]
-    log(f"[E3] {len(cfg.e3_arms) * len(cfg.seeds) - len(todo)}/{len(cfg.e3_arms) * len(cfg.seeds)} models trained")
+    failed = [(a, s) for a, s in todo if e3_failed(L, a, s)]
+    log(f"[E3] {len(cfg.e3_arms) * len(cfg.seeds) - len(todo)}/{len(cfg.e3_arms) * len(cfg.seeds)} models trained"
+        + (f"; {len(failed)} stopped earlier and skipped: {failed} (failed.json)" if failed else ""))
+    lim = SESSION["limit"]
     for arm in cfg.e3_arms:
-        if all(L.ckpt(arm, s).exists() for s in cfg.seeds):
+        if all(L.ckpt(arm, s).exists() or e3_failed(L, arm, s) for s in cfg.seeds):
             continue
+        est = _e3_hours(L, cfg, arm)
+        if not (L.models / arm / "lr_choice.json").exists() and lim is not None and not lim.may_start(
+                est * len(cfg.lr_mults) * cfg.lr_pilot_frac, log, f"{arm} learning-rate pilots"):
+            return out
         data = data_fn()
         lr = M5.choose_lr(cfg, data, L, arm, device, log)
         for s in cfg.seeds:
+            if L.ckpt(arm, s).exists() or e3_failed(L, arm, s):
+                continue
+            if lim is not None and not lim.may_start(est, log, f"{arm} seed {s}"):
+                return out
             t0 = time.time()
-            info = M5.train_arm_seed(cfg, data, L, arm, s, device, lr, log)
+            try:
+                info = M5.train_arm_seed(cfg, data, L, arm, s, device, lr, log)
+            except M5.TrainingStopped as e:
+                RG.record_failure(L, L.model_dir(arm, s) / "failed.json",
+                                  {"arm": arm, "seed": int(s), "status": "diverged", "reason": str(e),
+                                   "step": e.step, "lr_mult": float(lr), "git_commit": _GIT.get()},
+                                  "E3 model", f"{arm} seed {s}", log)
+                continue
             log(f"== {arm} seed {s}: {info.get('params')} parameters, {(time.time() - t0) / 60:.1f} min")
             out.append(info)
     return out
@@ -1716,7 +2079,7 @@ def train_rl_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device,
     out = []
     for arm in arms:
         base = "ppo_hist" if arm == "ppo_matched" else arm
-        if not is_tuned(L, "fnpeg") or (base in RL_SPACES and not is_tuned(L, f"rl_{base}")):
+        if not is_tuned(L, "fnpeg") or (base in RL_SPACES and not is_tuned(L, rl_method(base))):
             log(f"[E4] {arm} waits for tuning (03_tuning/)")
             continue
         for s in cfg.rl_seeds:
@@ -1864,6 +2227,8 @@ def _arm_type(j: dict) -> str:
 def status(cfg: StudyConfigV5, L: LayoutV5, stage_jobs: Dict[str, List[dict]], runtime: str = "cpu",
            write: bool = True) -> dict:
     """Done / total per stage and arm; flights per hour per arm type from the first 20 flights; hours and units left."""
+    if write:
+        notebook_guard()
     rows, rate_by_type = [], {}
     for stage, js in stage_jobs.items():
         arms: Dict[tuple, List[dict]] = {}
@@ -1891,7 +2256,8 @@ def status(cfg: StudyConfigV5, L: LayoutV5, stage_jobs: Dict[str, List[dict]], r
     for a in cfg.e3_arms:
         for s in cfg.seeds:
             d = L.model_dir(a, s)
-            st = "done" if (d / "ckpt.pt").exists() else ("partial" if (d / "train_state.pt").exists() else "todo")
+            st = "done" if (d / "ckpt.pt").exists() else ("diverged" if (d / "failed.json").exists() else
+                                                          ("partial" if (d / "train_state.pt").exists() else "todo"))
             train.append({"kind": "E3", "arm": a, "seed": s, "state": st})
     for a in RL_TIER1 + (RL_TIER2 if cfg.tier >= 2 else ()):
         for s in cfg.rl_seeds:

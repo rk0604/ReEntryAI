@@ -56,6 +56,7 @@ from jepa import study_v3 as S
 from jepa import study_v4 as S4
 from jepa import study_v5 as S5
 from jepa import testset_v3 as TS
+from jepa import runguard_v5 as RG
 
 ATM = list(TS.ATMOSPHERES)
 ATM_LAB = {**A3.ATM_LAB, "all": "pooled"}
@@ -227,6 +228,14 @@ def present(df: pd.DataFrame, al: tuple, suite: str = "A256") -> bool:
     return bool(((df.arm == al[0]) & (df.load == al[1]) & (df.suite == suite)).any())
 
 
+class Boot5(A4.Boot):
+    """analyze_v4.Boot, unchanged, plus a progress beat per computed bootstrap (the notebook's watchdog)."""
+
+    def run(self, cubes, fn, atm, seed):
+        RG.touch("bootstrap")
+        return super().run(cubes, fn, atm, seed)
+
+
 class ClusterBoot(A4.Boot):
     """analyze_v4.Boot with one case draw shared by every atmosphere: an entry case is resampled together with its
     four atmospheres (one cluster). The pre-registered bootstrap draws cases independently in each atmosphere, which
@@ -237,6 +246,7 @@ class ClusterBoot(A4.Boot):
         return super().__call__(key + "|clustered", cubes, fn, atm, stream)
 
     def run(self, cubes, fn, atm, seed):
+        RG.touch("bootstrap (clustered)")
         S_ = max(X.shape[0] for X in cubes)
         Xs = [np.repeat(X, S_, 0) if X.shape[0] == 1 else X for X in cubes]
         if atm is not None:
@@ -879,7 +889,7 @@ def tuning_table(L) -> pd.DataFrame:
     parts = []
     for m in sorted(p for p in L.tuning.glob("*") if p.is_dir()) if L.tuning.exists() else []:
         f = m / "configs.csv"
-        if f.exists():
+        if f.exists() and not (m / "DEPRECATED.md").exists():      # section 15, 2026-11-18
             d = pd.read_csv(f)
             ch = json.loads((m / "chosen.json").read_text()) if (m / "chosen.json").exists() else {}
             d.insert(0, "method", m.name)
@@ -992,7 +1002,7 @@ def analyze(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4=None, log=pr
     """Every table, figure and criterion. Returns a summary dict for the report. Skipped (outputs read back from
     05_analysis/) when nothing it reads changed since the last complete analysis, unless force."""
     caps = A4.Captions(L)
-    boot = A4.Boot(L, cfg.n_boot)
+    boot = Boot5(L, cfg.n_boot)
     cboot = ClusterBoot(L, cfg.n_boot)
     df = load_flights_v5(cfg, L, L3, L4)
     fp = inputs_fingerprint(cfg, L, L3, L4, df)

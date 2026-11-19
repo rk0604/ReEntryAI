@@ -307,6 +307,11 @@ def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
     d.h1("Deviations (v5_plan.md section 15)")
     for para in _paragraphs(deviations_text()):
         d.p(para)
+    from jepa import study_v5 as S5
+    dep = S5.deprecated_list(L)
+    if dep:
+        d.p("Deprecated and ignored by the analysis (kept on Drive, each with its DEPRECATED.md; section 15, "
+            "2026-11-18): " + ", ".join(escape(x) for x in dep) + ".")
     d.add(PageBreak())
     d.h1("Appendix: every table")
     for k, p in T.items():

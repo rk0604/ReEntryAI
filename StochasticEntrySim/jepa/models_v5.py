@@ -89,6 +89,52 @@ def set_rng_state(st: dict, gens: Optional[Dict[str, torch.Generator]] = None) -
             g.set_state(st["gens"][k])
 
 
+NAN_ENV = "JEPA_V5_FAULT_E3_NAN"      # smoke test only: "<arm> seed <k>" makes that model's training loss NaN
+
+
+class TrainingStopped(Exception):
+    """An E3 model stopped by its early-stop rule (train_e3): non-finite loss, or validation loss diverging or not
+    falling. study_v5.train_e3_stage records it as "diverged" and goes on with the other models."""
+
+    def __init__(self, msg: str, step: int):
+        super().__init__(msg)
+        self.step = int(step)
+
+
+def stop_rule(hist: Dict[str, list], steps: int, val0: Optional[float] = None, ratio: float = 3.0, frac: float = 0.2,
+              n_min: int = 3) -> str:
+    """Why training should stop at the last logged point ("" = go on): a non-finite validation loss; one above ratio x
+    its best at the same curriculum horizon; or, from frac of the steps on, no validation loss at the first horizon
+    (n_min points at least) below val0, the untrained model's. Never compares with another model (being worse than R0
+    is a result, not a reason to stop)."""
+    v, Ts = hist["val"], hist["T"]
+    if not v:
+        return ""
+    last, T = v[-1], Ts[-1]
+    if not math.isfinite(last):
+        return f"validation loss is {last} at step {hist['step'][-1]}"
+    best = min(x for x, t in zip(v, Ts) if t == T)
+    if last > ratio * best:
+        return (f"validation loss {last:.4g} at step {hist['step'][-1]} (T={T}) is above {ratio:g}x its best "
+                f"{best:.4g} at that horizon (diverging)")
+    T0 = Ts[0]
+    first = [x for x, t in zip(v, Ts) if t == T0]
+    if (val0 is not None and math.isfinite(val0) and hist["step"][-1] >= frac * steps and len(first) >= n_min
+            and min(first) >= val0):
+        return (f"validation loss at T={T0} never fell below the untrained model's {val0:.4g} in the first "
+                f"{frac:.0%} of {steps} steps (not learning)")
+    return ""
+
+
+def _beat(what: str) -> None:
+    """Progress for the notebook's watchdog (runguard_v5), from long loops that log nothing."""
+    try:
+        from jepa import runguard_v5 as RG
+        RG.touch(what)
+    except Exception:
+        pass
+
+
 def fail_point(stage: str, n: int) -> None:
     """The smoke test's simulated disconnect: JEPA_V5_FAIL_AT=<stage>:<n> kills the process at that point."""
     want = os.environ.get(FAIL_ENV, "")
@@ -417,7 +463,7 @@ def train_e3(model: nn.Module, ds_tr, ds_va, cfg: E3TrainCfg, device, L, state_p
         if state_path:
             save_state(L, {"module": model.state_dict(), "opt": opt.state_dict(), "scaler": scaler.state_dict(),
                            "step": step, "hist": hist, "elapsed": elapsed, "acc": acc, "n_acc": n_acc,
-                           "rng": rng_state({"gen": gen}), "cfg": asdict(cfg)}, state_path)
+                           "rng": rng_state({"gen": gen}), "cfg": asdict(cfg), "val0": val0}, state_path)
 
     def val_at(T: int) -> float:
         model.eval()
@@ -426,7 +472,12 @@ def train_e3(model: nn.Module, ds_tr, ds_va, cfg: E3TrainCfg, device, L, state_p
         model.train()
         return v
 
+    T_first = cfg.curriculum[0][1]
+    val0 = st.get("val0") if st is not None else None
+    if val0 is None and start == 0:
+        val0 = val_at(T_first)                  # the untrained model's (stop_rule's "not learning")
     params = [p for g in opt.param_groups for p in g["params"]]
+    nan_fault = bool(label) and os.environ.get(NAN_ENV, "") == label
     acc: Dict[str, float] = acc0               # the log window's running sums (saved, so a resume logs the same)
     n_acc, t_log, t_save = n_acc0, time.time(), time.time()
     model.train()
@@ -438,6 +489,12 @@ def train_e3(model: nn.Module, ds_tr, ds_va, cfg: E3TrainCfg, device, L, state_p
         b = ds_tr.sample((1, cfg.batch), T, gen)
         with torch.autocast(device.type, dtype=dt_amp, enabled=dt_amp is not None):
             loss, logs = e3_loss(model, b, cfg.w_acc, cfg.n_sub)
+        if nan_fault:
+            loss = loss * float("nan")
+        if not torch.isfinite(loss.detach()):
+            if state_path:
+                save(step)                      # the last finite state, kept for inspection
+            raise TrainingStopped(f"training loss is {float(loss.detach())} at step {step + 1}", step + 1)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
@@ -464,6 +521,10 @@ def train_e3(model: nn.Module, ds_tr, ds_va, cfg: E3TrainCfg, device, L, state_p
                 f"acc={hist['acc'][-1]:.4g} val={hist['val'][-1]:.4g} ({per * 1000:.0f} ms/step, "
                 f"~{per * (cfg.steps - step - 1) / 60:.0f} min left)")
             acc, n_acc = {}, 0
+            why = stop_rule(hist, cfg.steps, val0)
+            if why:
+                save(step + 1)
+                raise TrainingStopped(f"[{label}] {why}", step + 1)
         switch = not last and V.horizon_at(step + 1, c2) != T
         due = state_path and (time.time() - t_save > cfg.save_every_s
                               or (cfg.save_every_steps and (step + 1) % cfg.save_every_steps == 0))
@@ -619,10 +680,23 @@ def choose_lr(cfg5, data: dict, L, arm: str, device, log=print) -> float:
     T_max = max(T for _, T in E3TrainCfg(**cfg5.e3_train).curriculum)
     rows = []
     for mult in cfg5.lr_mults:
-        info = train_arm_seed(cfg5, data, L, arm, 0, device, mult, log, L.models / arm / "lr_pilot" / f"x{mult:g}",
-                              steps)
+        d = L.models / arm / "lr_pilot" / f"x{mult:g}"
+        stopped = d / "failed.json"
+        if stopped.exists():
+            rows.append({"lr_mult": mult, "val": float("inf"), "stopped": json.loads(stopped.read_text())["reason"]})
+            continue
+        try:
+            info = train_arm_seed(cfg5, data, L, arm, 0, device, mult, log, d, steps)
+        except TrainingStopped as e:          # a pilot that diverges loses the choice; the other pilots go on
+            L.write_json(stopped, {"arm": arm, "lr_mult": mult, "status": "diverged", "reason": str(e),
+                                   "step": e.step})
+            log(f"  [{arm}] pilot lr x{mult:g} stopped: {e}")
+            rows.append({"lr_mult": mult, "val": float("inf"), "stopped": str(e)})
+            continue
         rows.append({"lr_mult": mult, "val": info["val_open_loop_T%d" % T_max]})
     best = min(rows, key=lambda r: (r["val"] if math.isfinite(r["val"]) else float("inf")))
+    if not math.isfinite(best["val"]):
+        best = next(r for r in rows if r["lr_mult"] == 1.0) if 1.0 in cfg5.lr_mults else rows[0]
     L.write_json(out, {"arm": arm, "lr_mult": best["lr_mult"], "pilots": rows, "pilot_steps": steps,
                        "criterion": f"validation open-loop state loss at T={T_max}"})
     log(f"  [{arm}] learning rate x{best['lr_mult']:g} (pilots: {rows})")
@@ -663,6 +737,7 @@ def footprint_rows(adapter, name: str, eps: Sequence[dict], ttg_s: Sequence[floa
             truth.append(e["y_final"])
         ctx = adapter.context(yh)
         y6, _ = adapter.rollout(ctx, torch.stack(y0), torch.stack(uh), torch.stack(up), n_sub, None)
+        _beat(f"open loop {name} ttg {ttg:g}")
         y6 = y6[:, 0].double()
         phi, lam, _, _ = crossing_point(y6, h_cross)
         err, along, cross = _decompose(phi.numpy(), lam.numpy(), np.stack(truth).astype(np.float64))

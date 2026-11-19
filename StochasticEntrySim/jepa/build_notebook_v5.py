@@ -62,6 +62,15 @@ L4, so RQ2's comparison with R0 runs on the same GPU type and numeric path (nati
 records it in `00_study/gpu_platform.json`; a session on any other GPU stops at setup and releases the runtime.
 RL trains here too (it moved back from Kaggle on 2026-11-17, `jepa/v5_plan.md` §15).
 
+**Unattended runs (2026-11-18).** You can leave a pass running. A **watchdog** releases the runtime after
+`STALL_MIN` (45) minutes with no progress (no study log line and no Drive write), after writing why to
+`00_study/logs/watchdog.log`. A **failed stage** (an E3 model whose loss diverges, an arm whose flights keep raising
+errors, any other exception) is recorded in `01_checks/` or the model's `failed.json`, skipped, and the other stages
+go on; `STOP_ON_FAILURE = True` releases at the first failure instead. `MAX_SESSION_UNITS` caps the session: nothing
+starts that would not fit. **`00_study/RUN_SUMMARY.txt`** (rewritten after every stage) says what ran, what failed
+and why, the units used, why the runtime was released and what the next pass must do: read it on your phone from
+Drive. An old copy of this notebook stops at Setup: always open it from GitHub (badge above).
+
 **Tiers (decision D1).** `TIER = 1` (default) runs the gates, legacy RL re-evaluation, tuning, the A256
 arms (FNPEG, PredGuid, MPPI + filtered physics, v2 at FNPEG's load), ORB-1 block 1, the four non-JEPA
 models, three RL baselines (5 seeds each), DS1 (density errors that change with altitude), AS1 (the
@@ -106,6 +115,12 @@ GPU_TYPE = "L4" if MODE == "full" else None   # the one GPU type of all GPU work
                                 # (00_study/gpu_platform.json); any other GPU is refused at setup
 GPU_PASS_SKIPS_CPU = True       # on a GPU runtime, do only GPU work and release the runtime when it is done (15b);
                                 # the CPU stages wait for a (cheaper) CPU runtime. False runs everything here
+# Unattended runs (section 15, 2026-11-18)
+STALL_MIN = 45                  # release the runtime after this many minutes without progress (None: watchdog off)
+MAX_SESSION_UNITS = None        # e.g. 40: start no model, run or flight group that would not fit in this many units
+UNITS_PER_HOUR = None           # this runtime's rate (None: L4 1.98, High-RAM CPU 0.26, CPU 0.08)
+STOP_ON_FAILURE = False         # True: release at the first failed stage; False: record it, skip it, go on
+NOTEBOOK_REV = 2                # this notebook's revision (an old copy stops at Setup: open it from GitHub)
 """
 
 SETUP = r"""
@@ -134,7 +149,7 @@ else:
     LEGACY_ROOT = os.environ.get("JEPA_V5_LEGACY", "")
     DATA_CANDIDATES = [os.environ.get("JEPA_WIDE_DATA", ""), "jepa_runs/episodes_wide_6000.pkl", "jepa_runs/wide_6000"]
     LOCAL_DATA = "jepa_runs"
-
+""" + AUTO_DISCONNECT_V5 + r"""
 import json, time
 from pathlib import Path
 SIM_DIR = Path.cwd()
@@ -145,6 +160,8 @@ import matplotlib.pyplot as plt
 from IPython.display import Image, display
 %matplotlib inline
 from jepa import study_v4 as S4, study_v5 as S5, analyze_v5 as A5, report_v5 as R5, train_v2 as T2
+from jepa import runguard_v5 as RG
+S5.notebook_check(NOTEBOOK_REV)           # an old copy of this notebook stops here (and the hook releases the runtime)
 
 CFG = S5.StudyConfigV5.smoke() if MODE == "smoke" else S5.StudyConfigV5()
 CFG.tier = TIER
@@ -154,6 +171,39 @@ L4 = S5.v4_layout(V4_ROOT)                                             # read-on
 DATA_DIRS = [c if os.path.isdir(c) else os.path.dirname(c) for c in DATA_CANDIDATES if c and os.path.exists(c)]
 L = S5.LayoutV5(V5_ROOT, read_only=[V3_ROOT, V4_ROOT, LEGACY_ROOT] + DATA_DIRS).make()   # every write is checked
 LOG = L.logger("setup")
+
+# ---- Unattended runs: summary, session budget, watchdog (section 15, 2026-11-18) ----
+_release_plain = release_runtime
+
+def release_runtime(reason):
+    # RUN_SUMMARY.txt says why the runtime was released, then the auto-disconnect release (CLAUDE.md).
+    if str(reason).startswith("a cell failed"):
+        RG.SUMMARY.failure("cell", "notebook", reason)
+    RG.SUMMARY.released(reason)
+    RG.SUMMARY.write()
+    _release_plain(reason)
+
+def _watchdog_off_on_stop(result):
+    if isinstance(result.error_in_exec, KeyboardInterrupt):       # you pressed stop: you are here
+        RG.start_watchdog(None, None, log=print)
+        print("watchdog off because you pressed stop; run Setup again to turn it back on")
+
+for _cb in list(_ip.events.callbacks["post_run_cell"]):
+    if getattr(_cb, "__name__", "") == "_watchdog_off_on_stop":
+        _ip.events.unregister("post_run_cell", _cb)
+_ip.events.register("post_run_cell", _watchdog_off_on_stop)
+_RUNTIME0 = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+RATE = RG.units_per_hour(_RUNTIME0, os.cpu_count() or 2, S5.UNITS_PER_HOUR, UNITS_PER_HOUR)
+LIMIT = S5.SessionLimit(deadline=RG.deadline(MAX_SESSION_UNITS, RATE))
+S5.set_session_limit(LIMIT)
+RG.configure(L, {"runtime": _RUNTIME0, "mode": MODE, "tier": TIER, "git": S5._GIT.get()[:10],
+                 "notebook revision": NOTEBOOK_REV}, RATE, release_runtime, LIMIT, MAX_SESSION_UNITS,
+             STOP_ON_FAILURE, next_note=lambda: S5.next_pass_note(GPU_TYPE))
+WATCHDOG = RG.start_watchdog(STALL_MIN, RG.stall_action(L, release_runtime), log=LOG)
+LOG(f"session: {RATE:g} units/h" + (f", budget {MAX_SESSION_UNITS:g} units (deadline "
+    f"{time.strftime('%H:%M', time.localtime(LIMIT.deadline))})" if LIMIT.deadline else ", no unit budget")
+    + f"; STOP_ON_FAILURE={STOP_ON_FAILURE}; summary in 00_study/RUN_SUMMARY.txt")
+S5.mark_deprecated(L, LOG)               # DAgger's first tuning: kept, marked, ignored (section 15, 2026-11-18)
 REPAIR = S5.repair(L, LOG)                                             # stale .tmp, unreadable flights, broken .done
 FROZEN = S5.freeze_config_v5(CFG, L, inputs={"v3": V3_ROOT, "v4": V4_ROOT if L4 else None,
                                              "legacy": LEGACY_ROOT or None})
@@ -181,8 +231,9 @@ def need_data():
     global DATA, DATA_PATH
     if DATA is None:
         t0 = time.time()
-        DATA_PATH = T2.local_copy(T2.find_wide_dataset(DATA_CANDIDATES, download_dir=LOCAL_DATA), LOCAL_DATA)
-        DATA = S5.load_data_v5(CFG, DATA_PATH, DEVICE)
+        with RG.allow("copying and loading the 6,000 flights", 60):     # long and silent: the watchdog waits
+            DATA_PATH = T2.local_copy(T2.find_wide_dataset(DATA_CANDIDATES, download_dir=LOCAL_DATA), LOCAL_DATA)
+            DATA = S5.load_data_v5(CFG, DATA_PATH, DEVICE)
         LOG(f"{DATA['n_episodes']} flights: train/val/test = {len(DATA['train'])}/{len(DATA['val'])}/"
             f"{len(DATA['test'])} episodes ({time.time() - t0:.0f}s)")
     return DATA
@@ -263,41 +314,51 @@ if RUN["gates"]:
 TUNING = r"""
 if RUN["tuning"]:
     log = L.logger("tuning")
-    if CAN_CPU:
-        TUNED = S5.tune_guidance(CFG, L, CPU_WORKERS, log)
-    elif not (S5.is_tuned(L, "fnpeg") and S5.is_tuned(L, "predguid")):
-        log("FNPEG / PredGuid tuning waits for a CPU runtime (GPU_PASS_SKIPS_CPU); mppi_filtered and RL wait for it")
+    with RG.stage("guidance tuning", log):
+        if CAN_CPU:
+            TUNED = S5.tune_guidance(CFG, L, CPU_WORKERS, log)
+        elif not (S5.is_tuned(L, "fnpeg") and S5.is_tuned(L, "predguid")):
+            log("FNPEG / PredGuid tuning waits for a CPU runtime (GPU_PASS_SKIPS_CPU); mppi_filtered and RL wait for it")
     RL_ARMS = list(S5.RL_TIER1) + (list(S5.RL_TIER2) if CFG.tier >= 2 else [])
-    if CAN_GPU:                         # trains on the GPU; each configuration's 48 DEV48 scoring flights fly here
-        S5.tune_rl(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log)
-    else:
-        log("RL tuning waits for a GPU runtime")
-    for m in ("fnpeg", "predguid") + tuple(f"rl_{a}" for a in RL_ARMS):
+    for m in ("fnpeg", "predguid") + tuple(S5.rl_method(a) for a in RL_ARMS):
         p = L.tuning / m / "chosen.json"
         print(m, "->", json.loads(p.read_text())["score"] if p.exists() else "not chosen yet")
+"""
+
+RL_IMITATION = r"""
+RL_ARMS = list(S5.RL_TIER1) + (list(S5.RL_TIER2) if RUN["tier2_rl"] else [])
+if RUN["E4_train"]:
+    log = L.logger("RL_imitation")
+    with RG.stage("RL imitation and gates RV1-RV2 (CPU)", log):
+        S5.rl_imitation_stage(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log, CAN_CPU)
+        S5.rl_gates_stage(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log, CAN_CPU, False)
 """
 
 A256 = r"""
 if RUN["A256"]:
     log = L.logger("A256")
-    S5.run_jobs(CFG, S5.jobs_a256(CFG, L, L3, matched=False), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "A256", can_cpu=CAN_CPU)
-    S5.run_jobs(CFG, S5.jobs_matched(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "A256 matched", can_cpu=CAN_CPU)
+    with RG.stage("A256", log):
+        S5.run_jobs(CFG, S5.jobs_a256(CFG, L, L3, matched=False), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "A256", can_cpu=CAN_CPU)
+    with RG.stage("A256 matched", log):
+        S5.run_jobs(CFG, S5.jobs_matched(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "A256 matched", can_cpu=CAN_CPU)
 """
 
 ORB1 = r"""
 if RUN["ORB1_block1"]:
     log = L.logger("ORB1")
-    S5.run_jobs(CFG, S5.orb1_jobs(CFG, L, L3, S5.ORB1_ARMS, [0], "ORB1", log), L, DEVICE, CPU_WORKERS, GPU_WORKERS,
-                CAN_GPU, log, "ORB-1 block 1", can_cpu=CAN_CPU)
+    with RG.stage("ORB-1 block 1", log):
+        S5.run_jobs(CFG, S5.orb1_jobs(CFG, L, L3, S5.ORB1_ARMS, [0], "ORB1", log), L, DEVICE, CPU_WORKERS, GPU_WORKERS,
+                    CAN_GPU, log, "ORB-1 block 1", can_cpu=CAN_CPU)
 """
 
 E3_TRAIN = r"""
 if RUN["E3_train"]:
     log = L.logger("E3_train")
-    if CAN_GPU:
-        S5.train_e3_stage(CFG, L, need_data, DEVICE, log)
-    else:
-        log("E3 training waits for a GPU runtime")
+    with RG.stage("E3 training", log):
+        if CAN_GPU:
+            S5.train_e3_stage(CFG, L, need_data, DEVICE, log)
+        else:
+            log("E3 training waits for a GPU runtime")
     p = L.model_dir(CFG.e3_arms[0], CFG.seeds[0]) / "F_curves.png"
     if p.exists():
         display(Image(str(p)))
@@ -306,17 +367,16 @@ if RUN["E3_train"]:
 E3_FLY = r"""
 if RUN["E3_fly"]:
     log = L.logger("E3_fly")
-    S5.run_jobs(CFG, S5.jobs_e3(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "E3", can_cpu=CAN_CPU)
+    with RG.stage("E3 flights", log):
+        S5.run_jobs(CFG, S5.jobs_e3(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "E3", can_cpu=CAN_CPU)
 """
 
-E4_TRAIN = r"""
-RL_ARMS = list(S5.RL_TIER1) + (list(S5.RL_TIER2) if RUN["tier2_rl"] else [])
+RL_TRAIN = r"""
 if RUN["E4_train"]:
     log = L.logger("E4_train")
-    if CAN_GPU:
-        S5.train_rl_stage(CFG, L, RL_ARMS, DEVICE, log)
-    else:
-        log("RL training waits for a GPU runtime")
+    with RG.stage("RL gate RV3, tuning and training (GPU)", log):
+        S5.rl_gates_stage(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log, False, CAN_GPU)
+        S5.rl_stage(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log, CAN_GPU)
     done = sum((L.policy_dir(a, s) / "policy.pt").exists() for a in RL_ARMS for s in CFG.rl_seeds)
     log(f"RL policies on Drive: {done}/{len(RL_ARMS) * len(CFG.rl_seeds)}")
     p = L.policy_dir(RL_ARMS[0], CFG.rl_seeds[0]) / "F_curves.png"
@@ -327,53 +387,61 @@ if RUN["E4_train"]:
 E4_FLY = r"""
 if RUN["E4_fly"]:
     log = L.logger("E4_fly")
-    S5.run_jobs(CFG, S5.jobs_e4(CFG, L, L3, RL_ARMS), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "E4", can_cpu=CAN_CPU)
+    with RG.stage("E4 flights", log):
+        S5.run_jobs(CFG, S5.jobs_e4(CFG, L, L3, RL_ARMS), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "E4", can_cpu=CAN_CPU)
 """
 
 DS1 = r"""
 if RUN["DS1"]:
     log = L.logger("DS1")
-    S5.run_jobs(CFG, S5.jobs_ds1(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "DS1", can_cpu=CAN_CPU)
+    with RG.stage("DS1", log):
+        S5.run_jobs(CFG, S5.jobs_ds1(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "DS1", can_cpu=CAN_CPU)
 """
 
 AS1 = r"""
 if RUN["AS1"]:
     log = L.logger("AS1")
-    S5.run_jobs(CFG, S5.jobs_as1(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "AS1", can_cpu=CAN_CPU)
+    with RG.stage("AS1", log):
+        S5.run_jobs(CFG, S5.jobs_as1(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "AS1", can_cpu=CAN_CPU)
 """
 
 ORB1_MORE = r"""
 if RUN["ORB1_more"]:
     log = L.logger("ORB1")
-    for b in (1, 2):                    # block 3 becomes eligible only once block 2 is complete
-        S5.run_jobs(CFG, S5.orb1_jobs(CFG, L, L3, S5.ORB1_ARMS, [b], "ORB1", log), L, DEVICE, CPU_WORKERS,
-                    GPU_WORKERS, CAN_GPU, log, f"ORB-1 block {b + 1}", can_cpu=CAN_CPU)
-    extra = ["mppi_truth"] + S5.best_arms(CFG, L, L3)
-    S5.run_jobs(CFG, S5.orb1_jobs(CFG, L, L3, extra, [0], "ORB1", log), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU,
-                log, "ORB-1 block 1 extra", can_cpu=CAN_CPU)
+    with RG.stage("ORB-1 blocks 2-3 and extra arms", log):
+        for b in (1, 2):                    # block 3 becomes eligible only once block 2 is complete
+            S5.run_jobs(CFG, S5.orb1_jobs(CFG, L, L3, S5.ORB1_ARMS, [b], "ORB1", log), L, DEVICE, CPU_WORKERS,
+                        GPU_WORKERS, CAN_GPU, log, f"ORB-1 block {b + 1}", can_cpu=CAN_CPU)
+        extra = ["mppi_truth"] + S5.best_arms(CFG, L, L3)
+        S5.run_jobs(CFG, S5.orb1_jobs(CFG, L, L3, extra, [0], "ORB1", log), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU,
+                    log, "ORB-1 block 1 extra", can_cpu=CAN_CPU)
 """
 
 EXPLORE = r"""
 if RUN["explore"]:
     log = L.logger("explore")
-    S5.run_jobs(CFG, S5.jobs_explore(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "exploratory", can_cpu=CAN_CPU)
+    with RG.stage("exploratory arms", log):
+        S5.run_jobs(CFG, S5.jobs_explore(CFG, L, L3), L, DEVICE, CPU_WORKERS, GPU_WORKERS, CAN_GPU, log, "exploratory", can_cpu=CAN_CPU)
 """
 
 OPEN_LOOP = r"""
 if RUN["open_loop"]:
     log = L.logger("open_loop")
-    if CAN_GPU:
-        S5.open_loop_stage(CFG, L, need_data, DEVICE, log)
-    else:
-        log("open loop waits for a GPU runtime")
+    with RG.stage("open loop", log):
+        if CAN_GPU:
+            S5.open_loop_stage(CFG, L, need_data, DEVICE, log)
+        else:
+            log("open loop waits for a GPU runtime")
 """
 
 TIMING = r"""
 if RUN["timing"]:
-    if CAN_GPU:
-        S5.timing_stage(CFG, L, L3, DEVICE, L.logger("timing"))
-    else:
-        L.logger("timing")(f"the timing table waits for a {GPU_TYPE} runtime (its MPPI arms are timed on the GPU)")
+    log = L.logger("timing")
+    with RG.stage("timing", log):
+        if CAN_GPU:
+            S5.timing_stage(CFG, L, L3, DEVICE, log)
+        else:
+            log(f"the timing table waits for a {GPU_TYPE} runtime (its MPPI arms are timed on the GPU)")
 """
 
 GPU_END = r"""
@@ -382,6 +450,7 @@ if not CAN_CPU:                         # a GPU pass: its GPU work is done; ever
     S5.update_manifest(L)
     print(S5.next_pass_note(GPU_TYPE) or "NEXT PASS: a CPU runtime for the analysis and the report.")
     print("The analysis and the report run on the next CPU pass (Runtime -> Change runtime type -> CPU, then Run all).")
+    print(RG.SUMMARY.text())
     release_runtime("GPU pass finished: the CPU stages wait for a CPU runtime")
 else:
     print("CPU runtime: continuing with the analysis and the report")
@@ -391,17 +460,19 @@ ANALYSIS = r"""
 if RUN["analysis"] and not CAN_CPU:
     print("the analysis waits for a CPU runtime (GPU_PASS_SKIPS_CPU)")
 elif RUN["analysis"]:
-    t0 = time.time()
-    R = A5.analyze(CFG, L, L3, L4, log=L.logger("analysis"))
-    pd.set_option("display.max_colwidth", 140)
-    display(R["T05"][["id", "question", "measured", "p_holm", "status"]])
-    PENDING = R["T05"][R["T05"].status == "pending"].id.tolist()
-    if PENDING:
-        print(f"PROVISIONAL: {len(PENDING)} criteria are pending (flights still missing): {', '.join(PENDING)}")
-    for k in ("F01", "F02", "F03", "F06"):
-        if k in R.get("figures", {}):
-            display(Image(str(R["figures"][k])))
-    print(f"analysis in {time.time() - t0:.0f}s")
+    log = L.logger("analysis")
+    with RG.stage("analysis", log):
+        t0 = time.time()
+        R = A5.analyze(CFG, L, L3, L4, log=log)
+        pd.set_option("display.max_colwidth", 140)
+        display(R["T05"][["id", "question", "measured", "p_holm", "status"]])
+        PENDING = R["T05"][R["T05"].status == "pending"].id.tolist()
+        if PENDING:
+            print(f"PROVISIONAL: {len(PENDING)} criteria are pending (flights still missing): {', '.join(PENDING)}")
+        for k in ("F01", "F02", "F03", "F06"):
+            if k in R.get("figures", {}):
+                display(Image(str(R["figures"][k])))
+        print(f"analysis in {time.time() - t0:.0f}s")
 """
 
 REPORT = r"""
@@ -410,11 +481,13 @@ if CAN_CPU:
     if S5.next_pass_note(GPU_TYPE):
         print(S5.next_pass_note(GPU_TYPE))
     if RUN["report"]:
-        print("report:", R5.build_report(L))
+        with RG.stage("report", L.logger("report")):
+            print("report:", R5.build_report(L))
     S5.update_manifest(L)
     print(open(L.study / "README.md", encoding="utf-8").read()[:3000])
 else:
     print("the report waits for a CPU runtime (GPU_PASS_SKIPS_CPU)")
+print(RG.SUMMARY.text())
 """
 
 CELLS = [
@@ -423,9 +496,12 @@ CELLS = [
 ## 0. Settings
 
 `MODE`, `TIER` (decision D1; the stages each tier runs are listed in the intro), `RUN_OVERRIDE` to skip a stage
-this session, auto-disconnect, and worker counts (automatic unless you set them). Nothing else needs editing:
-resuming after a disconnect is Run all. **The notebook disconnects itself** when it finishes or a cell fails;
-`AUTO_DISCONNECT = False` turns that off.
+this session, auto-disconnect, worker counts (automatic unless you set them), and the unattended-run settings:
+`STALL_MIN` (the watchdog), `MAX_SESSION_UNITS` (a unit budget for this session), `UNITS_PER_HOUR` (this runtime's
+rate, if Colab shows another) and `STOP_ON_FAILURE`. Nothing else needs editing: resuming after a disconnect is
+Run all. **The notebook disconnects itself** when it finishes, a cell fails, the watchdog sees no progress for
+`STALL_MIN` minutes or the budget is used up; `AUTO_DISCONNECT = False` turns that off (and `STALL_MIN = None` the
+watchdog alone).
 """),
     ("code", SETTINGS),
     ("md", r"""
@@ -435,9 +511,12 @@ Clones (or pulls) the `space-jepa5` branch into its own folder, installs `pymsis
 opens the v3 folder (required) and the v4 folder (R0's flights and open loop; RQ2's comparison waits without it)
 read-only, repairs the v5 folder (stale `.tmp` files, unreadable flight files, `.done` markers whose artifacts are
 missing; v5_plan.md §9.1 rule 8), and freezes `00_study/study_config.json` (a later session with different
-non-runtime settings raises instead of mixing results). Registers the auto-disconnect hook (CLAUDE.md). A minute.
+non-runtime settings raises instead of mixing results). Registers the auto-disconnect hook first (CLAUDE.md), so a
+failure anywhere in Setup also releases the runtime; checks the notebook's revision (an old copy stops here); starts
+the watchdog and the session budget; marks DAgger's first tuning `DEPRECATED.md` (kept, ignored; section 15). A
+minute.
 """),
-    ("code", SETUP + AUTO_DISCONNECT_V5),
+    ("code", SETUP),
     ("md", r"""
 ## 2. Status
 
@@ -484,27 +563,22 @@ Vf from the DEV48 classical flights, then random search: 24 configurations each 
 (configuration 0 = the defaults), then 12 more around each law's best (`refine.json` records them), and 12 per RL
 method at a reduced budget. Objective: success@5km, then mean log miss, subject to mean peak g ≤ 4.6 g. Each
 configuration's DEV48 score is saved as `03_tuning/<method>/config_<j>.json` when its flights are done;
-`chosen.json` freezes the choice. Test flights of a method wait until it is chosen. FNPEG and PredGuid tune on a CPU
-runtime; RL tunes on the GPU once FNPEG is chosen (each RL configuration's 48 scoring flights fly in the same pass).
+`chosen.json` freezes the choice. Test flights of a method wait until it is chosen. FNPEG and PredGuid tune here,
+on a CPU runtime; RL tunes in section 15 (GPU, last), once FNPEG is chosen and the arm's competence gates passed.
 """),
     ("code", TUNING),
     ("md", r"""
-## 7. A256: FNPEG, PredGuid, MPPI + filtered physics, v2 at FNPEG's load
+## 6b. RL imitation and gates RV1–RV2 (CPU runtime)
 
-The guidance laws on a CPU pool (one lockstep batch per task), `mppi_filtered` for 5 noise indices on the GPU (its
-filter uses FNPEG's tuned β, so it waits for FNPEG's tuning), then `v2single@fnpeg_matched` (soft g limit = FNPEG's realized peak g on each condition). One JSON + `.npz` per flight
-the moment it lands; finished flights are skipped.
+The imitation arms' CPU work: DAgger's FNPEG labelling, supervised fit and scoring, BC's expert dataset and clone,
+then their competence gates on held-out episodes (RV1: sign accuracy at least 5 points above the best trivial
+baseline and |bank| error ≤ 10°; RV2: the policy alone reaches ≥ 50 % of FNPEG's fast-environment success;
+`01_checks/RV*_<arm>.json`). **An RL arm tunes and trains only after its gates pass**; until then it waits with a
+note (section 15, 2026-11-18: DAgger's first tuning underfitted, and is kept under `DEPRECATED.md`, ignored).
 """),
-    ("code", A256),
+    ("code", RL_IMITATION),
     ("md", r"""
-## 8. ORB-1 block 1
-
-`classical`, `fnpeg`, `predguid`, `mppi_filtered`, `v2single` on cases 0–999 (case i flies training seed i mod 5).
-Classical costs ~90 CPU-seconds per flight: a high-CPU CPU runtime is the cheap way to fly it.
-"""),
-    ("code", ORB1),
-    ("md", r"""
-## 9. E3 training: four non-JEPA dynamics models × 5 seeds
+## 7. E3 training: four non-JEPA dynamics models × 5 seeds
 
 `mlp_direct`, `gru_direct`, `gru_pi`, `r0_nojepa`, each sized to R0's parameter count, trained with free-running
 rollouts; learning rate chosen from {×1, ×0.3, ×3} on the validation split's open-loop loss. Train state to Drive
@@ -512,14 +586,84 @@ every 5 minutes (and `.prev`); `ckpt.pt` marks a model done.
 """),
     ("code", E3_TRAIN),
     ("md", r"""
-## 10. E3 flights
+## 8. E3 flights
 
 Each model × 5 seeds under v2's MPPI at 4.5 g on A256. A model not trained yet is skipped with a note.
 """),
     ("code", E3_FLY),
     ("md", r"""
-## 11. E4 RL training
+## 9. A256: FNPEG, PredGuid, MPPI + filtered physics, v2 at FNPEG's load
 
+The guidance laws on a CPU pool (one lockstep batch per task), `mppi_filtered` for 5 noise indices on the GPU (its
+filter uses FNPEG's tuned β, so it waits for FNPEG's tuning), then `v2single@fnpeg_matched` (soft g limit = FNPEG's realized peak g on each condition). One JSON + `.npz` per flight
+the moment it lands; finished flights are skipped.
+"""),
+    ("code", A256),
+    ("md", r"""
+## 10. ORB-1 block 1
+
+`classical`, `fnpeg`, `predguid`, `mppi_filtered`, `v2single` on cases 0–999 (case i flies training seed i mod 5).
+Classical costs ~90 CPU-seconds per flight: a high-CPU CPU runtime is the cheap way to fly it.
+"""),
+    ("code", ORB1),
+    ("md", r"""
+## 11. DS1: density errors that change during flight
+
+A256's 64 entry cases under four altitude-varying density profiles (`configs/benchmark_v5/DS1.json`): two ±15%
+shears that cross over between 40 and 70 km, and two GRAM-like random profiles (the second with L/D × 0.92).
+`classical`, `fnpeg`, `predguid`, `mppi_filtered`, `v2single` and the Tier 1 RL policies, one flight per condition
+(a seeded arm flies seed case mod 5). Guidance laws wait for tuning and RL arms for their policies; 2,048 flights
+in all: 512 MPPI flights (`mppi_filtered`, `v2single`) on the GPU, the rest on the CPU pool (`classical` is the
+slow one, ~6 CPU-hours for its 256).
+"""),
+    ("code", DS1),
+    ("md", r"""
+## 11b. AS1: the published Orion aerodynamics
+
+A256's 64 entry cases in nominal air, the true vehicle flying the published Orion trim aerodynamics
+(`configs/benchmark_v5/AS1.json`): `bibb_ld` (lower L/D) and `bibb_ld_cd` (lower L/D and CD). No controller's
+model is changed. The same eight arms and seed rule as DS1: 1,024 flights, 256 of them MPPI flights on the GPU, the
+rest on the CPU pool (`classical`: ~3 CPU-hours for its 128). Each condition carries a flag telling whether its
+target is still inside the true vehicle's 4.5 g footprint (60 of 64 for either vehicle).
+"""),
+    ("code", AS1),
+    ("md", r"""
+## 12. Exploratory arms: the laws as published, and FNPEG's ceiling
+
+`fnpeg_180` and `predguid_180` (the same tuned laws with the published 180° bank range instead of the 90° every
+learned controller has), `fnpeg_oracle` (FNPEG's predictor given the true parameters) and `fnpeg_norelief` (the tuned
+FNPEG with Lu's load relief switched off) on A256: what the 90° handle costs the published laws, how far FNPEG is
+from its own ceiling, and whether its load relief costs it accuracy (G7, estimates). CPU only.
+"""),
+    ("code", EXPLORE),
+    ("md", r"""
+## 12b. Tier 2: ORB-1 blocks 2–3 and extra ORB-1 arms
+
+Blocks 2 and 3 for the arms still eligible (fewer than 2 misses beyond 10 km in the blocks before; recomputed from
+Drive), and `mppi_truth` and the best non-JEPA and RL arms on block 1. Off in Tier 1.
+"""),
+    ("code", ORB1_MORE),
+    ("md", r"""
+## 13. Open loop
+
+Footprint error of each E3 model and seed on the test split from 400 to 50 s to go
+(`03_open_loop/footprint_<arm>_seed<k>.csv`). Cached per file.
+"""),
+    ("code", OPEN_LOOP),
+    ("md", r"""
+## 14. Compute per decision (GPU runtime)
+
+RQ5's timing table: one flight per arm, single CPU thread, and on the GPU for the MPPI arms. The classical controller
+appears twice: as flown, and with its diagnostic interval heat screen off (`classical_noscreen`). A law is timed once
+it is tuned, an RL arm once its seed-0 policy exists. Cached per (arm, device).
+"""),
+    ("code", TIMING),
+    ("md", r"""
+## 15. E4 RL: gate RV3, tuning and training (GPU, last)
+
+The GPU pass's last stage, so a slow RL run never holds up the other GPU work. First the PPO pilot gate RV3 (the
+return rises, success@5km > 0, no NaNs), then, for each arm whose gates passed, its DEV48 tuning (12 configurations
+at a reduced budget, each scored by its 48 full-simulator flights) and its training:
 `dagger_fnpeg`, `bcppo_fnpeg`, `ppo_hist` (Tier 2: `sac_hist`, `ppo_matched`), 5 seeds each, in the batched fast
 environment (ppo_matched: the full simulator). Checkpoints every 5 minutes with optimizer, normalizer and RNG
 state; learning curves redrawn at each; `policy.pt` marks a run done; then each policy's fast-environment success
@@ -532,66 +676,14 @@ longer used (2026-11-17, `jepa/v5_plan.md` §15). The DAgger and BC experts use 
 CUDA there is logged in the run's `hardware.json`, not refused. RL is the largest GPU cost of the study: check the
 units left before a long pass (the status cell's projection).
 """),
-    ("code", E4_TRAIN),
+    ("code", RL_TRAIN),
     ("md", r"""
-## 12. E4 flights
+## 15a. E4 flights
 
 Every RL policy in the full simulator on A256 (deterministic, one flight per condition and training seed) and its
 snapshots on the DEV48 learning-curve cases.
 """),
     ("code", E4_FLY),
-    ("md", r"""
-## 12b. DS1: density errors that change during flight
-
-A256's 64 entry cases under four altitude-varying density profiles (`configs/benchmark_v5/DS1.json`): two ±15%
-shears that cross over between 40 and 70 km, and two GRAM-like random profiles (the second with L/D × 0.92).
-`classical`, `fnpeg`, `predguid`, `mppi_filtered`, `v2single` and the Tier 1 RL policies, one flight per condition
-(a seeded arm flies seed case mod 5). Guidance laws wait for tuning and RL arms for their policies; 2,048 flights
-in all: 512 MPPI flights (`mppi_filtered`, `v2single`) on the GPU, the rest on the CPU pool (`classical` is the
-slow one, ~6 CPU-hours for its 256).
-"""),
-    ("code", DS1),
-    ("md", r"""
-## 12c. AS1: the published Orion aerodynamics
-
-A256's 64 entry cases in nominal air, the true vehicle flying the published Orion trim aerodynamics
-(`configs/benchmark_v5/AS1.json`): `bibb_ld` (lower L/D) and `bibb_ld_cd` (lower L/D and CD). No controller's
-model is changed. The same eight arms and seed rule as DS1: 1,024 flights, 256 of them MPPI flights on the GPU, the
-rest on the CPU pool (`classical`: ~3 CPU-hours for its 128). Each condition carries a flag telling whether its
-target is still inside the true vehicle's 4.5 g footprint (60 of 64 for either vehicle).
-"""),
-    ("code", AS1),
-    ("md", r"""
-## 13. Exploratory arms: the laws as published, and FNPEG's ceiling
-
-`fnpeg_180` and `predguid_180` (the same tuned laws with the published 180° bank range instead of the 90° every
-learned controller has), `fnpeg_oracle` (FNPEG's predictor given the true parameters) and `fnpeg_norelief` (the tuned
-FNPEG with Lu's load relief switched off) on A256: what the 90° handle costs the published laws, how far FNPEG is
-from its own ceiling, and whether its load relief costs it accuracy (G7, estimates). CPU only.
-"""),
-    ("code", EXPLORE),
-    ("md", r"""
-## 13b. Tier 2: ORB-1 blocks 2–3 and extra ORB-1 arms
-
-Blocks 2 and 3 for the arms still eligible (fewer than 2 misses beyond 10 km in the blocks before; recomputed from
-Drive), and `mppi_truth` and the best non-JEPA and RL arms on block 1. Off in Tier 1.
-"""),
-    ("code", ORB1_MORE),
-    ("md", r"""
-## 14. Open loop
-
-Footprint error of each E3 model and seed on the test split from 400 to 50 s to go
-(`03_open_loop/footprint_<arm>_seed<k>.csv`). Cached per file.
-"""),
-    ("code", OPEN_LOOP),
-    ("md", r"""
-## 15. Compute per decision (GPU runtime)
-
-RQ5's timing table: one flight per arm, single CPU thread, and on the GPU for the MPPI arms. The classical controller
-appears twice: as flown, and with its diagnostic interval heat screen off (`classical_noscreen`). A law is timed once
-it is tuned, an RL arm once its seed-0 policy exists. Cached per (arm, device).
-"""),
-    ("code", TIMING),
     ("md", r"""
 ## 15b. A GPU pass ends here
 

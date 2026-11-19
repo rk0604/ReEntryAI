@@ -29,6 +29,9 @@ default <tempdir>/jepa_v4_smoke/: wide_smoke/, v3_smoke/, v4_smoke/; v4_smoke ma
   15 outputs: every table and figure (PNG and PDF), curves, captions, logs, status files and the report exist
   16 RL on Kaggle: inputs exported, two notebook sessions (restore, resume), one platform enforced, import into
      Drive (finished runs only, checked, nothing overwritten)
+  17 unattended runs (2026-11-18): a broken arm recorded and skipped while later stages run; the watchdog (release
+     mocked) and the watchdog test notebook; a NaN stops only that E3 model; the deprecated DAgger tuning kept
+     untouched and ignored; RL gates; the session budget; the crash hook and the notebook revision (an old copy stops)
 
     python jepa/smoke_v5.py [--work <dir>] [--workers N] [--only 1,2,...]
 """
@@ -254,7 +257,7 @@ def t1_gpu_pass() -> None:
     src = ["".join(c["source"]) for c in json.loads(nb)["cells"] if c["cell_type"] == "code"]
     at = lambda txt: [i for i, c in enumerate(src) if txt in c]
     end = at('release_runtime("GPU pass finished')
-    gpu_work = at("S5.run_jobs(") + at("S5.train_e3_stage(") + at("S5.train_rl_stage(") + at("S5.tune_rl(")         + at("S5.open_loop_stage(") + at("S5.timing_stage(")
+    gpu_work = at("S5.run_jobs(") + at("S5.train_e3_stage(") + at("S5.rl_stage(") + at("S5.rl_gates_stage(")         + at("S5.open_loop_stage(") + at("S5.timing_stage(")
     cpu_after = at("A5.analyze(") + at("R5.build_report(")
     order = len(end) == 1 and max(gpu_work) < end[0] < min(cpu_after) and all(
         "if not CAN_CPU" in src[i] or "elif RUN" in src[i] or "if CAN_CPU" in src[i] for i in cpu_after)
@@ -781,7 +784,7 @@ def t10_guard(tmp: Path, ro: dict) -> None:
 def nb_env(root: Path, fx: dict, fail: str = None) -> dict:
     env = {**os.environ, "JEPA_V5_MODE": "smoke", "JEPA_V5_ROOT": str(root), "JEPA_V3_ROOT": str(fx["v3"]),
            "JEPA_V4_ROOT": str(fx["v4"]), "JEPA_WIDE_DATA": str(fx["data"]), "JEPA_V5_LEGACY": str(fx["legacy"]),
-           "PYTHONIOENCODING": "utf-8"}
+           "PYTHONIOENCODING": "utf-8", "JEPA_V5_RL_GATES_PASS": "1"}
     env.pop("JEPA_V5_FAIL_AT", None)
     if fail:
         env["JEPA_V5_FAIL_AT"] = fail
@@ -870,6 +873,10 @@ def t10_notebook(work: Path, fx: dict, keep: bool = False) -> Path:
     flown = re.findall(r"\[[^\]]+\] \d+/\d+ done, (\d+) to fly", txt)
     check("run 2: no flight flown, no model trained", all(int(x) == 0 for x in flown) and "ms/step" not in txt,
           f"({len(flown)} queues checked)")
+    summ = (root / "00_study" / "RUN_SUMMARY.txt").read_text(encoding="utf-8")         if (root / "00_study" / "RUN_SUMMARY.txt").exists() else ""
+    check("RUN_SUMMARY.txt after run 2: no failure, released because all cells finished",
+          "failures this session: none" in summ and "RELEASED: " in summ and "all cells finished" in summ,
+          f"({summ[:300]!r})")
     check("v3, v4 and legacy folders untouched by the whole smoke study", m_in == _mtimes([fx["v3"], fx["v4"],
                                                                                          fx["legacy"]]))
     return root
@@ -1086,9 +1093,9 @@ def t13_repair(root: Path, work: Path, fx: dict) -> None:
     shutil.rmtree(c, ignore_errors=True)
 
 
-# in the notebook's stage order, so each lands in a stage the earlier runs have not finished: legacy flights,
-# RL tuning (DAgger), the A256 MPPI arms, E3 training, E3 flights, E4 training, E4 flights
-FAILS = ["cpu_flights:3", "rl_train:1", "mppi_flights:2", "e3_train:4", "mppi_flights:1", "rl_train:1",
+# in the notebook's stage order (2026-11-18: E3 first, RL last), so each lands in a stage the earlier runs have not
+# finished: legacy flights, E3 training, E3 flights, the A256 MPPI arms, RL tuning (DAgger), E4 training, E4 flights
+FAILS = ["cpu_flights:3", "e3_train:4", "mppi_flights:1", "mppi_flights:2", "rl_train:1", "rl_train:1",
          "cpu_flights:2"]
 
 
@@ -1299,8 +1306,7 @@ def t16_kaggle(work: Path) -> None:
     # notebook stay as a tested by-hand route, checked below
     check("Colab notebook: no Kaggle step; RL tuning and training run in the notebook on the GPU",
           "RL_ON_KAGGLE" not in nb and "K.export_inputs" not in nb and "K.import_rl" not in nb
-          and "S5.tune_rl(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log)" in nb
-          and "S5.train_rl_stage(CFG, L, RL_ARMS, DEVICE, log)" in nb)
+          and "S5.rl_stage(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log, CAN_GPU)" in nb)
     src = work / "v5_smoke"
     if not (src / "03_tuning" / "fnpeg" / "chosen.json").exists():
         check("Kaggle check needs check 10's smoke study (FNPEG tuned)", False, f"({src})")
@@ -1348,7 +1354,7 @@ def t16_kaggle(work: Path) -> None:
         K.check_platform(L2, {**hw, "gpu": "Tesla P100-PCIE-16GB"})
     except RuntimeError:
         refused.append("session")
-    run_d = base / "live1" / "03_tuning" / "rl_dagger_fnpeg" / "config_00"
+    run_d = base / "live1" / "03_tuning" / S5.rl_method("dagger_fnpeg") / "config_00"
     if (run_d / "hardware.json").exists():
         h = json.loads((run_d / "hardware.json").read_text())
         (run_d / "hardware.json").write_text(json.dumps({**h, "gpu": "Tesla P100-PCIE-16GB"}))
@@ -1404,6 +1410,271 @@ def t16_kaggle(work: Path) -> None:
                                               f"{n_before} files)")
 
 
+# ============================================================================
+# 17. Unattended runs (section 15, 2026-11-18)
+# ============================================================================
+def _wd_wait(w, s: float) -> None:
+    t0 = time.time()
+    while time.time() - t0 < s and not w.acted.is_set():
+        time.sleep(0.05)
+
+
+def t17_unattended(tmp: Path, fx: dict) -> None:
+    section("17. unattended runs: failures recorded and skipped, the watchdog, E3 early stop, the deprecated "
+            "DAgger tuning, the budget, the crash hook and the notebook revision")
+    import dataclasses
+    import hashlib
+    from jepa import analyze_v5 as A5
+    from jepa import models_v5 as M5
+    from jepa import runguard_v5 as RG
+    from jepa import study_v5 as S5
+    from jepa import train_v2 as T2
+    base = tmp / "unattended"
+    shutil.rmtree(base, ignore_errors=True)
+    RG.BEAT_DIR = base / "beat"                       # not the notebook runs' beat files (checks 10 and 14)
+    L = S5.LayoutV5(base / "study").make()
+    cfg = S5.StudyConfigV5.smoke()
+    released, logs = [], []
+    log = lambda *a: logs.append(" ".join(str(x) for x in a))
+    RG.configure(L, {"test": "17"}, 1.0, released.append)
+
+    # (a) an arm whose flights raise: recorded and stopped; the next stage runs
+    conds = S5.conditions(cfg, "DEV48")[:12]
+    jobs = [S5.classical_job(c, "test", "classical_broken") for c in conds]
+    old = os.environ.get(S5.FAULT_ENV)
+    os.environ[S5.FAULT_ENV] = "flight:classical_broken"
+    try:
+        with RG.stage("broken arm", log):
+            S5.run_cpu(cfg, jobs, L, 1, log, "broken arm")
+        later = False
+        with RG.stage("later stage", log):
+            later = True
+    finally:
+        os.environ.pop(S5.FAULT_ENV, None) if old is None else os.environ.__setitem__(S5.FAULT_ENV, old)
+    errs = sorted((L.flights / "errors").rglob("*.json")) if (L.flights / "errors").exists() else []
+    rec = S5._read_json(L.checks / "stage_broken_arm_failed.json") or {}
+    st = {s_["name"]: s_["status"] for s_ in RG.SUMMARY.stages}
+    summ = (L.study / "RUN_SUMMARY.txt").read_text(encoding="utf-8")
+    check("17. a stage whose flights all raise: each retried once and recorded (04_flights/errors/), the stage "
+          "stopped and recorded (01_checks/stage_<label>_failed.json, RUN_SUMMARY.txt), the next stage runs",
+          later and st == {"broken arm": "FAILED", "later stage": "done"} and len(errs) == len(jobs)
+          and f"first {len(jobs)} flights" in rec.get("reason", "") and "broken arm" in summ and not released
+          and not list((L.flights / "results").rglob("*.json")), f"({st}, {len(errs)} error files, {rec})")
+    RG.STATE["stop_on_failure"] = True
+    raised = False
+    try:
+        with RG.stage("stop on failure", log):
+            raise RG.StageFailed("test")
+    except RG.StageFailed:
+        raised = True
+    RG.STATE["stop_on_failure"] = False
+    check("17. STOP_ON_FAILURE = True re-raises (the crash hook then releases the runtime)", raised)
+
+    # (b) the watchdog (release mocked)
+    acts = []
+    w = RG.Watchdog(0.03, RG.stall_action(L, acts.append), check_s=0.1)       # 1.8 s
+    RG.touch("start")
+    w.start()
+    t0 = time.time()
+    while time.time() - t0 < 3.5:                     # progress every 0.3 s: no stall
+        RG.touch("working")
+        time.sleep(0.3)
+    kept = w.fired is None
+    with RG.allow("a long silent step", 1.0):         # allowed for 1 min: 3 s of silence is fine
+        time.sleep(3.0)
+    allowed = w.fired is None
+    RG.BEAT_DIR.mkdir(parents=True, exist_ok=True)
+    beat = RG.BEAT_DIR / "999999"                     # a pool worker's beat file
+    for _ in range(12):
+        beat.write_text("worker")
+        time.sleep(0.3)
+    worker = w.fired is None
+    _wd_wait(w, 10.0)
+    w.stop()
+    wlog = (L.logs / "watchdog.log").read_text(encoding="utf-8") if (L.logs / "watchdog.log").exists() else ""
+    summ = (L.study / "RUN_SUMMARY.txt").read_text(encoding="utf-8")
+    check("17. watchdog: progress, an allow() block and a worker's beat file keep it quiet; a stall releases the "
+          "runtime once, with the reason in logs/watchdog.log and RUN_SUMMARY.txt",
+          kept and allowed and worker and w.fired is not None and len(acts) == 1 and "watchdog" in acts[0]
+          and "no progress" in wlog and "RELEASED: " in summ and "watchdog" in summ,
+          f"(quiet {kept}/{allowed}/{worker}, fired {w.fired!r}, releases {acts})")
+    w2 = RG.Watchdog(0.02, lambda r: (_ for _ in ()).throw(RuntimeError("release failed")), check_s=0.1)
+    w2.start()
+    _wd_wait(w2, 6.0)
+    check("17. watchdog: a release that raises does not leave the thread hanging", w2.acted.is_set())
+
+    # (c) a NaN in one E3 model's loss: only that model stops
+    eps = T2.load_episodes(fx["data"])[:60]
+    data = T2.prepare(eps, 16, "cpu", 25, split_seed=0)
+    c3 = _e3_cfg()
+    c3.e3_arms, c3.seeds, c3.lr_mults = ("mlp_direct",), (0, 1), (1.0,)
+    os.environ[M5.NAN_ENV] = "mlp_direct seed 1"
+    try:
+        S5.train_e3_stage(c3, L, lambda: data, "cpu", log)
+        n_before = len(logs)
+        S5.train_e3_stage(c3, L, lambda: data, "cpu", log)          # rerun: the stopped model is skipped
+    finally:
+        os.environ.pop(M5.NAN_ENV, None)
+    f1 = S5.e3_failed(L, "mlp_direct", 1) or {}
+    again = " ".join(logs[n_before:])
+    check("17. a NaN loss stops only that E3 model: failed.json (diverged), the other seed trained, a rerun skips it",
+          L.ckpt("mlp_direct", 0).exists() and not L.ckpt("mlp_direct", 1).exists()
+          and f1.get("status") == "diverged" and "nan" in f1.get("reason", "") and "ms/step" not in again
+          and "stopped earlier and skipped" in again, f"({f1}; rerun: {again[:200]})")
+    h = {"val": [], "T": [], "step": []}
+    rules = []
+    for v, t, k in [(1.0, 24, 500), (0.9, 24, 1000), (0.8, 24, 1500), (0.7, 48, 7500)]:
+        h["val"].append(v); h["T"].append(t); h["step"].append(k)
+    rules.append(M5.stop_rule(h, 36000, val0=2.0) == "")                    # learning: go on
+    rules.append("not learning" in M5.stop_rule(h, 36000, val0=0.5))         # never below the untrained loss
+    h2 = {"val": [1.0, 0.5, 1.6], "T": [24, 24, 24], "step": [500, 1000, 1500]}
+    rules.append("diverging" in M5.stop_rule(h2, 36000, val0=2.0))
+    h3 = {"val": [1.0, 0.5, 3.0], "T": [24, 24, 48], "step": [500, 1000, 1500]}
+    rules.append(M5.stop_rule(h3, 36000, val0=2.0) == "")                   # a longer horizon is not divergence
+    check("17. E3 stop rule: diverging (3x its best at that horizon), not learning by 20 % of the steps, never for "
+          "a longer horizon's larger loss", all(rules), f"({rules})")
+
+    # (d) the deprecated DAgger tuning: kept as it is, marked, ignored
+    old_files = {"03_tuning/rl_dagger_fnpeg/configs.csv": b"config_index,score\n0,0.0\n",
+                 "03_tuning/rl_dagger_fnpeg/config_00.json": b'{"score": 0}',
+                 "03_tuning/rl_dagger_fnpeg/config_00/policy.pt": b"weights",
+                 "04_flights/results/DEV48/tune_dagger_fnpeg_c00/seed0/a.json": b'{"flight_id": "x"}',
+                 "04_flights/results/DEV48/tune_dagger_fnpeg_c10/seed0/b.json": b"{broken",
+                 "04_flights/telemetry/DEV48/tune_dagger_fnpeg_c00/seed0/a.npz": b"npz",
+                 "03_tuning/fnpeg/configs.csv": b"config_index,score\n0,1.0\n"}
+    for rel, b in old_files.items():
+        (L.root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (L.root / rel).write_bytes(b)
+    snap = lambda: {rel: (hashlib.sha256((L.root / rel).read_bytes()).hexdigest(), os.stat(L.root / rel).st_mtime_ns)
+                    for rel in old_files}
+    s0 = snap()
+    m1 = S5.mark_deprecated(L, log)
+    m2 = S5.mark_deprecated(L, log)
+    (L.study / "repair_state.json").unlink(missing_ok=True)       # repair checks every flight file
+    S5.repair(L, log)
+    tt = A5.tuning_table(L)
+    check("17. deprecated DAgger tuning: DEPRECATED.md in its 4 folders (once), every old file kept unchanged "
+          "(a broken one too, repair skips them), the analysis' tuning table ignores it, the report lists it, the "
+          "refit tunes under new keys",
+          len(m1) == 4 and m2 == [] and snap() == s0 and set(tt.method) == {"fnpeg"}
+          and len(S5.deprecated_list(L)) == 4 and S5.rl_method("dagger_fnpeg") == "rl_dagger_fnpeg_fit2"
+          and S5.rl_method("ppo_hist") == "rl_ppo_hist" and S5.RL_TUNE_SUFFIX["dagger_fnpeg"] == "_fit2"
+          and all((L.root / d / "DEPRECATED.md").exists() for d in S5.deprecated_list(L)),
+          f"(marked {m1}, again {m2}, tuning methods {sorted(set(tt.method))})")
+
+    # (e) RL competence gates
+    g0 = S5.rl_gate(L, "dagger_fnpeg")
+    L.write_json(S5.rl_gate_path(L, "RV1", "dagger_fnpeg"), {"passed": True})
+    L.write_json(S5.rl_gate_path(L, "RV2", "dagger_fnpeg"), {"passed": False, "reason": "12 % of FNPEG"})
+    g1 = S5.rl_gate(L, "dagger_fnpeg")
+    L.write_json(S5.rl_gate_path(L, "RV2", "dagger_fnpeg"), {"passed": True})
+    g2 = S5.rl_gate(L, "dagger_fnpeg")
+    rs = S5.rl_stage(cfg, L, ["ppo_hist", "ppo_matched"], "cpu", 1, log, True)
+    check("17. RL gates: an arm waits without its gate files, is refused on a failed gate, passes when all pass; "
+          "rl_stage tunes and trains nothing whose gate has not passed (ppo_matched uses ppo_hist's)",
+          not g0[0] and "waits" in g0[1] and not g1[0] and "failed" in g1[1] and g2[0] and rs["ready"] == []
+          and set(rs["waiting"]) == {"ppo_hist", "ppo_matched"} and not (L.tuning / "rl_ppo_hist").exists(),
+          f"({g0}, {g1}, {g2}, {rs})")
+
+    # (f) the session budget: nothing starts that does not fit; the stage then releases the runtime
+    lim = S5.SessionLimit(deadline=RG.deadline(0.1, 1.0))           # 6 minutes < the 15 min margin
+    S5.set_session_limit(lim)
+    released.clear()
+    RG.configure(L, {"test": "17 budget"}, 1.0, released.append, lim, 0.1)
+    js = [S5.classical_job(c, "test", "classical_budget") for c in conds[:2]]
+    try:
+        with RG.stage("over budget", log):
+            n = S5.run_cpu(cfg, js, L, 1, log, "budget")
+    finally:
+        S5.set_session_limit(None)
+    check("17. MAX_SESSION_UNITS: a flight group that does not fit does not start, and the runtime is released "
+          "with the reason", n == 0 and lim.stopped and len(released) == 1 and "budget" in released[0]
+          and not list((L.flights / "results" / "DEV48").glob("classical_budget*")), f"({n}, {released})")
+
+    # (g) the notebook: crash hook first, revision check, an old copy stops at Setup and releases
+    nbp = SIM_DIR / "ReEntryAI_JEPA_v5.ipynb"
+    nb = json.loads(nbp.read_text(encoding="utf-8"))
+    src = ["".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code"]
+    setup = next(c for c in src if "S5.notebook_check(NOTEBOOK_REV)" in c)
+    i_hook = setup.find('_ip.events.register("post_run_cell", _release_on_error)')
+    order = 0 <= i_hook < setup.find("S5.notebook_check(") < setup.find("S5.repair(") < setup.find(
+        "S5.check_gpu_platform(")
+    settings = next(c for c in src if "NOTEBOOK_REV = " in c)
+    check("17. notebook: the crash hook is registered first in Setup (before the revision check, repair and the GPU "
+          "check), the unattended settings are in the Settings cell, the last cell releases the runtime",
+          order and f"NOTEBOOK_REV = {S5.NOTEBOOK_REV}" in settings and "STALL_MIN = 45" in settings
+          and "MAX_SESSION_UNITS = None" in settings and "STOP_ON_FAILURE = False" in settings
+          and src[-1].strip() == 'release_runtime("all cells finished")')
+    S5._NB["rev"] = None
+    bad = []
+    for rev in (S5.NOTEBOOK_REV - 1, "x"):
+        try:
+            S5.notebook_check(rev)
+        except RuntimeError as e:
+            bad.append("GitHub" in str(e))
+    os.environ[S5.NB_GUARD_ENV] = "1"
+    try:
+        try:
+            S5.notebook_guard()
+            guarded = False
+        except RuntimeError as e:
+            guarded = "old copy" in str(e)
+        S5.notebook_check(S5.NOTEBOOK_REV)
+        S5.notebook_guard()
+    finally:
+        os.environ.pop(S5.NB_GUARD_ENV, None)
+        S5._NB["rev"] = None
+    check("17. notebook revision: another revision is refused at Setup, a notebook whose Setup did not check it is "
+          "refused by its status cell, the current one passes", bad == [True, True] and guarded, f"({bad})")
+    runs = base / "nb"
+    runs.mkdir(parents=True)
+    old_nb = subprocess.run(["git", "show", "d2e7cec:StochasticEntrySim/ReEntryAI_JEPA_v5.ipynb"], capture_output=True,
+                            cwd=SIM_DIR)
+    stale = SIM_DIR / "_smoke17_stale.ipynb"          # next to the real one: the notebook needs that folder as cwd
+    wrong = SIM_DIR / "_smoke17_rev1.ipynb"
+    outs = {}
+    try:
+        stale.write_bytes(old_nb.stdout)
+        wrong.write_text(nbp.read_text(encoding="utf-8").replace(f"NOTEBOOK_REV = {S5.NOTEBOOK_REV}",
+                                                                  "NOTEBOOK_REV = 1"), encoding="utf-8")
+        for tag, path in (("stale", stale), ("rev1", wrong)):
+            env = {**nb_env(base / f"study_{tag}", fx), S5.NB_GUARD_ENV: "1",
+                   "JEPA_V5_BEAT_DIR": str(base / "beat_nb")}
+            r = subprocess.run([sys.executable, "-m", "nbconvert", "--to", "notebook", "--execute",
+                                "--ExecutePreprocessor.timeout=900", "--output-dir", str(runs), "--output",
+                                f"{tag}_out.ipynb", path.name], env=env, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", cwd=SIM_DIR)
+            outs[tag] = (r.returncode, _nb_text(runs / f"{tag}_out.ipynb") + r.stderr)
+    finally:
+        stale.unlink(missing_ok=True)
+        wrong.unlink(missing_ok=True)
+    ok_stale = outs["stale"][0] != 0 and "old copy" in outs["stale"][1] and "a cell failed" in outs["stale"][1]
+    ok_rev1 = outs["rev1"][0] != 0 and "revision 1" in outs["rev1"][1] and "a cell failed" in outs["rev1"][1] \
+        and not (base / "study_rev1" / "00_study" / "study_config.json").exists()
+    if not (ok_stale and ok_rev1):
+        print(outs["stale"][1][-2500:], outs["rev1"][1][-2500:])
+    check("17. an old copy of the notebook (d2e7cec) stops at its status cell and a wrong revision at Setup, before "
+          "anything is written; the crash hook releases the runtime in both", ok_stale and ok_rev1,
+          f"(stale {outs['stale'][0]}, rev1 {outs['rev1'][0]})")
+
+    # (h) the watchdog test notebook (CPU, Colab) in smoke mode
+    subprocess.run([sys.executable, "jepa/build_notebook_watchdog_test.py"], check=True, capture_output=True)
+    env = {**os.environ, "JEPA_WD_TEST_MODE": "smoke", "JEPA_WD_TEST_ROOT": str(base / "wd_test"),
+           "JEPA_V5_BEAT_DIR": str(base / "beat_wd"), "PYTHONIOENCODING": "utf-8"}
+    r = subprocess.run([sys.executable, "-m", "nbconvert", "--to", "notebook", "--execute",
+                        "--ExecutePreprocessor.timeout=300", "--output-dir", str(runs), "--output", "wd_out.ipynb",
+                        "ReEntryAI_watchdog_test.ipynb"], env=env, capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", cwd=SIM_DIR)
+    txt = _nb_text(runs / "wd_out.ipynb")
+    wdn = json.loads((SIM_DIR / "ReEntryAI_watchdog_test.ipynb").read_text(encoding="utf-8"))
+    check("17. the watchdog test notebook passes in smoke mode, opens on a CPU runtime and releases at the end",
+          r.returncode == 0 and "watchdog test passed" in txt and "accelerator" not in wdn["metadata"]
+          and "".join(wdn["cells"][-1]["source"]).strip() == 'release_runtime("all cells finished")',
+          f"(exit {r.returncode}) {r.stderr[-500:] if r.returncode else ''}")
+    RG.SUMMARY.L = None
+    RG.STATE.update({"release": None, "limit": None, "stop_on_failure": False})
+
+
 def main(work: Path, workers: int, only=None, keep: bool = False) -> None:
     t_all = time.time()
     torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
@@ -1453,6 +1724,8 @@ def main(work: Path, workers: int, only=None, keep: bool = False) -> None:
             print("\nmeasured smoke throughput per arm type (CPU):\n" + tp.to_string(index=False))
     if run(16):
         t16_kaggle(work)
+    if run(17):
+        t17_unattended(tmp, fx)
     shutil.rmtree(tmp, ignore_errors=True)
     n_ok = sum(ok for _, ok, _ in RESULTS)
     print(f"\nnotes: {json.dumps(NOTES, default=str)}")

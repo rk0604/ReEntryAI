@@ -1351,6 +1351,46 @@ saturated.
   no phase flown on DEV48 reads. LATBIAS at its high end, the positive control, changes 39 of 48. Every DEV48 flight
   goes initial roll → ballistic → final. `PREDGUID_SPACE` is not changed, because tuning had started (§14 says
   what this means for T10).
+* **2026-11-18, unattended runs: watchdog, failure records, session budget, early stops, RL last and gated
+  (Part A; no flown flight, tuned law or trained model changes).** The user leaves GPU passes running unattended,
+  so a pass must never idle on paid units and one broken arm must not stop the rest. (1) A **stall watchdog**
+  (`jepa/runguard_v5.py`, started at Setup): every study log line, Drive write and MPPI round counts as progress;
+  after `STALL_MIN` (45) minutes without any it writes the reason to `00_study/logs/watchdog.log` and
+  `RUN_SUMMARY.txt`, then releases the runtime (Drive flush, then `runtime.unassign()`, each bounded in time). The
+  known long silent step, copying and loading the 6,000 flights, runs under a 60-minute allowance.
+  (2) **`00_study/RUN_SUMMARY.txt`**, rewritten after every stage: stages, failures and why, units used, why the
+  runtime was released, what the next pass must do. (3) **Failures are recorded and skipped**: each stage cell runs
+  in `RG.stage`; an exception is logged (`logs/failures.log`, the summary) and the notebook goes on;
+  `STOP_ON_FAILURE = True` releases at the first one. A flight that raises (or lands with a non-finite miss) is
+  retried once (a lockstep batch flight by flight; the laws are batch-independent, §16) and otherwise recorded in
+  `04_flights/errors/<flight>.json`; a stage call whose first 50 flights have more than 10 % errors stops and writes
+  `01_checks/stage_<label>_failed.json`. Poor accuracy is never an error. (4) **E3 early stop**
+  (`models_v5.stop_rule`): a non-finite training or validation loss, a validation loss above 3× its best at the same
+  curriculum horizon, or, from 20 % of the steps on, no validation loss at the first horizon below the untrained
+  model's, stops that model; it gets `failed.json` (status `diverged`), the status table shows it, later sessions
+  skip it, and the other models go on. A learning-rate pilot that stops loses the choice. Being worse than R0 never
+  stops a model. Models that train normally are bit-identical to before (the extra untrained validation loss is
+  computed without gradients or random draws). (5) **`MAX_SESSION_UNITS`** (None by default) becomes a deadline at
+  the session's rate (`UNITS_PER_HOUR`, default L4 1.98, the rate Colab shows; the code's table had 4.8), and
+  `SessionLimit` now also gates every E3 model, pilot set and flight group: nothing starts that would not fit; when
+  the budget is used up the summary is written and the runtime released. (6) **Order of a GPU pass**: E3 training,
+  E3 flights, the MPPI flights (A256, matched, ORB-1, DS1, AS1), open loop, timing, then RL last (cell 15), so a
+  slow or failing RL arm never holds up the rest. (7) **RL tunes and trains only after its competence gates pass**
+  (`01_checks/RV1_<arm>.json`, `RV2`, `RV3`; DAgger RV1 + RV2, BC → PPO RV1–RV3, PPO RV3); until then each arm
+  waits with a note. The gates and the supervised-fit fix are the next entry's subject (Part B). (8) **DAgger's
+  first tuning is deprecated, not deleted.** Configurations 0–9 scored 0–2.1 % success@5km against FNPEG's 100 %;
+  `fit_supervised` underfits (sup_batch 4096 × 20–50 epochs is about 10–250 gradient steps, and BC used PPO's
+  learning rate); an offline refit (300 epochs, lr 10⁻³) gave 0.86 sign accuracy and 7° bank error. So those
+  results measure the bug, not DAgger. `03_tuning/rl_dagger_fnpeg/` and `04_flights/{results,telemetry}/DEV48/
+  tune_dagger_fnpeg_c00…c10/` stay exactly as they are, each with a `DEPRECATED.md` (written once by Setup);
+  repair and the analysis skip them and the report lists them here. The refit tunes under new keys:
+  `03_tuning/rl_dagger_fnpeg_fit2/` and flights `tune_dagger_fnpeg_fit2_cNN`. No test flight of any RL arm had
+  flown. (9) **Notebook revision** (`NOTEBOOK_REV = 2`): a notebook whose Setup does not check this code's revision
+  (an old downloaded copy that pulls the new code) stops at its first study cell with "open the notebook from
+  GitHub", and its crash hook releases the runtime. The auto-disconnect hook is now registered at the top of Setup,
+  so a failure anywhere in Setup releases the runtime too. Tested by smoke check 17 and by
+  `ReEntryAI_watchdog_test.ipynb` (5 minutes on a CPU runtime: a cell hangs, and the watchdog must release the
+  runtime from its background thread).
 
 ---
 
