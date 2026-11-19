@@ -32,6 +32,14 @@ default <tempdir>/jepa_v4_smoke/: wide_smoke/, v3_smoke/, v4_smoke/; v4_smoke ma
   17 unattended runs (2026-11-18): a broken arm recorded and skipped while later stages run; the watchdog (release
      mocked) and the watchdog test notebook; a NaN stops only that E3 model; the deprecated DAgger tuning kept
      untouched and ignored; RL gates; the session budget; the crash hook and the notebook revision (an old copy stops)
+  18 the "Is JEPA needed?" notebook (2026-11-19): the learning-rate fallback (a NaN retrains that seed at the next
+     multiplier and keeps failed.json, the remaining seeds start at the fallback, finished runs stand, all diverged
+     stops); every stop rule writes STOPPED.json and releases; the next run refuses without ACK_STOP; R0 and the E3
+     arms pair on AS1/DS1; the stage order; no E4 / RL; the CLAUDE.md release code; ReEntryAI_JEPA_v5.ipynb
+     (revision 2) stops at Setup as superseded; the notebook on a copy of the smoke study (a stop, a refusal, an
+     acknowledged run to the end)
+
+  Checks 10, 13, 14 and 17 still run ReEntryAI_JEPA_v5.ipynb (revision 2, superseded) with JEPA_V5_ACCEPT_NB_REV=2.
 
     python jepa/smoke_v5.py [--work <dir>] [--workers N] [--only 1,2,...]
 """
@@ -784,7 +792,8 @@ def t10_guard(tmp: Path, ro: dict) -> None:
 def nb_env(root: Path, fx: dict, fail: str = None) -> dict:
     env = {**os.environ, "JEPA_V5_MODE": "smoke", "JEPA_V5_ROOT": str(root), "JEPA_V3_ROOT": str(fx["v3"]),
            "JEPA_V4_ROOT": str(fx["v4"]), "JEPA_WIDE_DATA": str(fx["data"]), "JEPA_V5_LEGACY": str(fx["legacy"]),
-           "PYTHONIOENCODING": "utf-8", "JEPA_V5_RL_GATES_PASS": "1"}
+           "PYTHONIOENCODING": "utf-8", "JEPA_V5_RL_GATES_PASS": "1",
+           "JEPA_V5_ACCEPT_NB_REV": "2"}             # ReEntryAI_JEPA_v5.ipynb is superseded (revision 2): smoke only
     env.pop("JEPA_V5_FAIL_AT", None)
     if fail:
         env["JEPA_V5_FAIL_AT"] = fail
@@ -1517,10 +1526,12 @@ def t17_unattended(tmp: Path, fx: dict) -> None:
         os.environ.pop(M5.NAN_ENV, None)
     f1 = S5.e3_failed(L, "mlp_direct", 1) or {}
     again = " ".join(logs[n_before:])
-    check("17. a NaN loss stops only that E3 model: failed.json (diverged), the other seed trained, a rerun skips it",
+    check("17. a NaN loss stops only that E3 model: failed.json (diverged), the other seed trained; with one "
+          "multiplier the fallback has none left (did_not_train.json), and a rerun trains nothing",
           L.ckpt("mlp_direct", 0).exists() and not L.ckpt("mlp_direct", 1).exists()
           and f1.get("status") == "diverged" and "nan" in f1.get("reason", "") and "ms/step" not in again
-          and "stopped earlier and skipped" in again, f"({f1}; rerun: {again[:200]})")
+          and (L.models / "mlp_direct" / "did_not_train.json").exists() and "did not train" in again,
+          f"({f1}; rerun: {again[:200]})")
     h = {"val": [], "T": [], "step": []}
     rules = []
     for v, t, k in [(1.0, 24, 500), (0.9, 24, 1000), (0.8, 24, 1500), (0.7, 48, 7500)]:
@@ -1592,7 +1603,8 @@ def t17_unattended(tmp: Path, fx: dict) -> None:
           and not list((L.flights / "results" / "DEV48").glob("classical_budget*")), f"({n}, {released})")
 
     # (g) the notebook: crash hook first, revision check, an old copy stops at Setup and releases
-    nbp = SIM_DIR / "ReEntryAI_JEPA_v5.ipynb"
+    subprocess.run([sys.executable, "jepa/build_notebook_v5_needed.py"], check=True, capture_output=True, cwd=SIM_DIR)
+    nbp = SIM_DIR / "ReEntryAI_JEPA_v5_needed.ipynb"
     nb = json.loads(nbp.read_text(encoding="utf-8"))
     src = ["".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code"]
     setup = next(c for c in src if "S5.notebook_check(NOTEBOOK_REV)" in c)
@@ -1603,11 +1615,11 @@ def t17_unattended(tmp: Path, fx: dict) -> None:
     check("17. notebook: the crash hook is registered first in Setup (before the revision check, repair and the GPU "
           "check), the unattended settings are in the Settings cell, the last cell releases the runtime",
           order and f"NOTEBOOK_REV = {S5.NOTEBOOK_REV}" in settings and "STALL_MIN = 45" in settings
-          and "MAX_SESSION_UNITS = None" in settings and "STOP_ON_FAILURE = False" in settings
+          and "MAX_SESSION_UNITS = None" in settings and "STOP_RULES = True" in settings and "ACK_STOP = " in settings
           and src[-1].strip() == 'release_runtime("all cells finished")')
     S5._NB["rev"] = None
     bad = []
-    for rev in (S5.NOTEBOOK_REV - 1, "x"):
+    for rev in (S5.NOTEBOOK_REV - 1, S5.NOTEBOOK_REV - 2, "x"):
         try:
             S5.notebook_check(rev)
         except RuntimeError as e:
@@ -1625,7 +1637,7 @@ def t17_unattended(tmp: Path, fx: dict) -> None:
         os.environ.pop(S5.NB_GUARD_ENV, None)
         S5._NB["rev"] = None
     check("17. notebook revision: another revision is refused at Setup, a notebook whose Setup did not check it is "
-          "refused by its status cell, the current one passes", bad == [True, True] and guarded, f"({bad})")
+          "refused by its status cell, the current one passes", bad == [True, True, True] and guarded, f"({bad})")
     runs = base / "nb"
     runs.mkdir(parents=True)
     old_nb = subprocess.run(["git", "show", "d2e7cec:StochasticEntrySim/ReEntryAI_JEPA_v5.ipynb"], capture_output=True,
@@ -1673,6 +1685,338 @@ def t17_unattended(tmp: Path, fx: dict) -> None:
           f"(exit {r.returncode}) {r.stderr[-500:] if r.returncode else ''}")
     RG.SUMMARY.L = None
     RG.STATE.update({"release": None, "limit": None, "stop_on_failure": False})
+
+
+NEEDED_NB = "ReEntryAI_JEPA_v5_needed.ipynb"
+
+
+def _summary_stages(text: str) -> List[str]:
+    """The stage names of RUN_SUMMARY.txt, in order."""
+    out, on = [], False
+    for ln in text.splitlines():
+        if ln.startswith("stages this session:"):
+            on = True
+            continue
+        if on:
+            if not ln.startswith("  ") or ln.strip() == "(none yet)":
+                break
+            out.append(ln.strip().rsplit(": ", 1)[0] if ": " in ln else ln.strip())
+    return out
+
+
+def t18_needed(tmp: Path, fx: dict, work: Path) -> None:
+    section("18. the 'Is JEPA needed?' notebook: learning-rate fallback, stop rules and ACK_STOP, R0 and E3 on "
+            "AS1/DS1, the order, no E4 / RL, the release code, the old notebook superseded, a run on the smoke study")
+    from jepa import analyze_v5 as A5
+    from jepa import models_v5 as M5
+    from jepa import runguard_v5 as RG
+    from jepa import study_v4 as S4
+    from jepa import study_v5 as S5
+    from jepa import train_v2 as T2
+    base = tmp / "needed"
+    shutil.rmtree(base, ignore_errors=True)
+    RG.BEAT_DIR = base / "beat"
+    L = S5.LayoutV5(base / "study").make()
+    cfg = S5.StudyConfigV5.smoke()
+    released, logs = [], []
+    log = lambda *a: logs.append(" ".join(str(x) for x in a))
+    stop_file = L.study / RG.STOP_FILE
+    rd = lambda q: json.loads(Path(q).read_text(encoding="utf-8")) if Path(q).exists() else {}
+
+    def fire(fn):
+        """Run fn with the stop rules on (release mocked): (trigger or None, STOPPED.json, releases)."""
+        stop_file.unlink(missing_ok=True)
+        released.clear()
+        RG.configure(L, {"test": "18"}, 1.0, released.append, stop_rules=True)
+        trig = None
+        try:
+            fn()
+        except RG.StopRun as e:
+            trig = e.trigger
+        return trig, rd(stop_file), list(released)
+
+    eps = T2.load_episodes(fx["data"])[:60]
+    data = T2.prepare(eps, 16, "cpu", 25, split_seed=0)
+
+    # (a) the fallback: seed 1's NaN at the chosen multiplier; seed 0 (finished at the choice) stands
+    RG.configure(L, {"test": "18"}, 1.0, released.append)
+    c3 = _e3_cfg()
+    c3.e3_arms, c3.seeds, c3.lr_mults = ("mlp_direct",), (0, 1, 2), (1.0, 3.0)
+    M5.choose_lr(c3, data, L, "mlp_direct", "cpu", log)
+    rank = S5.lr_ranking(L, "mlp_direct") or [1.0]
+    ch, fb = rank[0], rank[-1]
+    os.environ[M5.NAN_ENV] = "mlp_direct seed 1"
+    try:
+        S5.train_e3_stage(c3, L, lambda: data, "cpu", log)
+        n0 = len(logs)
+        S5.train_e3_stage(c3, L, lambda: data, "cpu", log)         # rerun: nothing left to train
+    finally:
+        os.environ.pop(M5.NAN_ENV, None)
+    md = lambda sd: L.model_dir("mlp_direct", sd)
+    fbd = lambda sd: md(sd) / f"lr_x{fb:g}"
+    f1 = rd(md(1) / "failed.json")
+    plan = S5.e3_arm_plan(L, c3, "mlp_direct")
+    t10b = A5.e3_lr_table(c3, L)
+    flies = {int(r.seed): r.run for r in t10b[t10b.arm == "mlp_direct"].itertuples() if r.flies}
+    want = {0: os.path.join("mlp_direct", "seed_0"), 1: os.path.join("mlp_direct", "seed_1", f"lr_x{fb:g}"),
+            2: os.path.join("mlp_direct", "seed_2", f"lr_x{fb:g}")}
+    check("18. fallback: a NaN at the chosen multiplier keeps failed.json and retrains that seed from scratch at the "
+          "next-best pilot multiplier in seed_<k>/lr_x<m>/; the remaining seeds start there; a seed finished at the "
+          "choice stands; flights use the retrained model; T10b says which run flies; a rerun trains nothing",
+          len(rank) == 2 and (md(0) / "ckpt.pt").exists() and not fbd(0).exists()
+          and f1.get("kind") == "nonfinite_train" and float(f1.get("lr_mult", -1)) == ch
+          and (fbd(1) / "ckpt.pt").exists() and not (md(1) / "ckpt.pt").exists()
+          and (fbd(2) / "ckpt.pt").exists() and not (md(2) / "ckpt.pt").exists()
+          and S5.e3_model(L, "mlp_direct", 1)["ckpt"] == str(fbd(1) / "ckpt.pt")
+          and S5.e3_model(L, "mlp_direct", 0)["ckpt"] == str(md(0) / "ckpt.pt")
+          and plan["mult"] == fb and set(plan["seeds"].values()) == {"done"} and flies == want
+          and "ms/step" not in " ".join(logs[n0:]),
+          f"(ranking {rank}, failed {f1.get('kind')} x{f1.get('lr_mult')}, plan {plan['seeds']} x{plan['mult']}, "
+          f"flies {flies})")
+
+    # (b) every multiplier diverges: "did not train", STOPPED.json, released once
+    c4 = _e3_cfg()
+    c4.e3_arms, c4.seeds, c4.lr_mults = ("gru_direct",), (0,), (1.0, 3.0)
+    os.environ[M5.NAN_ENV] = "|".join(["gru_direct seed 0"] + [f"gru_direct seed 0 fallback lr x{m:g}"
+                                                              for m in c4.lr_mults])
+    try:
+        trig, doc, rel = fire(lambda: S5.train_e3_stage(c4, L, lambda: data, "cpu", log))
+    finally:
+        os.environ.pop(M5.NAN_ENV, None)
+    runs = S5.e3_runs(L, "gru_direct", 0)
+    check("18. stop rule: an arm diverged at every multiplier -> did_not_train.json, 00_study/STOPPED.json with the "
+          "trigger and evidence, the runtime released once; every diverged run's failed.json kept",
+          trig == "e3_did_not_train:gru_direct" and doc.get("trigger") == trig and "diverged" in doc.get("evidence", "")
+          and len(rel) == 1 and "stop rule" in rel[0] and (L.models / "gru_direct" / "did_not_train.json").exists()
+          and len(runs) == len(S5.lr_ranking(L, "gru_direct")) and all(r["kind"] == "nonfinite_train" for r in runs),
+          f"({trig}, {rel}, runs {[(r['lr_mult'], r['kind']) for r in runs]})")
+
+    # (c) the next run refuses until ACK_STOP names the trigger; acknowledged, the record moves to stopped_history/
+    refused = []
+    for a in (None, "wrong"):
+        try:
+            RG.check_stopped(L, a, log)
+            refused.append(False)
+        except RuntimeError as e:
+            refused.append(trig is not None and trig in str(e) and "ACK_STOP" in str(e))
+    acked = RG.check_stopped(L, trig, log) or {}
+    hist = sorted((L.study / "stopped_history").glob("STOPPED_*.json"))
+    after = RG.check_stopped(L, None, log)
+    t2, _, rel2 = fire(lambda: S5.train_e3_stage(c4, L, lambda: data, "cpu", log))   # found later: skipped, no stop
+    check("18. ACK_STOP: a STOPPED.json refuses the next run (no ACK_STOP, a wrong one) with the trigger and how to "
+          "continue; the right one moves it to 00_study/stopped_history/; a stopped arm found later is skipped, "
+          "not stopped again", refused == [True, True] and acked.get("trigger") == trig and len(hist) == 1
+          and after is None and not stop_file.exists() and t2 is None and rel2 == [],
+          f"({refused}, {len(hist)} archived, rerun {t2} {rel2})")
+
+    # (d) validation-loss stops: the 4b pilot reference (forced), and the rule itself
+    c5 = _e3_cfg()
+    c5.e3_arms, c5.seeds, c5.lr_mults = ("gru_pi",), (0,), (1.0,)
+    old_pv = S5.pilot_val
+    S5.pilot_val = lambda *_a: 1e-9                  # any validation loss is far above 3x this reference
+    try:
+        trig, doc, rel = fire(lambda: S5.train_e3_stage(c5, L, lambda: data, "cpu", log))
+    finally:
+        S5.pilot_val = old_pv
+    fp = rd(L.model_dir("gru_pi", 0) / "failed.json")
+    h = lambda st, v: {"step": st, "val": v, "T": [24] * len(st)}
+    rules = [M5.pilot_rule(h([500, 9000], [1.0, 3.5]), 36000, 1.0) != "",      # first point at 25 %: checked
+             M5.pilot_rule(h([500, 9000], [1.0, 2.9]), 36000, 1.0) == "",      # within 3x
+             M5.pilot_rule(h([500, 9000, 9500], [1.0, 1.0, 9.0]), 36000, 1.0) == "",   # once only
+             M5.pilot_rule(h([500, 8500], [1.0, 9.0]), 36000, 1.0) == "",      # before 25 %
+             M5.pilot_rule(h([500, 9000], [1.0, 9.0]), 36000, None) == "",     # no reference (pilots, old notebook)
+             M5.stop_kind("training loss is nan at step 3388") == "nonfinite_train",      # Drive's mlp_direct records
+             M5.stop_kind(M5.stop_rule(h([500], [float("nan")]), 36000)) == "val_nonfinite",
+             M5.stop_kind(M5.pilot_rule(h([500, 9000], [1.0, 3.5]), 36000, 1.0)) == "not_learning_pilot",
+             M5.stop_kind(M5.stop_rule({"step": [500, 1000, 1500], "val": [1.0, 0.5, 1.6], "T": [24] * 3}, 36000))
+             == "val_diverging"]
+    check("18. stop rule: an E3 run's validation loss above 3x its own pilot's at 25 % of its steps -> failed.json "
+          "(not_learning_pilot), STOPPED.json, released; the rule fires once, at the first point at or after 25 %, "
+          "never without a reference; stop kinds of every rule (the Drive records' text too)",
+          trig == "e3_not_learning:gru_pi_seed0" and fp.get("kind") == "not_learning_pilot" and len(rel) == 1
+          and doc.get("trigger") == trig and all(rules), f"({trig}, {fp.get('kind')}, {rules})")
+
+    # (e) an MPPI arm whose first flights fail
+    conds = S5.conditions(cfg, "A256")                # 8 in smoke mode, one model run (DEV48 has 4)
+    jobs = [S5.arm_job(cfg, L, None, c, "mppi_truth", "test", 0) for c in conds]
+    os.environ[S5.FAULT_ENV] = "flight:mppi_truth"
+    try:
+        trig, doc, rel = fire(lambda: S5.run_mppi(cfg, jobs, L, "cpu", 1, log, "mppi broken"))
+    finally:
+        os.environ.pop(S5.FAULT_ENV, None)
+    ok_rule = (S5._mppi_arm_rule({}, "a", [{"n": 251, "errors": [["x", "y"]] * 5}]) == ""
+               and S5._mppi_arm_rule({}, "a", [{"n": 15, "errors": [["x", "y"]] * 5}]) != ""
+               and S5._mppi_arm_rule({}, "a", [{"n": 2, "errors": [["x", "y"]] * 4}]) == "")
+    check("18. stop rule: an MPPI arm with >= 5 of its first 20 flights failing -> its record in 01_checks/, "
+          "STOPPED.json, released; 5 errors in a 256-flight lockstep run or 4 errors do not stop it",
+          trig == "mppi_arm_failing:mppi_truth" and (L.checks / "mppi_arm_mppi_truth_4_5g_failed.json").exists()
+          and len(rel) == 1 and doc.get("trigger") == trig and ok_rule, f"({trig}, {rel}, rule {ok_rule})")
+
+    # (f) three failure records; (g) a stage that raises; (h) budget and watchdog releases are not stop rules
+    def three(kind):
+        for i in range(3):
+            RG.record_failure(L, L.checks / f"t18_{kind}_{i}.json", {"reason": f"test {i}"}, kind, f"thing {i}", log)
+    trig3, doc3, rel3 = fire(lambda: three("test"))
+    trig3b, _, rel3b = fire(lambda: three("E3 divergence"))
+
+    def boom():
+        with RG.stage("boom stage", log):
+            raise ValueError("test")
+    trig4, doc4, rel4 = fire(boom)
+    stop_file.unlink(missing_ok=True)
+    released.clear()
+    RG.configure(L, {"test": "18"}, 1.0, released.append, stop_rules=True)
+    RG.release("the session's unit budget (MAX_SESSION_UNITS) is used up; Run all again to continue")
+    check("18. stop rules: 3 failure records in a session (fallback-handled E3 divergences not counted) and a stage "
+          "that raises each write STOPPED.json and release once; a budget release writes none",
+          trig3 == "failures_3" and doc3.get("trigger") == trig3 and len(rel3) == 1 and trig3b is None
+          and rel3b == [] and trig4 == "stage_failed:boom_stage" and "ValueError" in doc4.get("evidence", "")
+          and len(rel4) == 1 and len(released) == 1 and not stop_file.exists(),
+          f"({trig3}, {trig3b}, {trig4}, budget {released})")
+    RG.STATE.update({"stop_rules": False, "stopped": None, "release": None})
+    RG.SUMMARY.L = None
+
+    # (i) R0 and the E3 arms pair on AS1/DS1; (j) the order; no E4 / RL
+    L3 = S4.v3_layout(fx["v3"])
+    L4 = S5.v4_layout(fx["v4"])
+    key = lambda j: (j["suite"], int(j["case"]), j["atmosphere"], j["seed"], j["mppi_seed"])
+    r0 = S5.jobs_robust(cfg, L, L3, L4, S5.R0_ARM)
+    n_rob = len(S5.conditions(cfg, "AS1")) + len(S5.conditions(cfg, "DS1"))
+    pair = all(sorted(map(key, S5.jobs_robust(cfg, L, L3, L4, a))) == sorted(map(key, r0)) for a in S5.NEEDED_E3_ORDER)
+    check("18. R0 (v4's checkpoints) and every E3 arm fly the same AS1/DS1 conditions with the same training seed "
+          "(case mod 5) and CRN seed, so they pair; R0 waits without v4's folder",
+          pair and len(r0) == n_rob and all(j["model"]["ckpt"] == str(L4.ckpt("R0", j["seed"])) and
+                                            os.path.exists(j["model"]["ckpt"]) for j in r0)
+          and all(j["seed"] == cfg.seeds[int(j["case"]) % len(cfg.seeds)] for j in r0)
+          and [j["suite"] for j in r0] == sorted(j["suite"] for j in r0)
+          and S5.jobs_robust(cfg, L, L3, None, S5.R0_ARM) == [], f"({len(r0)} R0 jobs, paired {pair})")
+    J = S5.needed_stage_jobs(cfg, L, L3, L4)
+    exp = ["v2single AS1", "mppi_filtered AS1", "v2single DS1", "mppi_filtered DS1", "mppi_filtered A256",
+           "v2single@fnpeg_matched A256", "v2single ORB-1 block 1", "mppi_filtered ORB-1 block 1", "R0 AS1/DS1"] + [
+        f"{a} {x}" for a in ("r0_nojepa", "gru_direct", "mlp_direct", "gru_pi") for x in ("A256", "AS1/DS1")]
+    ctrl = {j["controller"] for js in J.values() for j in js}
+    subprocess.run([sys.executable, "jepa/build_notebook_v5_needed.py"], check=True, capture_output=True, cwd=SIM_DIR)
+    nb = json.loads((SIM_DIR / NEEDED_NB).read_text(encoding="utf-8"))
+    src = ["".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code"]
+    mdt = chr(10).join("".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "markdown")
+    code = chr(10).join(src)
+    marks = ["S5.needed_e2_blocks(", "S5.R0_ARM)", 'e3_arm("r0_nojepa")', 'e3_arm("gru_direct")',
+             'e3_arm("mlp_direct")', 'e3_arm("gru_pi")', "S5.open_loop_stage(", "S5.timing_stage(",
+             "GPU pass finished", "A5.analyze(", "R5.build_report(", 'release_runtime("all cells finished")']
+    pos = [next((i for i, c in enumerate(src) if m in c), -1) for m in marks]
+    no_rl = not any(x in code for x in ("rl_stage", "jobs_e4", "train_rl_stage", "rl_imitation_stage",
+                                         "rl_gates_stage", "RL_TIER", "E4_"))
+    check("18. the order of plan 2 and 5: E2 and robustness blocks, R0 on AS1/DS1, r0_nojepa, gru_direct, "
+          "mlp_direct, gru_pi (each A256 then AS1/DS1), open loop, timing, GPU end, analysis, report, release; no E4 "
+          "or RL stage or flight", list(J) == exp and pos == sorted(pos) and -1 not in pos and no_rl
+          and not (ctrl & set(S5.RL_TIER1 + S5.RL_TIER2)) and tuple(S5.NEEDED_E3_ORDER) == (
+              "r0_nojepa", "gru_direct", "mlp_direct", "gru_pi"),
+          f"(blocks {list(J)}; cells {pos}; RL-free {no_rl})")
+    setup = next(c for c in src if "S5.notebook_check(NOTEBOOK_REV)" in c)
+    settings = next(c for c in src if "NOTEBOOK_REV = " in c)
+    i_hook = setup.find('_ip.events.register("post_run_cell", _release_on_error)')
+    check("18. CLAUDE.md: AUTO_DISCONNECT = IN_COLAB in Settings, release_runtime flushes Drive then unassigns, the "
+          "post_run_cell failure hook (KeyboardInterrupt ignored, an old copy unregistered) registered before the "
+          "revision and stop checks, the last cell releases, the text says so; an L4 GPU requested",
+          "AUTO_DISCONNECT = IN_COLAB" in settings and f"NOTEBOOK_REV = {S5.NOTEBOOK_REV}" in settings
+          and 0 <= setup.find("drive.flush_and_unmount()") < setup.find("runtime.unassign()")
+          and 0 <= i_hook < setup.find("S5.notebook_check(") < setup.find("RG.check_stopped(")
+          and '_ip.events.unregister("post_run_cell", _cb)' in setup and "KeyboardInterrupt" in setup
+          and src[-1].strip() == 'release_runtime("all cells finished")' and "disconnects itself" in mdt
+          and "AUTO_DISCONNECT = False" in mdt and nb["metadata"].get("accelerator") == "GPU"
+          and nb["metadata"].get("colab", {}).get("gpuType") == "L4")
+
+    # (k) the analysis: E4 is "not in this notebook"; the "Is JEPA needed?" outcomes
+    t05 = pd.DataFrame([{"id": "R-ppo_hist", "family": "RQ3", "status": "not run"},
+                        {"id": "D-dagger_fnpeg", "family": "DS1 (estimate)", "status": "pending"},
+                        {"id": "G1", "family": "RQ1", "status": "pending"}])
+    ex = A5.exclude_e4_rows(t05).status.tolist()
+    st = {"G1": "not met", "D1": "not met", "A1": "not met", "G5": "not met", "J-r0_nojepa": "met",
+          "J-equiv": "not met", "J-mlp_direct": "not met", "J-gru_direct": "not met", "J-gru_pi": "not met"}
+    o = A5.is_jepa_needed(pd.DataFrame([{"id": k, "status": v, "question": k, "measured": "", "family": ""}
+                                        for k, v in st.items()]))
+    got = dict(zip(o[o.part == "outcome"].id, o[o.part == "outcome"].status))
+    st["A1"] = "pending"
+    o2 = A5.is_jepa_needed(pd.DataFrame([{"id": k, "status": v, "question": k, "measured": "", "family": ""}
+                                         for k, v in st.items()]))
+    got2 = dict(zip(o2[o2.part == "outcome"].id, o2[o2.part == "outcome"].status))
+    check("18. analysis: missing E4 / RL rows read 'not in this notebook'; T15 fills plan 0's outcomes (met / not met / "
+          "pending) from the criteria", ex == [A5.NOT_IN_NOTEBOOK, A5.NOT_IN_NOTEBOOK, "pending"]
+          and got == {"not_needed": "met", "learned_needed": "not met", "jepa_needed": "met",
+                      "jepa_not_needed": "not met", "inconclusive": "not met", "decoder_not_needed": "met"}
+          and got2["not_needed"] == "pending" and got2["learned_needed"] == "pending"
+          and set(o[o.part == "criterion"].id) == set(A5.NEEDED_EVIDENCE), f"({ex}; {got}; {got2})")
+
+    # (l) ReEntryAI_JEPA_v5.ipynb (revision 2) stops at Setup: superseded
+    runs = base / "nb"
+    runs.mkdir(parents=True, exist_ok=True)
+
+    def nb_run(nbname, root, tag, extra=None):
+        env = {**nb_env(root, fx), "JEPA_V5_BEAT_DIR": str(base / "beat_nb"), **(extra or {})}
+        env.pop("JEPA_V5_ACCEPT_NB_REV", None)
+        env.pop(S5.FAULT_ENV, None) if S5.FAULT_ENV not in (extra or {}) else None
+        t0 = time.time()
+        r = subprocess.run([sys.executable, "-m", "nbconvert", "--to", "notebook", "--execute",
+                            "--ExecutePreprocessor.timeout=5400", "--output-dir", str(runs), "--output", f"{tag}.ipynb",
+                            nbname], env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           cwd=SIM_DIR)
+        return r, _nb_text(runs / f"{tag}.ipynb") + r.stderr, time.time() - t0
+
+    old_nb = json.loads((SIM_DIR / "ReEntryAI_JEPA_v5.ipynb").read_text(encoding="utf-8"))
+    old_set = next("".join(c["source"]) for c in old_nb["cells"] if "NOTEBOOK_REV = " in "".join(c["source"]))
+    r, txt, _ = nb_run("ReEntryAI_JEPA_v5.ipynb", base / "study_old", "old")
+    check("18. ReEntryAI_JEPA_v5.ipynb (revision 2) stops at Setup with 'superseded by ReEntryAI_JEPA_v5_needed.ipynb' "
+          "before writing anything; the crash hook releases the runtime",
+          "NOTEBOOK_REV = 2" in old_set and r.returncode != 0 and "superseded by ReEntryAI_JEPA_v5_needed.ipynb" in txt
+          and "a cell failed" in txt and not (base / "study_old" / "00_study" / "study_config.json").exists(),
+          f"(exit {r.returncode}) {txt[-600:] if r.returncode == 0 else ''}")
+
+    # (m) the notebook on a copy of the smoke study: a stop rule, a refusal, an acknowledged run to the end
+    src_study = work / "v5_smoke"
+    if not (src_study / "00_study" / "study_config.json").exists():
+        check("18. the notebook on the smoke study (run check 10 first)", False, f"({src_study} missing)")
+        return
+    root = base / "v5_needed_smoke"
+    shutil.copytree(src_study, root)
+    sf = root / "00_study" / RG.STOP_FILE
+    summ = lambda: (root / "00_study" / "RUN_SUMMARY.txt").read_text(encoding="utf-8")
+    r, txt, ta = nb_run(NEEDED_NB, root, "needed_A", {S5.FAULT_ENV: "flight:R0"})
+    stopA = rd(sf)
+    sA = summ()
+    trigA = stopA.get("trigger", "")
+    okA = (r.returncode != 0 and trigA.startswith("stage_failed:R0") and "RELEASED: " in sA and "stop rule" in sA
+           and _summary_stages(sA)[:9] == exp[:9])
+    if not okA:
+        print(txt[-3000:])
+    check("18. notebook on the smoke study, R0's flights forced to fail: the E2 blocks run in order, then the R0 "
+          "stage stops the notebook (STOPPED.json, RUN_SUMMARY.txt names the stop rule, released)", okA,
+          f"(exit {r.returncode}, trigger {trigA!r}, {ta / 60:.1f} min, stages {_summary_stages(sA)})")
+    r, txt, _ = nb_run(NEEDED_NB, root, "needed_B")
+    check("18. the next Run all without ACK_STOP stops at Setup and prints the trigger; STOPPED.json and the stopped "
+          "session's RUN_SUMMARY.txt stay", r.returncode != 0 and "an earlier session stopped" in txt
+          and trigA in txt and sf.exists() and "stop rule" in summ(), f"(exit {r.returncode})")
+    r, txt, tc = nb_run(NEEDED_NB, root, "needed_C", {"JEPA_V5_ACK_STOP": trigA})
+    sC = summ()
+    stages = _summary_stages(sC)
+    L5 = S5.LayoutV5(root)
+    rob = {a: S5.jobs_robust(cfg, L5, L3, L4, a) for a in (S5.R0_ARM,) + tuple(S5.NEEDED_E3_ORDER)}
+    flown = {a: len(S5.done_ids(L5, js)) == len(js) > 0 for a, js in rob.items()}
+    tabs = {q.stem.split("_")[0] for q in (root / "05_analysis" / "tables").glob("T*.csv")}
+    t16 = pd.read_csv(next((root / "05_analysis" / "tables").glob("T16_*.csv"))) if "T16" in tabs else pd.DataFrame()
+    want_st = exp[:9] + [f"{a} {x}" for a in S5.NEEDED_E3_ORDER for x in ("training", "A256", "AS1/DS1")] + [
+        "open loop", "timing", "analysis", "report"]
+    okC = (r.returncode == 0 and not sf.exists() and len(list((root / "00_study" / "stopped_history").glob("*.json")))
+           == 1 and "all cells finished" in sC and stages == want_st and all(flown.values())
+           and {"T10b", "T15", "T16"} <= tabs and len(t16) == 16 and set(t16.status) == {"estimate"}
+           and "IS JEPA NEEDED?" in txt and not any("E4" in x or "RL" in x for x in stages)
+           and (root / "06_report" / "SpaceJEPA_v5_report.pdf").exists())
+    if not okC:
+        print(txt[-3000:], sC[-2000:])
+    check("18. with ACK_STOP set to the trigger it runs to the end: STOPPED.json archived, every stage in order (no E4 "
+          "or RL), R0 and each E3 arm flown on AS1/DS1, T10b, T15 and T16 written (T16: estimates), the report "
+          "built, released because all cells finished", okC,
+          f"(exit {r.returncode}, {tc / 60:.1f} min, flown {flown}, tables {sorted(tabs & {'T10b', 'T15', 'T16'})}, "
+          f"stages {stages})")
 
 
 def main(work: Path, workers: int, only=None, keep: bool = False) -> None:
@@ -1726,6 +2070,8 @@ def main(work: Path, workers: int, only=None, keep: bool = False) -> None:
         t16_kaggle(work)
     if run(17):
         t17_unattended(tmp, fx)
+    if run(18):
+        t18_needed(tmp, fx, work)
     shutil.rmtree(tmp, ignore_errors=True)
     n_ok = sum(ok for _, ok, _ in RESULTS)
     print(f"\nnotes: {json.dumps(NOTES, default=str)}")

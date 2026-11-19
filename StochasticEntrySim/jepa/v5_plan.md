@@ -1392,6 +1392,89 @@ saturated.
   so a failure anywhere in Setup releases the runtime too. Tested by smoke check 17 and by
   `ReEntryAI_watchdog_test.ipynb` (5 minutes on a CPU runtime: a cell hangs, and the watchdog must release the
   runtime from its background thread).
+* **2026-11-19, notebook 1 "Is JEPA needed?" replaces `ReEntryAI_JEPA_v5.ipynb`; its run order (user decision,
+  `jepa/plan_jepa_needed_v5.md`; written before any of its flights or trainings).** The rest of the study runs from
+  `ReEntryAI_JEPA_v5_needed.ipynb` (`jepa/build_notebook_v5_needed.py`), on the same Drive folder and the same
+  study code, so everything already done is picked up by the resume logic and nothing is re-flown or retrained. It
+  asks one question: is the JEPA world model needed, or does a published law (Q-A), the same planner with physics
+  and explicit estimation (Q-B), or a non-JEPA learned model (Q-C) do as well? How each outcome reads is fixed in the
+  plan's §0 table, and the analysis fills it in (T15, the report's "Is JEPA needed?" page). **Order** (GPU pass on the
+  L4): (1) the E2 and robustness flights, `v2single` AS1 (128), `mppi_filtered` AS1 (128), `v2single` DS1 (256),
+  `mppi_filtered` DS1 (256), `mppi_filtered` A256 (5 × 256), `v2single@fnpeg_matched` A256 (5 × 256), `v2single`
+  and `mppi_filtered` on ORB-1 block 1 (1,000 each), 5,328 flights; (2) R0 on AS1/DS1 (next-but-one entry);
+  (3) the E3 arms in the order **`r0_nojepa`, `gru_direct`, `mlp_direct`, `gru_pi`** (was `mlp_direct`,
+  `gru_direct`, `gru_pi`, `r0_nojepa`; order only: `r0_nojepa` alone answers Q-C, since J-equiv is defined for it
+  only), each: learning-rate pilots if not chosen, all 5 seeds, its A256 flights, its AS1/DS1 flights; (4) open loop
+  and the timing table; (5) the GPU pass releases the runtime; the analysis and the report run on a CPU runtime.
+  No seed is cut and no arm dropped (user decision). Tier 2 stays off. The frozen configuration is unchanged
+  (`e3_arms` keeps its order in `study_config.json`; the notebook orders the cells, `study_v5.NEEDED_E3_ORDER`).
+  **One writer**: `NOTEBOOK_REV = 3`; the old notebook (revision 2) now stops at Setup with "superseded by
+  ReEntryAI_JEPA_v5_needed.ipynb" and its crash hook releases the runtime, so the two never write the folder at the
+  same time (the smoke test alone lets revision 2 run, with `JEPA_V5_ACCEPT_NB_REV=2`, for its own checks).
+* **2026-11-19, E4 / RL moves to notebook 2 (user decision; no RL test flight had flown).** The "Is JEPA needed?"
+  notebook runs no RL stage: no DAgger, BC → PPO, PPO or SAC, no RL gates RV1–RV3, no RL tuning, no RL flights on
+  A256, DS1 or AS1. The legacy RL flights stay on Drive and in the report as they are. In this notebook's analysis
+  (`analyze(..., exclude_e4=True)`) the RQ3 rows and DS1's and AS1's RL comparisons that are not run or pending read
+  **"not in this notebook"**, not pending failures. RL's code, gates and deprecated tuning stay as the 2026-11-18
+  entry left them, for notebook 2.
+* **2026-11-19, E3 learning-rate divergence fallback (user decision; written before the `r0_nojepa` and `gru_pi`
+  pilots and before any fallback run).** The pilots train each multiplier for 3,600 steps on their own short
+  schedule, so the rate has decayed by their end; in the 36,000-step run ×3 is still near its peak (1.8 × 10⁻³) at
+  step ~3,400. `mlp_direct`'s ×3 (pilot val 0.753, against ×1 0.861 and ×0.3 1.685) diverged on all 5 seeds (NaN at
+  steps 3,070–3,714; their `failed.json` stand); `gru_direct`'s ×3 (0.605) passed that point and trains normally.
+  **The rule, the same for all four arms:** (1) the pilots and the choice stay as preregistered ({×1, ×0.3, ×3},
+  seed 0, 10 % pilot, lowest validation open-loop state loss at horizon 96); pilots that ran are not rerun.
+  (2) A full run whose **training loss goes non-finite** keeps its `failed.json` (never deleted or moved): it is a
+  result, "×m diverged at step s". (3) That seed is **retrained from scratch at the next-best pilot multiplier** (the
+  lowest pilot validation loss among the multipliers not yet diverged for this arm; a pilot that stopped is not a
+  candidate), in its own folder `02_models/<arm>/seed_<k>/lr_x<m>/`, so the failed run's files stay untouched; the
+  seed's flights and open loop use the retrained model (`study_v5.e3_ckpt`; a flight's id does not contain the
+  checkpoint, so nothing flown changes). For `mlp_direct` that is ×1. (4) Once a multiplier has diverged on any seed
+  of an arm, its remaining seeds start at the fallback; runs at the original choice that finished without
+  divergence stand (`gru_direct` seed 0, if it finishes). (5) If the fallback diverges too, the next one is tried; if
+  every multiplier diverged, the arm "did not train" (`02_models/<arm>/did_not_train.json`) and the notebook stops
+  (next entry). (6) T10b lists per arm and seed every run (multiplier, folder, finished or stopped, divergence step),
+  which run the seed's flights use, and the pilot losses. Why this and not re-piloting on the full schedule: it keeps
+  the preregistered selection and `gru_direct`'s valid work, reacts only to an objective event (a non-finite loss),
+  never to a flight result, and costs only the retrains the divergences force (the early stop ends a diverged run
+  within minutes). A validation-loss stop is not a divergence and gets no fallback.
+* **2026-11-19, E3 and R0 on AS1 and DS1, exploratory estimates (user decision; written before any of these
+  flights exists).** Does R0's advantage, if any, survive model error the classical laws cannot handle (AS1) or that
+  changes during flight (DS1), and do the non-JEPA models handle it too? A256 cannot tell (success@5km saturates).
+  R0 (v4's checkpoints, seeds 0–4, flown as v4 flew it: models_v2 checkpoint, every member, `w_unc` 0) and each
+  of the four E3 arms fly every AS1 and DS1 condition once, training seed = case mod 5 and the same CRN seed, so each
+  E3 flight pairs with R0's: 5 × 384 = 1,920 flights (`study_v5.jobs_robust`, stage `E3_robust`). R0's run right
+  after the E2 blocks; each E3 arm's right after its A256 flights. **Statistics, fixed now:** per suite and arm, R0 −
+  arm paired mean log miss and success@5km, a case's conditions averaged, cases as units, 95 % two-stage bootstrap
+  (seeds, then cases within a seed; the DS1/AS1 scheme of §6) with the seed-level t-test beside it (T16). **No
+  pass/fail criterion and no Holm family**: these estimates cannot change an RQ2 verdict, which stays on A256
+  (§8.2).
+* **2026-11-19, stop-and-disconnect rules, `ReEntryAI_JEPA_v5_needed.ipynb` only (user request: "stop the run and
+  disconnect if a run is failing"; `STOP_RULES = True` in its Settings).** The notebook releases the runtime itself,
+  after a failure record, `00_study/STOPPED.json` (trigger id, evidence, the session's failures) and
+  `RUN_SUMMARY.txt`, whenever a run is failing in a way more compute will not fix; never on a bad result. Triggers:
+  (a) an E3 arm diverged at every multiplier (`e3_did_not_train:<arm>`); (b) an E3 run's validation loss is
+  non-finite, above 3× its best at the same horizon, never below the untrained model's by 20 % of the steps (Part A's
+  rules, which in the old notebook only skipped the model), or **at 25 % of its steps above 3× its own pilot's final
+  validation loss at that multiplier** (`e3_not_learning:<arm>_seed<k>`); (c) an MPPI arm with ≥ 5 of its first 20
+  flights ending in an exception or a non-finite landing (`mppi_arm_failing:<arm>`); (d) 3 failure records in one
+  session (`failures_3`); (e) any stage that raises (`stage_failed:<stage>`). The watchdog, the unit budget and
+  Colab's 24 h limit also release, but they are not stop rules: those sessions resume normally. **Resuming:** the
+  next Run all prints `STOPPED.json` at Setup and refuses to continue until `ACK_STOP = "<trigger id>"` is set in
+  Settings; then the record moves to `00_study/stopped_history/` and the run goes on. Rules fire on events only: a
+  model stopped earlier is skipped later, not stopped again. **Calibration of the not-learning trigger** against
+  `00_study/logs/E3_train.log` (read 2026-11-19): `gru_direct` seed 0, the only full run that reached 25 %, has
+  validation loss 0.833 at its first logged point at or after 25 % (step 9,000, T = 48), 1.38× its pilot's 0.605,
+  and at most 2.10× at any later point (1.272 at step 18,500, the T = 96 switch); `mlp_direct`'s seeds stayed within
+  1.25× (0.62–0.94 against 0.753) until their NaNs, before 25 %; Part A's diverging rule would not have fired on any
+  logged run. So 3× is kept, checked once, at the first logged point at or after 25 % of the steps (later points
+  include the T = 96 switch). **Pilots are not checked by it:** at 25 % of their own 3,600 steps they sit right after
+  their compressed curriculum's 24 → 48 switch, at 1.6–7.9× their final loss, and the rule would fire on 4 of the 6
+  logged pilots. **How two rules are read:** an MPPI arm flies in lockstep batches that finish together, so "its
+  first 20 flights" are the flights of the model runs that started before 20 of the arm's flights had been seen in
+  the session, with ≥ 5 errors at a rate of at least 5 in 20 (5 errors in a 256-flight batch do not stop it); and the
+  3-records rule does not count an E3 divergence that the learning-rate fallback handles (its end, "did not train",
+  is trigger (a)), the crash hook's own record or a stop rule's record. Tested by smoke check 18.
 
 ---
 

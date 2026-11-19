@@ -902,6 +902,126 @@ def tuning_table(L) -> pd.DataFrame:
     return out
 
 
+def e3_lr_table(cfg, L) -> pd.DataFrame:
+    """T10b: the E3 learning-rate fallback (plan_jepa_needed_v5.md 3): per arm and seed every run (multiplier, folder,
+    finished or stopped, divergence step and reason), the multiplier the seed's flights use, and the pilot losses."""
+    rows = []
+    for arm in M5.ARMS_E3:
+        ch = S5._read_json(L.models / arm / "lr_choice.json") or {}
+        pil = json.dumps({f"x{float(r['lr_mult']):g}": (None if r.get("stopped") or not np.isfinite(float(r["val"]))
+                                                         else round(float(r["val"]), 4)) for r in ch.get("pilots", [])})
+        plan = S5.e3_arm_plan(L, cfg, arm)
+        for sd in cfg.seeds:
+            runs = S5.e3_runs(L, arm, sd)
+            used = next((r for r in runs if r["done"]), None)
+            if not runs:
+                rows.append({"arm": arm, "seed": sd, "lr_mult": np.nan, "run": "", "state": plan["seeds"][sd],
+                             "diverged_step": np.nan, "reason": "", "flies": False})
+            for r in runs:
+                rows.append({"arm": arm, "seed": sd, "lr_mult": r["lr_mult"],
+                             "run": os.path.relpath(str(r["dir"]), str(L.models)),
+                             "state": "finished" if r["done"] else (f"stopped ({r['kind']})" if r["failed"] else
+                                                                    "partial"),
+                             "diverged_step": r["step"] if r["failed"] else np.nan,
+                             "reason": (r["failed"] or {}).get("reason", ""), "flies": used is not None and r is used})
+        for r in [x for x in rows if x["arm"] == arm]:
+            r.update({"chosen_lr_mult": ch.get("lr_mult"), "pilot_val_T96": pil,
+                      "arm_did_not_train": bool(plan["did_not_train"])})
+    return pd.DataFrame(rows, columns=["arm", "seed", "lr_mult", "run", "state", "diverged_step", "reason", "flies",
+                                       "chosen_lr_mult", "pilot_val_T96", "arm_did_not_train"])
+
+
+E3_ROBUST_SUITES = ("AS1", "DS1")
+
+
+def e3_robustness(cfg, L, main: pd.DataFrame) -> pd.DataFrame:
+    """T16 (plan_jepa_needed_v5.md 2.2b, estimates only): R0 − each E3 arm on AS1 and DS1, paired by condition (each
+    case flown by training seed case mod 5, the same CRN seed), a case's conditions averaged, cases as units; the
+    two-stage bootstrap (seeds, then cases within a seed) and the seed-level t-test. Mean log miss: negative = R0's
+    misses smaller. success@5km (pp): positive = R0 better. No pass/fail, no Holm family."""
+    rows = []
+    for suite in E3_ROBUST_SUITES:
+        d = main[main.suite == suite]
+        n_exp = len(S5.conditions(cfg, suite))
+        for arm in M5.ARMS_E3:
+            for metric, col, sc in (("log_miss", "log_miss", 1.0), ("success5", "success_5km", 100.0)):
+                base = {"suite": suite, "arm": arm, "comparison": f"R0 − {arm}", "metric": metric,
+                        "n_expected": n_exp}
+                piv = d.pivot_table(index=["case", "atmosphere"], columns="key", values=col, aggfunc="first") \
+                    if len(d) else pd.DataFrame()
+                if S5.R0_ARM not in piv or arm not in piv:
+                    rows.append({**base, "n_pairs": 0, "complete": False, "status": "not run"})
+                    continue
+                pp = piv[[S5.R0_ARM, arm]].astype(float).dropna()
+                if not len(pp):
+                    rows.append({**base, "n_pairs": 0, "complete": False, "status": "not run"})
+                    continue
+                cm = pp.groupby(level="case").mean()
+                r = orb_paired(L, f"v5|E3robust|{suite}|{arm}|{metric}", cm[S5.R0_ARM].to_numpy(), cm[arm].to_numpy(),
+                               cm.index.to_numpy() % len(cfg.seeds), cfg.n_boot)
+                done = len(pp) == n_exp
+                rows.append({**base, "n_pairs": int(len(pp)), "complete": bool(done),
+                             "R0": sc * float(pp[S5.R0_ARM].mean()), "arm_value": sc * float(pp[arm].mean()),
+                             "diff": sc * r["diff"], "ci_lo": sc * r["ci_lo"], "ci_hi": sc * r["ci_hi"],
+                             "p_boot": r["p_boot"], "n_cases": r["n"], **_t_scaled(r, sc),
+                             "status": "estimate" if done else "pending"})
+    return pd.DataFrame(rows)
+
+
+# The "Is JEPA needed?" page (plan_jepa_needed_v5.md 0): its outcome table filled from the criteria (T05).
+NEEDED_EVIDENCE = ("G1", "G2", "G4", "G5", "D1", "D2", "D3", "D4", "A1", "A2", "A3", "A4", "Q3a", "Q3b",
+                   "J-r0_nojepa", "J-gru_direct", "J-mlp_direct", "J-gru_pi", "J-equiv", "J-mech")
+NEEDED_OUTCOMES = (
+    ("not_needed", "FNPEG ≥ v2 on every suite, and mppi_filtered ≈ v2",
+     "Not needed: a classical law or a physics planner with filters does as well", ("G1", "D1", "A1", "G5"), "none"),
+    ("learned_needed", "v2 > FNPEG on a suite where the model is wrong (AS1, DS1), or v2 > mppi_filtered (G5)",
+     "A learned model is needed there; then Q-C decides whether the JEPA objective is", ("D1", "A1", "G5"), "any"),
+    ("jepa_needed", "Q-C: J-each passes for r0_nojepa (R0 better)", "The JEPA objective is needed",
+     ("J-r0_nojepa",), "all"),
+    ("jepa_not_needed", "Q-C: J-equiv passes for r0_nojepa",
+     "The JEPA objective is not needed (the architecture and data do the work)", ("J-equiv",), "all"),
+    ("inconclusive", "Q-C: neither", "Inconclusive (as v5_plan.md 8.2 says)", ("J-r0_nojepa", "J-equiv"), "none"),
+    ("decoder_not_needed", "Q-C: mlp_direct / gru_direct / gru_pi ≈ R0 (read as: R0 not significantly better; there "
+     "is no equivalence test for these arms)", "Even the physics-informed decoder is not needed",
+     ("J-mlp_direct", "J-gru_direct", "J-gru_pi"), "none"),
+)
+
+
+def is_jepa_needed(t05: pd.DataFrame) -> pd.DataFrame:
+    """T15: every outcome row of plan 0 with met / not met / pending from its criteria ("any": met when one of them
+    is met; "all": when all are; "none": when every one is decided and none is met), then each criterion it reads."""
+    st = {r["id"]: r for r in t05.to_dict("records")} if len(t05) else {}
+    s_ = lambda i: (st.get(i) or {}).get("status", "not run")
+    rows = []
+    for key, cond, concl, ids, rule in NEEDED_OUTCOMES:
+        ss = [s_(i) for i in ids]
+        dec = [x in ("met", "not met") for x in ss]
+        if rule == "any":
+            res = "met" if "met" in ss else ("not met" if all(dec) else "pending")
+        elif rule == "all":
+            res = "met" if all(x == "met" for x in ss) else ("not met" if any(x == "not met" for x in ss) else
+                                                             "pending")
+        else:
+            res = "not met" if "met" in ss else ("met" if all(dec) else "pending")
+        rows.append({"part": "outcome", "id": key, "question": cond, "conclusion": concl,
+                     "evidence": ", ".join(f"{i}: {x}" for i, x in zip(ids, ss)), "status": res})
+    for i in NEEDED_EVIDENCE:
+        r = st.get(i) or {}
+        x = r.get("status", "not run")
+        rows.append({"part": "criterion", "id": i, "question": r.get("question", ""),
+                     "conclusion": str(r.get("measured", ""))[:400], "evidence": r.get("family", ""),
+                     "status": "pending" if x == "not run" else x})
+    return pd.DataFrame(rows)
+
+
+def needed_answer(t15: pd.DataFrame) -> str:
+    """One line: the conclusions whose outcome row is met, or what is still pending."""
+    o = t15[t15.part == "outcome"] if len(t15) else t15
+    met = [r.conclusion for r in o.itertuples() if r.status == "met"]
+    pend = [r.id for r in o.itertuples() if r.status == "pending"]
+    return ("; ".join(met) if met else "no outcome decided yet") + (f" (pending: {', '.join(pend)})" if pend else "")
+
+
 def threshold_table(cfg, main: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for (suite, key), g in main.groupby(["suite", "key"]):
@@ -946,7 +1066,7 @@ def mechanism(cfg, df, ol: pd.DataFrame, seeds) -> dict:
 
 
 def _params_of(L, arm: str, seed: int) -> Optional[int]:
-    p = L.model_dir(arm, seed) / "model.json"
+    p = S5.e3_model_dir(L, arm, seed) / "model.json"
     if p.exists():
         return json.loads(p.read_text()).get("params")
     return None
@@ -955,7 +1075,7 @@ def _params_of(L, arm: str, seed: int) -> Optional[int]:
 # ============================================================================
 # The analysis
 # ============================================================================
-TABLES = tuple(f"T{i:02d}" for i in range(1, 15))
+TABLES = tuple(f"T{i:02d}" for i in range(1, 17))
 FIGURES = tuple(f"F{i:02d}" for i in range(1, 11))
 
 
@@ -970,7 +1090,8 @@ def _stat_rows(paths) -> List[str]:
     return out
 
 
-def inputs_fingerprint(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4, df: pd.DataFrame) -> str:
+def inputs_fingerprint(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4, df: pd.DataFrame,
+                       exclude_e4: bool = False) -> str:
     """Everything the analysis reads: the flights (ids and outcomes), the gate, tuning, timing, open-loop and policy
     files (size and modification time), the frozen config and the legacy inventory (their content: the inventory is
     rewritten by every run, and a new timestamp on the same content must not redo the analysis), this module's code."""
@@ -989,6 +1110,8 @@ def inputs_fingerprint(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4, 
             files += [os.path.join(dp, f) for f in fs if f.endswith((".json", ".csv")) and not f.startswith(".")]
     h.update("\n".join(sorted(_stat_rows(files))).encode())
     h.update(json.dumps(dataclasses.asdict(cfg), sort_keys=True, default=str).encode())
+    if exclude_e4:
+        h.update(b"exclude_e4")
     return h.hexdigest()
 
 
@@ -998,14 +1121,16 @@ def _outputs_complete(L: S5.LayoutV5) -> bool:
     return set(TABLES) <= t and set(FIGURES) <= f and (L.analysis / "captions.json").exists()
 
 
-def analyze(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4=None, log=print, force: bool = False) -> dict:
+def analyze(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4=None, log=print, force: bool = False,
+            exclude_e4: bool = False) -> dict:
     """Every table, figure and criterion. Returns a summary dict for the report. Skipped (outputs read back from
-    05_analysis/) when nothing it reads changed since the last complete analysis, unless force."""
+    05_analysis/) when nothing it reads changed since the last complete analysis, unless force. exclude_e4: the "Is
+    JEPA needed?" notebook (E4 / RL moved to notebook 2): RQ3's rows say "not in this notebook", not "not run"."""
     caps = A4.Captions(L)
     boot = Boot5(L, cfg.n_boot)
     cboot = ClusterBoot(L, cfg.n_boot)
     df = load_flights_v5(cfg, L, L3, L4)
-    fp = inputs_fingerprint(cfg, L, L3, L4, df)
+    fp = inputs_fingerprint(cfg, L, L3, L4, df, exclude_e4)
     fpp = L.analysis / "inputs.json"
     if not force and fpp.exists() and _outputs_complete(L):
         try:
@@ -1016,14 +1141,31 @@ def analyze(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4=None, log=pr
             log(f"[analysis] {len(df)} flights; nothing changed since the last analysis (05_analysis/inputs.json)")
             return {"skipped": True, "n_flights": int(len(df)), "boot": boot, "boot_clustered": cboot,
                     "T05": pd.read_csv(next(L.tables.glob("T05_*.csv"))),
+                    **({"T15": pd.read_csv(next(L.tables.glob("T15_*.csv")))} if list(L.tables.glob("T15_*.csv"))
+                       else {}),
                     "figures": {p.stem.split("_")[0]: p for p in sorted(L.figures.glob("F*.png"))}}
-    out = _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot)
+    out = _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot, exclude_e4)
     if _outputs_complete(L):
         L.write_json(fpp, {"fingerprint": fp, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "n_flights": int(len(df))})
     return out
 
 
-def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
+NOT_IN_NOTEBOOK = "not in this notebook"
+
+
+def exclude_e4_rows(t05: pd.DataFrame) -> pd.DataFrame:
+    """E4 / RL moved to notebook 2 (plan_jepa_needed_v5.md 2.4): RQ3's rows and DS1's / AS1's RL comparisons that
+    are not run or pending say "not in this notebook" (not pending failures)."""
+    if not len(t05):
+        return t05
+    t05 = t05.copy()
+    rl = "|".join(S5.RL_TIER1 + S5.RL_TIER2)
+    m = t05.family.astype(str).str.startswith("RQ3") | t05.id.astype(str).str.match(r"^[DA]-(?:%s)$" % rl)
+    t05.loc[m & t05.status.isin(["not run", "pending"]), "status"] = NOT_IN_NOTEBOOK
+    return t05
+
+
+def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None, exclude_e4: bool = False) -> dict:
     main = main_flights(df)
     cases = sorted({int(c["case"]) for c in S5.conditions(cfg, "A256")})
     seeds = list(cfg.seeds)
@@ -1083,8 +1225,8 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
     if len(t06):
         pr = {a: _params_of(L, a, seeds[0]) for a in M5.ARMS_E3}
         t06["params_a"] = [pr.get(k) for k in t06.a_key]
-        r0p = next((json.loads((L.model_dir(a, seeds[0]) / "model.json").read_text()).get("r0_params")
-                    for a in M5.ARMS_E3 if (L.model_dir(a, seeds[0]) / "model.json").exists()), None)
+        r0p = next((json.loads((S5.e3_model_dir(L, a, seeds[0]) / "model.json").read_text()).get("r0_params")
+                    for a in M5.ARMS_E3 if (S5.e3_model_dir(L, a, seeds[0]) / "model.json").exists()), None)
         t06["params_R0"] = r0p
         if ol_s is not None:
             for ttg in ol_s.columns:
@@ -1235,6 +1377,8 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
 
     # ---- T05 criteria ----
     t05 = criteria(cfg, main, t04, t06, t07, mech, orb, gates, seeds, rl_seeds, ds, a1)
+    if exclude_e4:
+        t05 = exclude_e4_rows(t05)
     _table(L, caps, t05, "T05_criteria", "Pre-registered criteria (v5_plan.md section 8): measured value, interval, "
            "bootstrap p, Holm-adjusted p within each family (RQ1: G1, G2, G4, G5; RQ2: the four J-each; RQ3: the Tier 1 "
            "R-each; RQ4: Q3a, Q3b; DS1: D1, D2; AS1: A1, A2), seeds holding, met (blank = not decided), valid (G4 needs G3). status: met / not met "
@@ -1243,6 +1387,24 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
            "resampled together with its four atmospheres; clustered_excludes_0 tells whether the verdict survives it.",
            "05_analysis/tables/T04, T06, T07, T08")
     out["T05"] = t05
+
+    # ---- T15 "Is JEPA needed?" and T16 E3 on AS1/DS1 (plan_jepa_needed_v5.md 0 and 2.2b) ----
+    t15 = is_jepa_needed(t05)
+    _table(L, caps, t15, "T15_is_jepa_needed", "Is JEPA needed? (plan_jepa_needed_v5.md section 0, fixed before any of "
+           "its flights): each outcome row of the plan with met / not met / pending, read from the criteria it "
+           "names (T05), then each of those criteria with its status. 'Not needed' needs G1, D1, A1 and G5 decided "
+           "and none met; 'a learned model is needed' needs D1, A1 or G5 met; the decoder row reads 'R0 not "
+           "significantly better than the arm' as ≈ (no equivalence test exists for those arms).",
+           "05_analysis/tables/T05")
+    out["T15"] = t15
+    t16 = e3_robustness(cfg, L, main)
+    _table(L, caps, t16.round(5), "T16_e3_robustness", "E3 on AS1 and DS1 (exploratory estimates, v5_plan.md section "
+           "15 of 2026-11-19): R0 − each E3 arm, paired by condition (case mod 5 is the training seed of both, same "
+           "CRN seed), a case's conditions averaged, cases as units; 95% two-stage bootstrap (seeds, then cases "
+           "within a seed) and the seed-level t-test beside it. log_miss: negative = R0's misses smaller; success5 "
+           "(pp): positive = R0 better. No pass/fail criterion and no Holm family: these cannot change an RQ2 "
+           "verdict.", data)
+    out["T16"] = t16
 
     # ---- T09 compute ----
     cp = L.checks / "compute_per_decision.csv"
@@ -1263,6 +1425,13 @@ def _analyze(cfg, L, L3, L4, log, caps, boot, df, cboot=None) -> dict:
            "and gmax_g. "
            + (f"FNPEG final speed Vf = {vf.get('vf_mps')} m/s (median at 7.6 km over {vf.get('n_flights')} classical "
               "DEV48 flights)." if vf else ""), "03_tuning/")
+    t10b = e3_lr_table(cfg, L)
+    _table(L, caps, t10b, "T10b_e3_learning_rates", "E3 learning rates (plan_jepa_needed_v5.md section 3, v5_plan.md "
+           "section 15 of 2026-11-19): per arm and seed every training run (multiplier, folder, finished or stopped "
+           "with the step and reason), flies = the run whose model the seed's flights use, the preregistered choice "
+           "and the pilots' final validation open-loop loss at T=96. A run whose training loss went non-finite is "
+           "kept and the seed retrained at the next-best pilot multiplier.", "02_models/")
+    out["T10b"] = t10b
 
     # ---- T11 legacy ----
     inv = L.study / "legacy_rl_inventory.csv"

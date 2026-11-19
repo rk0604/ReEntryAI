@@ -89,16 +89,62 @@ def set_rng_state(st: dict, gens: Optional[Dict[str, torch.Generator]] = None) -
             g.set_state(st["gens"][k])
 
 
-NAN_ENV = "JEPA_V5_FAULT_E3_NAN"      # smoke test only: "<arm> seed <k>" makes that model's training loss NaN
+NAN_ENV = "JEPA_V5_FAULT_E3_NAN"      # smoke test only: "<label>[|<label>...]" makes those models' training loss NaN
+
+# Why an E3 run stopped (TrainingStopped.kind). Only "nonfinite_train" leads to the learning-rate fallback
+# (plan_jepa_needed_v5.md 3, v5_plan.md 15 of 2026-11-19); the validation-loss kinds are stop rules (4b).
+STOP_KINDS = ("nonfinite_train", "val_nonfinite", "val_diverging", "not_learning", "not_learning_pilot")
 
 
 class TrainingStopped(Exception):
     """An E3 model stopped by its early-stop rule (train_e3): non-finite loss, or validation loss diverging or not
-    falling. study_v5.train_e3_stage records it as "diverged" and goes on with the other models."""
+    falling. study_v5.train_e3_stage records it as "diverged"; kind says which rule (STOP_KINDS)."""
 
-    def __init__(self, msg: str, step: int):
+    def __init__(self, msg: str, step: int, kind: str = ""):
         super().__init__(msg)
         self.step = int(step)
+        self.kind = kind or stop_kind(msg)
+
+
+def stop_kind(reason: str) -> str:
+    """The STOP_KINDS entry of a stop reason (also for failed.json files written before kinds existed)."""
+    r = str(reason)
+    if "training loss is" in r:
+        return "nonfinite_train"
+    if "(diverging)" in r:
+        return "val_diverging"
+    if "pilot reference" in r:
+        return "not_learning_pilot"
+    if "(not learning)" in r:
+        return "not_learning"
+    if "validation loss is" in r:
+        return "val_nonfinite"
+    return "stopped"
+
+
+def nan_fault_for(label: str) -> bool:
+    want = os.environ.get(NAN_ENV, "")
+    return bool(label) and bool(want) and label in want.split("|")
+
+
+def pilot_rule(hist: Dict[str, list], steps: int, ref_val: Optional[float], frac: float = 0.25,
+               ratio: float = 3.0) -> str:
+    """The 4b not-learning rule, checked once, at the first logged point at or after frac of the steps: validation
+    loss above ratio x ref_val (the run's own pilot's final validation open-loop loss at that multiplier,
+    lr_choice.json). Calibrated on E3_train.log of 2026-11-19 (v5_plan.md 15): healthy runs reach at most 1.38x
+    there (gru_direct seed 0, step 9,000) and 2.1x anywhere later (the T=96 switch). Pilots are not checked (their
+    own 25% point is right after their compressed curriculum's first switch, at 1.6-7.9x)."""
+    if ref_val is None or not math.isfinite(ref_val) or not hist["step"]:
+        return ""
+    s = hist["step"]
+    at = frac * steps
+    if s[-1] < at or (len(s) > 1 and s[-2] >= at):
+        return ""
+    v = hist["val"][-1]
+    if math.isfinite(v) and v > ratio * ref_val:
+        return (f"validation loss {v:.4g} at step {s[-1]} (T={hist['T'][-1]}) is above {ratio:g}x its own pilot's "
+                f"final validation loss {ref_val:.4g} at {frac:.0%} of {steps} steps (not learning, pilot reference)")
+    return ""
 
 
 def stop_rule(hist: Dict[str, list], steps: int, val0: Optional[float] = None, ratio: float = 3.0, frac: float = 0.2,
@@ -427,10 +473,12 @@ def param_groups(module: nn.Module, wd: float):
 
 
 def train_e3(model: nn.Module, ds_tr, ds_va, cfg: E3TrainCfg, device, L, state_path, seed: int,
-             label: str = "", log=print, stage: str = "e3_train") -> Dict[str, list]:
+             label: str = "", log=print, stage: str = "e3_train", ref_val: Optional[float] = None,
+             ref_frac: float = 0.25, ref_ratio: float = 3.0) -> Dict[str, list]:
     """
     Resumable AdamW loop (models_v2.train_stage's arithmetic) with the full train state of v5_plan.md 9.1.
-    Returns the history (step, T, sec, state, acc, val).
+    Returns the history (step, T, sec, state, acc, val). ref_val: the not-learning rule of plan 4b (pilot_rule;
+    None = off, as for the pilots and the old notebook).
     """
     device = torch.device(device)
     model.to(device)
@@ -477,7 +525,7 @@ def train_e3(model: nn.Module, ds_tr, ds_va, cfg: E3TrainCfg, device, L, state_p
     if val0 is None and start == 0:
         val0 = val_at(T_first)                  # the untrained model's (stop_rule's "not learning")
     params = [p for g in opt.param_groups for p in g["params"]]
-    nan_fault = bool(label) and os.environ.get(NAN_ENV, "") == label
+    nan_fault = nan_fault_for(label)
     acc: Dict[str, float] = acc0               # the log window's running sums (saved, so a resume logs the same)
     n_acc, t_log, t_save = n_acc0, time.time(), time.time()
     model.train()
@@ -494,7 +542,8 @@ def train_e3(model: nn.Module, ds_tr, ds_va, cfg: E3TrainCfg, device, L, state_p
         if not torch.isfinite(loss.detach()):
             if state_path:
                 save(step)                      # the last finite state, kept for inspection
-            raise TrainingStopped(f"training loss is {float(loss.detach())} at step {step + 1}", step + 1)
+            raise TrainingStopped(f"training loss is {float(loss.detach())} at step {step + 1}", step + 1,
+                                  "nonfinite_train")
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
@@ -521,10 +570,10 @@ def train_e3(model: nn.Module, ds_tr, ds_va, cfg: E3TrainCfg, device, L, state_p
                 f"acc={hist['acc'][-1]:.4g} val={hist['val'][-1]:.4g} ({per * 1000:.0f} ms/step, "
                 f"~{per * (cfg.steps - step - 1) / 60:.0f} min left)")
             acc, n_acc = {}, 0
-            why = stop_rule(hist, cfg.steps, val0)
+            why = stop_rule(hist, cfg.steps, val0) or pilot_rule(hist, cfg.steps, ref_val, ref_frac, ref_ratio)
             if why:
                 save(step + 1)
-                raise TrainingStopped(f"[{label}] {why}", step + 1)
+                raise TrainingStopped(f"[{label}] {why}", step + 1, stop_kind(why))
         switch = not last and V.horizon_at(step + 1, c2) != T
         due = state_path and (time.time() - t_save > cfg.save_every_s
                               or (cfg.save_every_steps and (step + 1) % cfg.save_every_steps == 0))
@@ -615,10 +664,13 @@ def load_adapter(kind: str, ckpt: str, device="cpu"):
 # One arm, one seed (resumable; ckpt.pt marks done)
 # ============================================================================
 def train_arm_seed(cfg5, data: dict, L, arm: str, seed: int, device, lr_mult: float, log=print,
-                   train_dir: Optional[Path] = None, steps: Optional[int] = None) -> dict:
+                   train_dir: Optional[Path] = None, steps: Optional[int] = None, label: Optional[str] = None,
+                   ref_val: Optional[float] = None) -> dict:
     """
     Train (or resume, or skip) one E3 model. cfg5: study_v5.StudyConfigV5 (e3_train, e3_sizes, r0_arch).
-    train_dir/steps: the learning-rate pilot's folder and budget. Returns the run's summary.
+    train_dir/steps: the learning-rate pilot's folder and budget, or a fallback run's folder (study_v5.e3_run_dir).
+    label: the log label (default "<arm> seed <k>", pilots "... lr x<m>"). ref_val: train_e3's pilot reference.
+    Returns the run's summary.
     """
     d = Path(train_dir) if train_dir is not None else L.model_dir(arm, seed)
     ckpt = d / "ckpt.pt"
@@ -635,8 +687,10 @@ def train_arm_seed(cfg5, data: dict, L, arm: str, seed: int, device, lr_mult: fl
         from jepa.ablate_v4 import SlicedWindows
         ds_tr, ds_va = SlicedWindows(ds_tr, model.rf), SlicedWindows(ds_va, model.rf)
     t0 = time.time()
-    hist = train_e3(model, ds_tr, ds_va, tc, device, L, d / "train_state.pt", seed,
-                    label=f"{arm} seed {seed}" + (f" lr x{lr_mult:g}" if train_dir is not None else ""), log=log)
+    if label is None:
+        label = f"{arm} seed {seed}" + (f" lr x{lr_mult:g}" if train_dir is not None else "")
+    hist = train_e3(model, ds_tr, ds_va, tc, device, L, d / "train_state.pt", seed, label=label, log=log,
+                    ref_val=ref_val)
     T_max = max(T for _, T in tc.curriculum)
     info = {"arm": arm, "seed": int(seed), "lr_mult": float(lr_mult), "lr": tc.lr, "steps": tc.steps,
             "params": n_params(model), "r0_params": r0_param_count(cfg5.r0_arch), "hparams": model.hparams,
@@ -689,7 +743,7 @@ def choose_lr(cfg5, data: dict, L, arm: str, device, log=print) -> float:
             info = train_arm_seed(cfg5, data, L, arm, 0, device, mult, log, d, steps)
         except TrainingStopped as e:          # a pilot that diverges loses the choice; the other pilots go on
             L.write_json(stopped, {"arm": arm, "lr_mult": mult, "status": "diverged", "reason": str(e),
-                                   "step": e.step})
+                                   "step": e.step, "kind": e.kind})
             log(f"  [{arm}] pilot lr x{mult:g} stopped: {e}")
             rows.append({"lr_mult": mult, "val": float("inf"), "stopped": str(e)})
             continue
@@ -747,13 +801,14 @@ def footprint_rows(adapter, name: str, eps: Sequence[dict], ttg_s: Sequence[floa
     return rows
 
 
-def open_loop_seed(cfg5, L, data: dict, arm: str, seed: int, device="cpu"):
-    """03_open_loop/footprint_<arm>_seed<k>.csv (test and validation splits); cached."""
+def open_loop_seed(cfg5, L, data: dict, arm: str, seed: int, device="cpu", ckpt=None):
+    """03_open_loop/footprint_<arm>_seed<k>.csv (test and validation splits); cached. ckpt: the model that flies
+    (study_v5.e3_ckpt: a fallback run's), default the seed folder's."""
     import pandas as pd
     path = L.open_loop / f"footprint_{arm}_seed{seed}.csv"
     if path.exists():
         return pd.read_csv(path)
-    ck = L.ckpt(arm, seed)
+    ck = Path(ckpt) if ckpt is not None else L.ckpt(arm, seed)
     if not ck.exists():
         return None
     m, _, _ = load_e3(str(ck), device)

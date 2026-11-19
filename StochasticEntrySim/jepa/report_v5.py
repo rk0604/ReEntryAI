@@ -165,6 +165,33 @@ def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
                         "paired flight of both arms exists; until then its numbers are provisional and it has no verdict.")
     d.callout("The numbers (read from 05_analysis/tables)", lines or ["No analysis tables yet."],
               R2.TINT_YELLOW, colors.HexColor("#eda100"))
+    t15 = t.get("T15")
+    if t15 is not None and len(t15):                 # plan_jepa_needed_v5.md 0: the one-page answer
+        d.add(PageBreak())
+        d.h1("Is JEPA needed?")
+        d.p("The question of ReEntryAI_JEPA_v5_needed.ipynb: is the JEPA world model (v2 / R0 + MPPI) needed, or does "
+            "something simpler do as well? Three simpler alternatives, each its own experiment: a published tuned "
+            "guidance law (Q-A: G1, G2, Q3, D1-D2, A1-A2), the same planner with a physics model and explicit online "
+            "estimation (Q-B: G5, D3, A3), a learned model of the same size, data and planner trained without the "
+            "JEPA objective (Q-C: J-each, J-equiv). How each outcome reads was fixed before any of its flights.")
+        o = t15[t15.part == "outcome"]
+        rows = [["Outcome", "Conclusion", "Evidence", "Status"]]
+        for r in o.itertuples():
+            stt = str(r.status)
+            rows.append([escape(str(r.question)), escape(str(r.conclusion)), escape(str(r.evidence)),
+                         f"<b>{escape(stt)}</b>" if stt == "met" else escape(stt)])
+        d.table(rows, [1.9, 1.9, 2.1, 0.7])
+        met = [str(r.conclusion) for r in o.itertuples() if str(r.status) == "met"]
+        d.p("<b>Answer so far:</b> " + escape("; ".join(met) if met else "no outcome is decided yet")
+            + (" (provisional: some criteria wait for flights)" if (o.status == "pending").any() else ""))
+        c = t15[t15.part == "criterion"]
+        rows = [["#", "Question", "Measured", "Status"]]
+        for r in c.itertuples():
+            rows.append([escape(str(r.id)), escape(str(r.question)), escape(str(r.conclusion)), escape(str(r.status))])
+        d.table(rows, [0.9, 2.0, 3.0, 0.7])
+        d.note("Status: met / not met are decided on complete data only; pending = flights still missing (or not run "
+               "yet); estimate = reported with its interval, no pass/fail. The E3 arms on AS1 and DS1 (T16) are "
+               "estimates and cannot change these rows.")
     if t05 is not None and len(t05):
         d.h2("Pre-registered criteria (v5_plan.md section 8, fixed before any v5 flight)")
         rows = [["#", "Question", "Measured", "p (Holm)", "Met"]]
@@ -244,6 +271,21 @@ def build_report(L, out_pdf: Optional[str] = None, force: bool = False) -> str:
         "reach; the '-reach' rows use only the conditions still inside its 4.5 g footprint. T14b shows what each arm "
         "loses from A256's nominal atmosphere to AS1.")
     tab("T14"), tab("T14b")
+    if "T16" in T:
+        d.h1("E3 on AS1 and DS1 (exploratory)")
+        d.p("Does R0's advantage over the non-JEPA models, if any, survive model error that the classical laws cannot "
+            "handle (AS1) or that changes during flight (DS1)? R0 (v4's checkpoints) and each E3 arm fly every AS1 "
+            "and DS1 condition with training seed case mod 5, so each E3 flight pairs with R0's. Estimates only "
+            "(v5_plan.md section 15, 2026-11-19, written before any of these flights): no pass/fail criterion and no "
+            "Holm family.")
+        tab("T16")
+    if "T10b" in T:
+        d.h1("E3 learning rates and the divergence fallback")
+        d.p("Pilots on seed 0 choose each arm's multiplier (x1, x0.3, x3) as preregistered. A full run whose training "
+            "loss goes non-finite keeps its record and the seed is retrained from scratch at the next-best pilot "
+            "multiplier; once a multiplier diverged on any seed, the arm's remaining seeds start at the fallback "
+            "(v5_plan.md section 15, 2026-11-19). The table says which seeds used which multiplier.")
+        tab("T10b")
     d.h1("RQ5. Compute per decision")
     tab("T09")
     d.h1("Success against the threshold")

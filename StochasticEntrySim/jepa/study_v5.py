@@ -95,7 +95,10 @@ AMENDMENTS = {
 # Approximate Colab compute units per hour by runtime (the status cell's projection only).
 UNITS_PER_HOUR = {"A100": 11.8, "L4": 1.98, "T4": 1.8, "V100": 4.9, "cpu": 0.08}   # L4: the rate Colab showed the
                                                                                 # user (2026-11-17), was 4.8
-NOTEBOOK_REV = 2        # ReEntryAI_JEPA_v5.ipynb's revision; an older copy of the notebook stops at its status cell
+NOTEBOOK_REV = 3        # ReEntryAI_JEPA_v5_needed.ipynb's revision; any other copy stops at Setup (2026-11-19)
+NOTEBOOK_NAME = "ReEntryAI_JEPA_v5_needed.ipynb"
+SUPERSEDED_REVS = {2: "ReEntryAI_JEPA_v5.ipynb"}     # notebooks replaced by NOTEBOOK_NAME (one writer per study folder)
+ACCEPT_REV_ENV = "JEPA_V5_ACCEPT_NB_REV"   # smoke test only: "2" lets the old notebook run its smoke checks (10, 13, 14)
 
 
 # ============================================================================
@@ -581,7 +584,8 @@ def v2single_model(L3: S.Layout, seed: int) -> dict:
 
 
 def e3_model(L: LayoutV5, arm: str, seed: int) -> dict:
-    ck = str(L.ckpt(arm, seed))
+    """The model that flies: the seed's finished run, a fallback retrain's if that is the one (e3_ckpt)."""
+    ck = str(e3_ckpt(L, arm, seed) or L.ckpt(arm, seed))
     return {"kind": "v2", "ckpt": ck, "members": None} if arm == "r0_nojepa" else {"kind": "e3", "ckpt": ck,
                                                                                     "members": None}
 
@@ -786,6 +790,75 @@ def jobs_as1(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout) -> List[dict]:
     return [arm_job(cfg, L, L3, c, a, "AS1") for a in cfg.as1_arms for c in conds]
 
 
+R0_ARM = "R0"      # v4's R0 (v2 recipe, 1 member), flown from v4's checkpoints on AS1 and DS1 (section 15, 2026-11-19)
+
+
+def r0_model(L4, seed: int) -> dict:
+    """v4's R0 as v4 flew it (models_v2 checkpoint, every member: R0 has one)."""
+    return {"kind": "v2", "ckpt": str(L4.ckpt("R0", seed)), "members": None}
+
+
+def jobs_robust(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, L4, arm: str) -> List[dict]:
+    """R0 or an E3 arm on AS1, then DS1 (plan_jepa_needed_v5.md 2.2b): one flight per condition, training seed =
+    case mod 5 (orb1_seed) and the same CRN seed, so each E3 flight pairs with R0's on its condition. [] for R0
+    without v4's folder."""
+    out = []
+    for suite in ("AS1", "DS1"):
+        for c in conditions(cfg, suite):
+            if arm == R0_ARM:
+                if L4 is None:
+                    return []
+                sd = orb1_seed(cfg, c)
+                out.append(mppi_job(cfg, c, R0_ARM, G, cfg.g_primary, sd, r0_model(L4, sd), "E3_robust"))
+            else:
+                out.append(arm_job(cfg, L, L3, c, arm, "E3_robust"))
+    return out
+
+
+def jobs_e3_arm(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, arm: str) -> List[dict]:
+    """One E3 arm's A256 flights (jobs_e3's, seed-major)."""
+    conds = conditions(cfg, "A256")
+    return [arm_job(cfg, L, L3, c, arm, "E3", s) for s in cfg.seeds for c in conds]
+
+
+NEEDED_E2 = (("v2single", "AS1"), ("mppi_filtered", "AS1"), ("v2single", "DS1"), ("mppi_filtered", "DS1"),
+             ("mppi_filtered", "A256"), ("v2single@fnpeg_matched", "A256"), ("v2single", "ORB1"),
+             ("mppi_filtered", "ORB1"))
+
+
+def needed_e2_blocks(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, log=lambda *a: None) -> List[Tuple[str, list]]:
+    """The "Is JEPA needed?" notebook's E2 and robustness flights in plan 2.1's order (ORB-1 block 1 only)."""
+    out = []
+    for arm, suite in NEEDED_E2:
+        if suite in ("AS1", "DS1"):
+            js = [arm_job(cfg, L, L3, c, arm, suite) for c in conditions(cfg, suite)]
+        elif arm == "v2single@fnpeg_matched":
+            js = jobs_matched(cfg, L, L3)
+        elif suite == "A256":
+            js = [arm_job(cfg, L, L3, c, arm, "A256", sd) for sd in cfg.seeds for c in conditions(cfg, "A256")]
+        else:
+            js = orb1_jobs(cfg, L, L3, [arm], [0], "ORB1", log)
+        out.append((f"{arm} {suite if suite != 'ORB1' else 'ORB-1 block 1'}", js))
+    return out
+
+
+NEEDED_E3_ORDER = ("r0_nojepa", "gru_direct", "mlp_direct", "gru_pi")   # plan 2.2: r0_nojepa first (order only)
+
+
+def needed_e3_arms(cfg: StudyConfigV5) -> List[str]:
+    return [a for a in NEEDED_E3_ORDER if a in cfg.e3_arms]
+
+
+def needed_stage_jobs(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, L4, log=lambda *a: None) -> Dict[str, list]:
+    """Every flight block of ReEntryAI_JEPA_v5_needed.ipynb, in its order (status and the flight cells)."""
+    J = dict(needed_e2_blocks(cfg, L, L3, log))
+    J["R0 AS1/DS1"] = jobs_robust(cfg, L, L3, L4, R0_ARM)
+    for a in needed_e3_arms(cfg):
+        J[f"{a} A256"] = jobs_e3_arm(cfg, L, L3, a)
+        J[f"{a} AS1/DS1"] = jobs_robust(cfg, L, L3, L4, a)
+    return J
+
+
 def done_ids(L: LayoutV5, jobs: Sequence[dict]) -> set:
     """Flight ids among jobs whose result exists (one os.scandir per result folder)."""
     by_dir: Dict[Path, Dict[str, str]] = {}
@@ -928,7 +1001,7 @@ class _FlightErrors:
 
     def __init__(self, L: LayoutV5, label: str, log, n_first: int = 50, max_frac: float = 0.10):
         self.L, self.label, self.log, self.n_first, self.max_frac = L, label, log, n_first, max_frac
-        self.seen, self.err_first, self.errors = 0, 0, []
+        self.seen, self.err_first, self.errors, self.closed = 0, 0, [], False
 
     def add(self, res: dict) -> None:
         errs = res.get("errors", [])
@@ -952,18 +1025,38 @@ class _FlightErrors:
             return False
         return self.err_first > self.max_frac * self.seen
 
-    def close(self, finished: bool = True) -> None:
-        if self.errors:
+    def close(self, finished: bool = True, stage_rule: bool = True) -> None:
+        if self.errors and not self.closed:
+            self.closed = True
             RG.SUMMARY.failure("flights", self.label, f"{len(self.errors)} flight(s) failed after one retry "
                                f"(04_flights/errors/)")
             RG.SUMMARY.write()
-        if self.too_many(finished):
+        if stage_rule and self.too_many(finished):
             msg = (f"{self.err_first} of the first {self.seen} flights raised errors (more than "
                    f"{self.max_frac:.0%}): stage stopped")
             RG.record_failure(self.L, self.L.checks / f"stage_{_safe(self.label)}_failed.json",
                               {"stage": self.label, "reason": msg, "errors": self.errors[:50],
                                "git_commit": _GIT.get()}, "stage", self.label, self.log)
             raise RG.StageFailed(f"[{self.label}] {msg}")
+
+
+MPPI_STOP_FIRST, MPPI_STOP_ERRORS = 20, 5     # stop rule (plan 4b): >= 5 of an MPPI arm's first 20 flights fail
+
+
+def _mppi_arm_rule(arm_n: Dict[str, List[int]], arm: str, outs: Sequence[dict]) -> str:
+    """The MPPI stop rule after one model run's lockstep shards: an arm whose flights in this call, counted until 20
+    have been seen, failed (an exception or a non-finite landing, after one retry) MPPI_STOP_ERRORS times or more, at
+    a rate of at least 5 in 20. A lockstep shard finishes all of its flights together, so "the first 20" are the
+    flights of the model runs that started before 20 had been seen."""
+    a = arm_n.setdefault(arm, [0, 0])
+    if a[0] >= MPPI_STOP_FIRST:
+        return ""
+    a[0] += sum(int(o.get("n", 0)) + len(o.get("errors", [])) for o in outs)
+    a[1] += sum(len(o.get("errors", [])) for o in outs)
+    if a[1] >= MPPI_STOP_ERRORS and a[1] * MPPI_STOP_FIRST >= MPPI_STOP_ERRORS * a[0]:
+        return (f"{a[1]} of the first {a[0]} flights of MPPI arm {arm} failed (exception or non-finite state; "
+                f"stop rule: {MPPI_STOP_ERRORS} of the first {MPPI_STOP_FIRST})")
+    return ""
 
 
 def _safe(s: str) -> str:
@@ -1060,6 +1153,7 @@ def run_mppi(cfg: StudyConfigV5, jobs: Sequence[dict], L: LayoutV5, device: str 
     errs = _FlightErrors(L, label, log)
     lim = SESSION["limit"]
     stopped = False
+    arm_n: Dict[str, List[int]] = {}             # stop rule: an arm's flights and errors in its first window
     try:
         for key, g in ready:
             todo = [j for j in g if F5.flight_id_v5(j) not in done]
@@ -1093,6 +1187,16 @@ def run_mppi(cfg: StudyConfigV5, jobs: Sequence[dict], L: LayoutV5, device: str 
                                       f"min, {S._progress_line(progs, len(todo))}")
             for o in outs:
                 errs.add(o)
+            if RG.STATE.get("stop_rules"):
+                why = _mppi_arm_rule(arm_n, arm if load == G else f"{arm}@{load}", outs)
+                if why:
+                    stopped = True
+                    errs.close(finished=False, stage_rule=False)
+                    RG.record_failure(L, L.checks / f"mppi_arm_{_safe(arm)}_{_safe(load)}_failed.json",
+                                      {"arm": arm, "load": load, "suite": suite, "reason": why,
+                                       "errors": errs.errors[:50], "git_commit": _GIT.get()}, "MPPI arm",
+                                      f"{arm} {load}", log)
+                    RG.stop_run(L, f"mppi_arm_failing:{_safe(arm)}", why, log)
             if errs.too_many():
                 stopped = True
                 break
@@ -1903,9 +2007,20 @@ NB_GUARD_ENV = "JEPA_V5_NB_GUARD"
 _NB = {"rev": None}
 
 
+def _rev_accepted(rev) -> bool:
+    return rev == NOTEBOOK_REV or (str(rev) == os.environ.get(ACCEPT_REV_ENV, "-") and rev in SUPERSEDED_REVS)
+
+
 def notebook_check(rev) -> None:
     """The notebook's Setup cell: its NOTEBOOK_REV must be this code's. An older copy stops here (the post_run_cell
-    hook then releases the runtime)."""
+    hook then releases the runtime). A superseded notebook (ReEntryAI_JEPA_v5.ipynb, revision 2) says so."""
+    if _rev_accepted(rev):
+        _NB["rev"] = rev
+        return
+    if rev in SUPERSEDED_REVS:
+        raise RuntimeError(f"{SUPERSEDED_REVS[rev]} (revision {rev}) is superseded by {NOTEBOOK_NAME} (revision "
+                           f"{NOTEBOOK_REV}, plan_jepa_needed_v5.md): it must not write the study folder any more. "
+                           f"Open {NOTEBOOK_NAME} from GitHub (space-jepa5) and Run all there.")
     if rev != NOTEBOOK_REV:
         raise RuntimeError(f"this notebook is revision {rev}, the code on space-jepa5 is revision {NOTEBOOK_REV}: it is "
                            f"an old copy. Open the notebook from GitHub (the 'Open in Colab' badge in jepa/v5_plan.md "
@@ -1917,7 +2032,7 @@ def notebook_guard() -> None:
     """In Colab (or with JEPA_V5_NB_GUARD=1): refuse to run study cells from a notebook whose Setup cell did not pass
     notebook_check (an old notebook that pulled the new code)."""
     active = "google.colab" in sys.modules or os.environ.get(NB_GUARD_ENV) == "1"
-    if active and _NB["rev"] != NOTEBOOK_REV:
+    if active and not (_NB["rev"] is not None and _rev_accepted(_NB["rev"])):
         raise RuntimeError(f"this notebook is an old copy (its Setup cell does not check revision {NOTEBOOK_REV}). "
                            f"Open the notebook from GitHub, not a downloaded or Drive copy, then Run all.")
 
@@ -2021,53 +2136,189 @@ def e3_failed(L: LayoutV5, arm: str, seed: int) -> Optional[dict]:
     return _read_json(L.model_dir(arm, seed) / "failed.json")
 
 
+# The learning-rate fallback (plan_jepa_needed_v5.md 3, v5_plan.md section 15 of 2026-11-19). A full run whose
+# training loss goes non-finite keeps its failed.json; the seed is retrained from scratch at the next-best pilot
+# multiplier in seed_<k>/lr_x<m>/; once a multiplier diverged on any seed of an arm, the arm's remaining seeds start
+# at the fallback (finished runs stand); with every multiplier diverged the arm "did not train".
+def lr_ranking(L: LayoutV5, arm: str) -> Optional[List[float]]:
+    """The arm's multipliers in fallback order: the preregistered choice, then the other pilots that finished, by
+    validation loss (lowest first). None before the pilots chose."""
+    doc = _read_json(L.models / arm / "lr_choice.json")
+    if doc is None:
+        return None
+    chosen = float(doc["lr_mult"])
+    rest = sorted((r for r in doc.get("pilots", []) if float(r["lr_mult"]) != chosen and not r.get("stopped")
+                   and np.isfinite(float(r["val"]))), key=lambda r: float(r["val"]))
+    return [chosen] + [float(r["lr_mult"]) for r in rest]
+
+
+def pilot_val(L: LayoutV5, arm: str, mult: float) -> Optional[float]:
+    """The pilot's final validation open-loop loss at a multiplier (the not-learning rule's reference)."""
+    doc = _read_json(L.models / arm / "lr_choice.json") or {}
+    for r in doc.get("pilots", []):
+        if float(r["lr_mult"]) == float(mult) and not r.get("stopped") and np.isfinite(float(r["val"])):
+            return float(r["val"])
+    return None
+
+
+def e3_run_dir(L: LayoutV5, arm: str, seed: int, mult: float, chosen: float) -> Path:
+    d = L.model_dir(arm, seed)
+    return d if float(mult) == float(chosen) else d / f"lr_x{float(mult):g}"
+
+
+def e3_runs(L: LayoutV5, arm: str, seed: int) -> List[dict]:
+    """Every run of one seed: its folder, multiplier, done (ckpt.pt), and its failed.json (kind, step) if stopped."""
+    d = L.model_dir(arm, seed)
+    dirs = [d] + (sorted(x for x in d.glob("lr_x*") if x.is_dir()) if d.exists() else [])
+    out = []
+    for x in dirs:
+        f = _read_json(x / "failed.json")
+        info = _read_json(x / "model.json") or {}
+        m = info.get("lr_mult", (f or {}).get("lr_mult"))
+        if m is None and x != d:
+            m = float(x.name[len("lr_x"):])
+        if not ((x / "ckpt.pt").exists() or f or (x / "train_state.pt").exists()):
+            continue
+        out.append({"dir": x, "lr_mult": None if m is None else float(m), "done": (x / "ckpt.pt").exists(),
+                    "failed": f, "kind": (f.get("kind") or M5.stop_kind(f.get("reason", ""))) if f else None,
+                    "step": (f or {}).get("step"), "partial": (x / "train_state.pt").exists()})
+    return out
+
+
+def e3_ckpt(L: LayoutV5, arm: str, seed: int) -> Optional[Path]:
+    """The checkpoint that flies for one seed: the seed folder's, else a fallback retrain's; None if none finished."""
+    for r in e3_runs(L, arm, seed):
+        if r["done"]:
+            return r["dir"] / "ckpt.pt"
+    return None
+
+
+def e3_model_dir(L: LayoutV5, arm: str, seed: int) -> Path:
+    ck = e3_ckpt(L, arm, seed)
+    return ck.parent if ck is not None else L.model_dir(arm, seed)
+
+
+def e3_arm_plan(L: LayoutV5, cfg: StudyConfigV5, arm: str) -> dict:
+    """The fallback rule's state of one arm: the multiplier its remaining seeds start at (None: every multiplier
+    diverged, or the pilots have not chosen), the multipliers that diverged (seed and step), and per seed what is
+    left to do ("done", "stopped" by a validation-loss rule, "train")."""
+    rank = lr_ranking(L, arm)
+    div: Dict[float, List[Tuple[int, Optional[int]]]] = {}
+    seeds = {}
+    for sd in cfg.seeds:
+        rs = e3_runs(L, arm, sd)
+        for r in rs:
+            if r["kind"] == "nonfinite_train" and r["lr_mult"] is not None:
+                div.setdefault(r["lr_mult"], []).append((int(sd), r["step"]))
+        if any(r["done"] for r in rs):
+            seeds[sd] = "done"
+        elif any(r["failed"] and r["kind"] != "nonfinite_train" for r in rs):
+            seeds[sd] = "stopped"
+        else:
+            seeds[sd] = "train"
+    mult = None if rank is None else next((m for m in rank if m not in div), None)
+    return {"ranking": rank, "chosen": None if rank is None else rank[0], "mult": mult, "diverged": div,
+            "seeds": seeds, "did_not_train": rank is not None and mult is None}
+
+
 def _e3_hours(L: LayoutV5, cfg: StudyConfigV5, arm: str) -> float:
     """A finished model's training time of this arm (the session budget's estimate; 0 before the first one)."""
     for s in cfg.seeds:
-        info = _read_json(L.model_dir(arm, s) / "model.json")
+        info = _read_json(e3_model_dir(L, arm, s) / "model.json")
         if info and info.get("train_s"):
             return float(info["train_s"]) / 3600.0
     return 0.0
 
 
-def train_e3_stage(cfg: StudyConfigV5, L: LayoutV5, data_fn: Callable[[], dict], device, log=print) -> List[dict]:
+def _did_not_train(cfg, L: LayoutV5, arm: str, plan: dict, log) -> None:
+    """Every multiplier of an arm diverged: 02_models/<arm>/did_not_train.json; with the stop rules on, the notebook
+    stops and releases the runtime (plan 4b)."""
+    p = L.models / arm / "did_not_train.json"
+    if p.exists():
+        log(f"  [{arm}] did not train (every multiplier diverged, {p.name}): skipped")
+        return
+    div = {f"x{m:g}": [{"seed": sd, "step": st} for sd, st in v] for m, v in plan["diverged"].items()}
+    why = f"{arm}: every learning-rate multiplier diverged ({div}); the arm did not train"
+    doc = {"arm": arm, "status": "did not train", "reason": why, "diverged": div, "ranking": plan["ranking"],
+           "git_commit": _GIT.get()}
+    if RG.STATE.get("stop_rules"):            # the stop rule's record is this failure's record
+        L.write_json(p, {**doc, "time": time.strftime("%Y-%m-%d %H:%M:%S")})
+        RG.stop_run(L, f"e3_did_not_train:{arm}", why, log)
+    RG.record_failure(L, p, doc, "E3 arm", arm, log)
+
+
+def train_e3_stage(cfg: StudyConfigV5, L: LayoutV5, data_fn: Callable[[], dict], device, log=print,
+                   arms: Optional[Sequence[str]] = None) -> List[dict]:
     """
-    Every E3 arm: learning-rate pilots on seed 0, then seeds (seed-major within the arm). A model stopped by its
-    early-stop rule (non-finite loss, validation loss diverging or not falling; models_v5.train_e3) gets failed.json
-    in its folder and is skipped from then on (delete the file to train it again); the other models go on. Being
-    worse than R0 never stops a model: that is RQ2's answer. A model starts only if the session budget allows it.
+    E3 arms (default every one): learning-rate pilots on seed 0, then seeds (seed-major within the arm), with the
+    learning-rate fallback (e3_arm_plan). A run stopped by its early-stop rule gets failed.json in its folder (kept):
+    a non-finite training loss is retrained at the next multiplier; a validation-loss stop (diverging, not falling,
+    the 4b pilot reference) is skipped from then on, and with the stop rules on (RG.STATE["stop_rules"], the "Is
+    JEPA needed?" notebook) it stops the notebook. Being worse than R0 never stops a model: that is RQ2's answer. A
+    model starts only if the session budget allows it.
     """
     out = []
-    todo = [(a, s) for a in cfg.e3_arms for s in cfg.seeds if not L.ckpt(a, s).exists()]
-    failed = [(a, s) for a, s in todo if e3_failed(L, a, s)]
-    log(f"[E3] {len(cfg.e3_arms) * len(cfg.seeds) - len(todo)}/{len(cfg.e3_arms) * len(cfg.seeds)} models trained"
-        + (f"; {len(failed)} stopped earlier and skipped: {failed} (failed.json)" if failed else ""))
+    arms = list(cfg.e3_arms if arms is None else arms)
+    rules = bool(RG.STATE.get("stop_rules"))
     lim = SESSION["limit"]
-    for arm in cfg.e3_arms:
-        if all(L.ckpt(arm, s).exists() or e3_failed(L, arm, s) for s in cfg.seeds):
+    for arm in arms:
+        plan = e3_arm_plan(L, cfg, arm)
+        n_done = sum(v == "done" for v in plan["seeds"].values())
+        stopped = [sd for sd, v in plan["seeds"].items() if v == "stopped"]
+        log(f"[E3] {arm}: {n_done}/{len(cfg.seeds)} models trained"
+            + (f"; stopped earlier and skipped: seeds {stopped} (failed.json)" if stopped else "")
+            + (f"; diverged: {({f'x{m:g}': [x[0] for x in v] for m, v in plan['diverged'].items()})}, remaining "
+               f"seeds at x{plan['mult']:g}" if plan["diverged"] and plan["mult"] is not None else ""))
+        if all(v != "train" for v in plan["seeds"].values()):
+            continue
+        if plan["did_not_train"]:
+            _did_not_train(cfg, L, arm, plan, log)
             continue
         est = _e3_hours(L, cfg, arm)
-        if not (L.models / arm / "lr_choice.json").exists() and lim is not None and not lim.may_start(
+        if plan["ranking"] is None and lim is not None and not lim.may_start(
                 est * len(cfg.lr_mults) * cfg.lr_pilot_frac, log, f"{arm} learning-rate pilots"):
             return out
         data = data_fn()
-        lr = M5.choose_lr(cfg, data, L, arm, device, log)
+        M5.choose_lr(cfg, data, L, arm, device, log)
         for s in cfg.seeds:
-            if L.ckpt(arm, s).exists() or e3_failed(L, arm, s):
-                continue
-            if lim is not None and not lim.may_start(est, log, f"{arm} seed {s}"):
-                return out
-            t0 = time.time()
-            try:
-                info = M5.train_arm_seed(cfg, data, L, arm, s, device, lr, log)
-            except M5.TrainingStopped as e:
-                RG.record_failure(L, L.model_dir(arm, s) / "failed.json",
-                                  {"arm": arm, "seed": int(s), "status": "diverged", "reason": str(e),
-                                   "step": e.step, "lr_mult": float(lr), "git_commit": _GIT.get()},
-                                  "E3 model", f"{arm} seed {s}", log)
-                continue
-            log(f"== {arm} seed {s}: {info.get('params')} parameters, {(time.time() - t0) / 60:.1f} min")
-            out.append(info)
+            tried = set()
+            while True:
+                plan = e3_arm_plan(L, cfg, arm)
+                if plan["seeds"][s] != "train":
+                    break
+                if plan["did_not_train"]:
+                    _did_not_train(cfg, L, arm, plan, log)
+                    break
+                m, chosen = plan["mult"], plan["chosen"]
+                if m in tried:                        # its failed.json could not be written: never loop
+                    log(f"  [{arm}] seed {s}: x{m:g} was tried in this session already; skipped")
+                    break
+                tried.add(m)
+                d = e3_run_dir(L, arm, s, m, chosen)
+                fallback = m != chosen
+                label = f"{arm} seed {s}" + (f" fallback lr x{m:g}" if fallback else "")
+                if lim is not None and not lim.may_start(est, log, label):
+                    return out
+                if fallback:
+                    log(f"  [{arm}] seed {s} trains at the fallback multiplier x{m:g} in {d.relative_to(L.root)} "
+                        f"(x{chosen:g} diverged on seeds {[x[0] for x in plan['diverged'].get(chosen, [])]})")
+                t0 = time.time()
+                try:
+                    info = M5.train_arm_seed(cfg, data, L, arm, s, device, m, log, train_dir=d if fallback else None,
+                                             label=label, ref_val=pilot_val(L, arm, m) if rules else None)
+                except M5.TrainingStopped as e:
+                    rec = {"arm": arm, "seed": int(s), "status": "diverged", "reason": str(e), "step": e.step,
+                           "lr_mult": float(m), "kind": e.kind, "fallback": bool(fallback), "git_commit": _GIT.get()}
+                    RG.record_failure(L, d / "failed.json", rec, "E3 divergence" if e.kind == "nonfinite_train"
+                                      else "E3 model", label, log)
+                    if e.kind == "nonfinite_train":
+                        continue                      # the next multiplier (or "did not train")
+                    if rules:
+                        RG.stop_run(L, f"e3_not_learning:{arm}_seed{s}", str(e), log)
+                    break
+                log(f"== {label}: {info.get('params')} parameters, {(time.time() - t0) / 60:.1f} min")
+                out.append(info)
+                break
     return out
 
 
@@ -2106,11 +2357,11 @@ def train_rl_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device,
 
 def open_loop_stage(cfg: StudyConfigV5, L: LayoutV5, data_fn, device, log=print) -> int:
     todo = [(a, s) for a in cfg.e3_arms for s in cfg.seeds
-            if L.ckpt(a, s).exists() and not (L.open_loop / f"footprint_{a}_seed{s}.csv").exists()]
+            if e3_ckpt(L, a, s) is not None and not (L.open_loop / f"footprint_{a}_seed{s}.csv").exists()]
     log(f"[open loop] {len(todo)} model-seeds to evaluate")
     for a, s in todo:
         t0 = time.time()
-        M5.open_loop_seed(cfg, L, data_fn(), a, s, device)
+        M5.open_loop_seed(cfg, L, data_fn(), a, s, device, ckpt=e3_ckpt(L, a, s))
         log(f"  {a} seed {s}: {time.time() - t0:.0f}s")
     return len(todo)
 
@@ -2225,7 +2476,7 @@ def _arm_type(j: dict) -> str:
 
 
 def status(cfg: StudyConfigV5, L: LayoutV5, stage_jobs: Dict[str, List[dict]], runtime: str = "cpu",
-           write: bool = True) -> dict:
+           write: bool = True, rl: bool = True, default_rates: Optional[Dict[str, float]] = None) -> dict:
     """Done / total per stage and arm; flights per hour per arm type from the first 20 flights; hours and units left."""
     if write:
         notebook_guard()
@@ -2244,7 +2495,7 @@ def status(cfg: StudyConfigV5, L: LayoutV5, stage_jobs: Dict[str, List[dict]], r
             rows.append({"stage": stage, "suite": suite, "arm": arm, "load": load, "type": typ, "done": len(t),
                          "total": len(g), "flights_per_h": round(rate, 1) if rate else None})
     for r in rows:
-        rt = r["flights_per_h"] or (rate_by_type.get(r["type"], (None,))[0])
+        rt = r["flights_per_h"] or (rate_by_type.get(r["type"], (None,))[0]) or (default_rates or {}).get(r["type"])
         r["hours_left"] = round((r["total"] - r["done"]) / rt, 2) if rt else None
     stages = []
     for stage in stage_jobs:
@@ -2254,12 +2505,19 @@ def status(cfg: StudyConfigV5, L: LayoutV5, stage_jobs: Dict[str, List[dict]], r
                        "hours_left": round(sum(hl), 2) if hl else None})
     train = []
     for a in cfg.e3_arms:
+        plan = e3_arm_plan(L, cfg, a)
         for s in cfg.seeds:
-            d = L.model_dir(a, s)
-            st = "done" if (d / "ckpt.pt").exists() else ("diverged" if (d / "failed.json").exists() else
-                                                          ("partial" if (d / "train_state.pt").exists() else "todo"))
-            train.append({"kind": "E3", "arm": a, "seed": s, "state": st})
-    for a in RL_TIER1 + (RL_TIER2 if cfg.tier >= 2 else ()):
+            rs = e3_runs(L, a, s)
+            st = plan["seeds"][s]
+            if st == "train":
+                st = ("did not train" if plan["did_not_train"] else
+                      "partial" if any(r["partial"] and not r["failed"] for r in rs) else
+                      "fallback todo" if plan["mult"] is not None and plan["mult"] != plan["chosen"] else "todo")
+            elif st == "stopped":
+                st = "diverged"
+            train.append({"kind": "E3", "arm": a, "seed": s, "state": st,
+                          "lr_mult": next((r["lr_mult"] for r in rs if r["done"]), plan["mult"])})
+    for a in (RL_TIER1 + (RL_TIER2 if cfg.tier >= 2 else ())) if rl else ():
         for s in cfg.rl_seeds:
             d = L.policy_dir(a, s)
             st = "done" if (d / "policy.pt").exists() else ("partial" if d.exists() else "todo")
@@ -2285,6 +2543,32 @@ def status(cfg: StudyConfigV5, L: LayoutV5, stage_jobs: Dict[str, List[dict]], r
         old = pd.read_csv(hp) if hp.exists() else None
         L.write_csv(pd.concat([old, new], ignore_index=True) if old is not None else new, hp)
     return doc
+
+
+# The projection's fallbacks before a block has measured its own rate (plan_jepa_needed_v5.md 4; L4, 2026-11-19).
+NEEDED_RATES = {"mppi_v2": 600.0, "mppi_physics": 1200.0, "mppi_e3": 1000.0}          # flights per L4-hour
+NEEDED_TRAIN_H = {"r0_nojepa": 7.1, "gru_direct": 0.8, "mlp_direct": 3.0, "gru_pi": 7.3}   # L4-hours per full seed
+
+
+def needed_projection(cfg: StudyConfigV5, L: LayoutV5, doc: dict, rate: float) -> List[dict]:
+    """Hours and units left per block of the "Is JEPA needed?" notebook: flights (status, measured rates or
+    NEEDED_RATES), and each E3 arm's training (pilots if not chosen, seeds left; a finished seed's own time)."""
+    rows = [{"block": s_["stage"], "done": s_["done"], "total": s_["total"], "hours_left": s_["hours_left"] or 0.0}
+            for s_ in doc["stages"]]
+    for a in needed_e3_arms(cfg):
+        plan = e3_arm_plan(L, cfg, a)
+        h = _e3_hours(L, cfg, a) or NEEDED_TRAIN_H.get(a, 7.0) * (M5.E3TrainCfg(**cfg.e3_train).steps / 36_000)
+        left = sum(v == "train" for v in plan["seeds"].values()) if not plan["did_not_train"] else 0
+        pil = 0.0 if plan["ranking"] is not None else h * cfg.lr_pilot_frac * len(cfg.lr_mults)
+        i = next((k for k, r in enumerate(rows) if r["block"] == f"{a} A256"), len(rows))
+        rows.insert(i, {"block": f"{a} training", "done": len(cfg.seeds) - left, "total": len(cfg.seeds),
+                        "hours_left": round(left * h + pil, 2)})
+    tot = 0.0
+    for r in rows:
+        r["units_left"] = round(r["hours_left"] * rate, 1)
+        tot += r["units_left"]
+        r["units_running_total"] = round(tot, 1)
+    return rows
 
 
 def update_manifest(L: LayoutV5) -> None:
@@ -2346,7 +2630,7 @@ def timing_stage(cfg: StudyConfigV5, L: LayoutV5, L3: S.Layout, device: str, log
             rows.append({"arm": arm, "device": "cpu", "ms_median": float(np.median(ms)),
                          "ms_p99": float(np.percentile(ms, 99)), "params": 0})
         mppi_arms = [("mppi_filtered", None), ("v2single", None)] + [(a, None) for a in cfg.e3_arms
-                                                                     if L.ckpt(a, cfg.seeds[0]).exists()]
+                                                                     if e3_ckpt(L, a, cfg.seeds[0]) is not None]
         devs = ["cpu"] + (["cuda"] if device == "cuda" else [])
         for arm, _ in mppi_arms:
             for dv in devs:
