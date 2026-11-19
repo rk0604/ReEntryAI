@@ -1421,7 +1421,23 @@ saturated.
   `hardware.json` records where it trained. BC → PPO's tuning configurations start from seed 0's clone (the clone
   does not depend on the tuned PPO settings). The GPU arms still share the one GPU type (§16). (7) **Cost
   projection**: the pilots' wall times give `01_checks/rl_cost_projection.json` (hours per tuning configuration and
-  per seed, on the runtime each part runs on). PILOT_RESULTS
+  per seed, on the runtime each part runs on). The notebook's revision is now 3 (`NOTEBOOK_REV`), so a copy
+  opened before this change stops at Setup. (8) **Laptop pilots (2026-11-19, a preview: the study's own
+  gate files come from Colab's CPU pass, cell 6b; full study settings, FNPEG's tuned configuration, Intel 12-core
+  CPU, 151 min).** *DAgger fails RV1 and RV2*: after 4 iterations × 100 episodes (41,300 labelled states), the
+  held-out sign accuracy was 0.909 against the current bank's sign at 0.894, the |bank| error 10.2°, and the policy
+  alone reached 0.6 % success@5km in the fast env against FNPEG's 87.1 %. *BC → PPO fails RV1 and RV2*: on 400 expert
+  episodes (40,100 states), the clone's held-out sign accuracy was 0.968 against 0.928 and its |bank| error 5.1°, but
+  alone it reached 2.7 % against FNPEG's 80.6 %. In both fits the held-out loss is lowest early (step 200 or 500
+  of 1,200–1,500) while the training loss keeps falling, so the fit does not carry over to unseen dispersions. The
+  likely cause (not yet checked) is that the wrong signs fall at the bank reversals, which set the crossrange,
+  so a 3–9 % sign error is enough to fly the vehicle off course.
+  Neither arm tunes or trains; both are reported as failed gates. *ppo_hist passes RV3*: in 30.5 min (3,722
+  decisions/s on the CPU), the return rose from −30.3 to −3.9 with no NaN, and its best success@5km was 0.2 %
+  (above 0 as RV3 requires, but far from FNPEG). Cost projection (`rl_cost_projection.json`): DAgger, had it
+  passed, ~2.8 h per tuning configuration and ~5.6 h per seed on the CPU (~62 h, ~16 units); BC's clone ~4.5 h
+  per seed on the CPU; ppo_hist ~0.35 h per configuration and 3 h per seed (its wall cap) on the L4 (~19 h,
+  ~38 units).
 
 ---
 
