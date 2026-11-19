@@ -17,7 +17,14 @@ The v5 RL baselines (jepa/v5_plan.md section 4.4), in-house torch, resumable (se
     dagger_train   DAgger with fnpeg as the expert, queried on the learner's own states (the expert's filters
                    run on every flight whoever acts), beta_i = 0.5^i, rollouts per iteration, the aggregated
                    data in data/iter_<i>.npz, supervised fit of the magsign actor (MSE on |a|, BCE on the sign)
-    bc_dataset     fnpeg episodes in the fast env (states, expert actions) for the clone
+    fit_supervised a fixed number of gradient steps (sup_steps) at its own learning rate (sup_lr), whole episodes
+                   held out (sup_val_frac) for early stopping and for the RV1 gate's sign accuracy and bank error
+                   (2026-11-18, v5_plan.md section 15: the epoch-based fit took 10-250 steps and underfitted)
+    ParallelExpert the fnpeg labels from worker processes (rows sharded, each flight on one worker): the same
+                   labels as FastExpert, label_workers times faster
+    bc_dataset     fnpeg episodes in the fast env (states, expert actions) for the clone; bc_clone fits it (CPU)
+    gates          imitation_pilot (RV1: held-out sign accuracy and bank error; RV2: the policy alone against
+                   fnpeg in the fast env) and ppo_pilot (RV3: return rises, success@5km > 0, no NaN)
     train_state    every save_every_s seconds and at the end: actors, critics, optimizers, normalizer, counters,
                    the fast env's state and RNG, every RNG state, the learning curve; .prev kept; a run's
                    policy.pt (actor + normalizer) marks it done
@@ -213,10 +220,16 @@ class RLCfg:
     # DAgger / BC
     dagger_iters: int = 10
     dagger_rollouts: int = 200
-    dagger_epochs: int = 30
+    dagger_epochs: int = 30                 # unused since 2026-11-18 (sup_steps); kept for old run.json files
     bc_episodes: int = 2000
-    bc_epochs: int = 40
+    bc_epochs: int = 40                     # unused since 2026-11-18 (sup_steps)
     sup_batch: int = 4096
+    sup_steps: int = 4000                   # gradient steps of a supervised fit (early-stopped on held-out episodes)
+    sup_lr: float = 1e-3                    # its learning rate (BC used PPO's lr before 2026-11-18)
+    sup_val_frac: float = 0.2               # whole episodes held out
+    sup_eval_every: int = 100               # steps between validation losses
+    sup_patience: int = 10                  # validations without a better loss -> stop, best weights kept
+    label_workers: int = 1                  # fnpeg labelling processes (0: every core); labels are identical
     expert_beta_1hz: float = 0.9            # fnpeg's 1 Hz filter when fnpeg_cfg has no tuned filter_beta; ^5 at the
                                             # fast env's 5 s decisions
     # bookkeeping
@@ -340,6 +353,7 @@ def ppo_train(L, d: Path, cfg: RLCfg, device, label: str, actor: Optional[Actor]
     N, T = env.cfg.n_envs, cfg.n_steps
     t_save, t0 = time.time(), time.time()
     snaps = _snapshot_marks(cfg)
+    checks = [f for f in CHECK_AT if _used(step, elapsed, cfg) < f]
 
     def save():
         save_state(L, {"actor": actor.state_dict(), "critic": vf.state_dict(), "opt": opt.state_dict(),
@@ -382,6 +396,13 @@ def ppo_train(L, d: Path, cfg: RLCfg, device, label: str, actor: Optional[Actor]
             log(f"  [{label}] update {update} {step:,} decisions: return {r['ep_return']:.3f} "
                 f"success@5km {r['success_5km_fast']:.3f} ({(elapsed + time.time() - t0) / 60:.1f} min)")
         _maybe_snapshot(L, d, actor, step, cfg, snaps, elapsed + time.time() - t0)
+        while checks and _used(step, elapsed + time.time() - t0, cfg) >= checks[0]:
+            why = training_check(actor, curve.rows, checks.pop(0))
+            if why:
+                elapsed += time.time() - t0
+                t0 = time.time()
+                save()
+                raise RLStopped(f"[{label}] {why}", step)
         due = time.time() - t_save > cfg.save_every_s or (cfg.save_every_updates and update % cfg.save_every_updates == 0)
         if due:
             elapsed += time.time() - t0
@@ -396,6 +417,40 @@ def ppo_train(L, d: Path, cfg: RLCfg, device, label: str, actor: Optional[Actor]
     save_policy(L, d / "policy.pt", actor, {"label": label, "decisions": step, "updates": update,
                                             "train_s": round(elapsed, 1), "cfg": asdict(cfg)})
     return {"decisions": step, "updates": update, "train_s": round(elapsed, 1)}
+
+
+class RLStopped(Exception):
+    """An RL run stopped by its training check (non-finite weights or return, or no sign of learning by half its
+    budget). study_v5 records it (failed.json in the run's folder) and goes on with the next run."""
+
+    def __init__(self, msg: str, step: int = 0):
+        super().__init__(msg)
+        self.step = int(step)
+
+
+CHECK_AT = (0.25, 0.5)                 # training checks at these fractions of a run's budget
+
+
+def _used(step: int, elapsed_s: float, cfg: RLCfg) -> float:
+    return max(step / max(cfg.budget_decisions, 1), elapsed_s / max(cfg.budget_hours * 3600.0, 1e-9))
+
+
+def training_check(actor: nn.Module, rows: Sequence[dict], frac: float) -> str:
+    """Why an RL run should stop at this check ("" = go on): non-finite weights or returns; at half the budget, a
+    success@5km of 0 in every curve row so far with no rise in the return (late third vs early third). A run that
+    learns but flies badly goes on: poor accuracy is a result."""
+    if not all(bool(torch.isfinite(p).all()) for p in actor.parameters()):
+        return f"non-finite weights at {frac:.0%} of the budget"
+    ret = [float(r["ep_return"]) for r in rows if r.get("episodes")]
+    if any(not math.isfinite(x) for x in ret):
+        return f"non-finite return at {frac:.0%} of the budget"
+    if frac >= 0.5 and len(ret) >= 6:
+        k = len(ret) // 3
+        succ = max(float(r.get("success_5km_fast", 0.0)) for r in rows)
+        if succ <= 0.0 and float(np.mean(ret[-k:])) <= float(np.mean(ret[:k])):
+            return (f"no flight within 5 km and no rise in the return ({np.mean(ret[:k]):.3f} -> "
+                    f"{np.mean(ret[-k:]):.3f}) by {frac:.0%} of the budget")
+    return ""
 
 
 def _ppo_update(actor: Actor, vf: nn.Module, opt, cfg: RLCfg, gen, ref: Optional[Actor], warm: bool,
@@ -619,10 +674,7 @@ class FastExpert:
 
     def __init__(self, env: RF.FastEntryEnv, cfg: RLCfg, fnpeg_cfg: Optional[dict] = None):
         from jepa.guidance_fnpeg import FNPEG, FNPEGConfig
-        fc = dict(fnpeg_cfg or {})
-        b1 = fc.get("filter_beta")
-        fc["filter_beta"] = float(cfg.expert_beta_1hz if b1 is None else b1) ** float(env.cfg.dt_s)
-        self.law = FNPEG(FNPEGConfig(**fc))
+        self.law = FNPEG(FNPEGConfig(**_expert_fc(env, cfg, fnpeg_cfg)))
         self.env = env
         self.flights = [self.law.new_flight(float(p), float(l)) for p, l in zip(env.phi_t.cpu(), env.lam_t.cpu())]
 
@@ -638,16 +690,121 @@ class FastExpert:
         return torch.as_tensor(np.asarray(cmds) / RF.SIGMA_MAX_RAD, dtype=torch.float32).clamp(-1, 1)
 
 
+def _expert_fc(env: RF.FastEntryEnv, cfg: RLCfg, fnpeg_cfg: Optional[dict]) -> dict:
+    fc = dict(fnpeg_cfg or {})
+    b1 = fc.get("filter_beta")
+    fc["filter_beta"] = float(cfg.expert_beta_1hz if b1 is None else b1) ** float(env.cfg.dt_s)
+    return fc
+
+
+def _expert_worker(conn, fc: dict) -> None:
+    """A ParallelExpert process: the fnpeg flights of its rows."""
+    torch.set_num_threads(1)
+    from jepa.guidance_fnpeg import FNPEG, FNPEGConfig
+    law = FNPEG(FNPEGConfig(**fc))
+    flights: Dict[int, object] = {}
+    while True:
+        msg = conn.recv()
+        if msg is None:
+            break
+        resets, rows, ys, ts = msg
+        for r, ph, la in resets:
+            flights[int(r)] = law.new_flight(float(ph), float(la))
+        conn.send(np.asarray(law.decide([flights[int(r)] for r in rows], list(ys), list(ts)), dtype=np.float64))
+    conn.close()
+
+
+class ParallelExpert:
+    """FastExpert with the flights sharded over worker processes (fnpeg decides each flight on its own, so the
+    labels equal FastExpert's; smoke check 17). close() ends the workers."""
+
+    def __init__(self, env: RF.FastEntryEnv, cfg: RLCfg, fnpeg_cfg: Optional[dict] = None, workers: int = 0):
+        import multiprocessing as mp
+        self.env = env
+        n = int(env.cfg.n_envs)
+        w = max(1, min(int(workers or (os.cpu_count() or 2)), n))
+        self.shards = [a for a in np.array_split(np.arange(n), w) if len(a)]
+        self.owner = np.zeros(n, dtype=np.int64)
+        for k, a in enumerate(self.shards):
+            self.owner[a] = k
+        ctx = mp.get_context("spawn")
+        self.conns, self.procs = [], []
+        fc = _expert_fc(env, cfg, fnpeg_cfg)
+        for _ in self.shards:
+            a, b = ctx.Pipe()
+            pr = ctx.Process(target=_expert_worker, args=(b, fc), daemon=True)
+            pr.start()
+            self.conns.append(a)
+            self.procs.append(pr)
+        self.pending: List[list] = [[] for _ in self.shards]
+        self.reset_rows(range(n))
+
+    def reset_rows(self, rows) -> None:
+        for i in rows:
+            i = int(i)
+            self.pending[int(self.owner[i])].append((i, float(self.env.phi_t[i]), float(self.env.lam_t[i])))
+
+    def label(self) -> torch.Tensor:
+        ys = self.env.expert_rows()
+        ts = self.env.t.cpu().numpy()
+        for k, a in enumerate(self.shards):
+            self.conns[k].send((self.pending[k], a, ys[a], ts[a]))
+            self.pending[k] = []
+        cmds = np.zeros(int(self.env.cfg.n_envs), dtype=np.float64)
+        for k, a in enumerate(self.shards):
+            cmds[a] = self.conns[k].recv()
+        try:
+            from jepa import runguard_v5 as RG
+            RG.touch("fnpeg labels")
+        except Exception:
+            pass
+        return torch.as_tensor(cmds / RF.SIGMA_MAX_RAD, dtype=torch.float32).clamp(-1, 1)
+
+    def close(self) -> None:
+        for c in self.conns:
+            try:
+                c.send(None)
+            except (OSError, BrokenPipeError):
+                pass
+        for pr in self.procs:
+            pr.join(timeout=10)
+            if pr.is_alive():
+                pr.terminate()
+        self.conns, self.procs = [], []
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def make_expert(env: RF.FastEntryEnv, cfg: RLCfg, fnpeg_cfg: Optional[dict] = None):
+    """FastExpert in this process (label_workers 1, or a single env row), else ParallelExpert."""
+    if int(cfg.label_workers) == 1 or int(env.cfg.n_envs) < 2:
+        return FastExpert(env, cfg, fnpeg_cfg)
+    return ParallelExpert(env, cfg, fnpeg_cfg, int(cfg.label_workers))
+
+
+def _close(expert) -> None:
+    if hasattr(expert, "close"):
+        expert.close()
+
+
 def _rollouts(env: RF.FastEntryEnv, expert: FastExpert, actor: Optional[Actor], beta: float, n_episodes: int,
-              gen: torch.Generator, dev) -> Tuple[np.ndarray, np.ndarray, dict]:
-    """Episodes until n_episodes finished; the expert labels every visited state. Returns (obs, labels, stats)."""
-    O, A = [], []
+              gen: torch.Generator, dev, ep_offset: int = 0) -> Tuple[np.ndarray, np.ndarray, dict]:
+    """Episodes until n_episodes finished; the expert labels every visited state. Returns (obs, labels, stats);
+    stats["ep"] is each state's episode id (from ep_offset: whole episodes are held out by fit_supervised)."""
+    O, A, E = [], [], []
     done_n, succ, miss = 0, 0, []
     obs = env.obs()
+    ep = np.arange(int(env.cfg.n_envs), dtype=np.int64) + int(ep_offset)
+    nxt = int(ep_offset) + int(env.cfg.n_envs)
     while done_n < n_episodes:
         lab = expert.label().to(dev)
         O.append(obs.cpu().numpy())
         A.append(lab.cpu().numpy())
+        E.append(ep.copy())
         if actor is None:
             act = lab
         else:
@@ -662,41 +819,121 @@ def _rollouts(env: RF.FastEntryEnv, expert: FastExpert, actor: Optional[Actor], 
             done_n += len(idx)
             succ += int(info["success_5km"][done].sum())
             miss += info["miss_km"][done].cpu().tolist()
+            ii = idx.numpy()
+            ep[ii] = np.arange(nxt, nxt + len(ii))
+            nxt += len(ii)
     return (np.concatenate(O).astype(np.float32), np.concatenate(A).astype(np.float32),
             {"episodes": done_n, "success_5km_fast": succ / max(done_n, 1),
-             "miss_km_fast": float(np.median(miss)) if miss else float("nan")})
+             "miss_km_fast": float(np.median(miss)) if miss else float("nan"), "ep": np.concatenate(E)})
 
 
-def fit_supervised(actor: Actor, O: np.ndarray, A: np.ndarray, epochs: int, batch: int, lr: float, gen, dev,
-                   log=print, label: str = "") -> float:
-    """MSE on |a| and BCE on sign(a) (magsign), or MSE on a (gauss); refits the normalizer on the data."""
+def _val_mask(E: np.ndarray, frac: float, seed: int) -> np.ndarray:
+    """Whole episodes held out: a fixed share of the episode ids (at least one when there are two or more)."""
+    ids = np.unique(E)
+    if len(ids) < 2 or frac <= 0:
+        return np.zeros(len(E), dtype=bool)
+    rng = np.random.default_rng(int(seed) * 104729 + 17)
+    k = min(len(ids) - 1, max(1, int(round(frac * len(ids)))))
+    return np.isin(E, rng.permutation(ids)[:k])
+
+
+def _sup_loss(actor: Actor, o: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    mu, _, logit = actor.dist_params(o)
+    if actor.kind == "magsign":
+        return Fnn.mse_loss(mu, a.abs()) + Fnn.binary_cross_entropy_with_logits(logit, (a >= 0).float())
+    return Fnn.mse_loss(mu, a)
+
+
+@torch.no_grad()
+def sup_metrics(actor: Actor, O: np.ndarray, A: np.ndarray, dev) -> dict:
+    """Sign accuracy and |bank| error (deg) of a magsign actor, and the trivial baselines (always positive; the
+    sign of the current bank, the observation's last entry)."""
+    if not len(O):
+        return {"n": 0}
     o = torch.from_numpy(O).to(dev)
     a = torch.from_numpy(A).to(dev)
+    mu, _, logit = actor.dist_params(o)
+    pos = a >= 0
+    out = {"n": int(len(O)), "always_positive": float(pos.float().mean()),
+           "current_bank_sign": float(((o[:, -1] >= 0) == pos).float().mean())}
+    if actor.kind == "magsign":
+        out["sign_acc"] = float(((logit >= 0) == pos).float().mean())
+        out["bank_err_deg"] = float((mu - a.abs()).abs().mean()) * math.degrees(RF.SIGMA_MAX_RAD)
+    else:
+        out["bank_err_deg"] = float((mu.clamp(-1, 1) - a).abs().mean()) * math.degrees(RF.SIGMA_MAX_RAD)
+    return out
+
+
+def fit_supervised(actor: Actor, O: np.ndarray, A: np.ndarray, E: Optional[np.ndarray], cfg: RLCfg, gen, dev,
+                   log=print, label: str = "") -> dict:
+    """
+    MSE on |a| and BCE on sign(a) (magsign), or MSE on a (gauss): cfg.sup_steps Adam steps at cfg.sup_lr on
+    minibatches of cfg.sup_batch (drawn by permutation, epoch after epoch), the normalizer refit on the training
+    episodes. Whole episodes (E: episode ids; cfg.sup_val_frac of them) are held out: the validation loss every
+    sup_eval_every steps, stop after sup_patience without improvement, the best weights kept. Returns the fit's
+    numbers, the held-out sign accuracy and bank error and their trivial baselines (the RV1 gate).
+    """
+    E = np.zeros(len(O), dtype=np.int64) if E is None else np.asarray(E)
+    val = _val_mask(E, cfg.sup_val_frac, cfg.seed)
+    tr = ~val
+    o = torch.from_numpy(O[tr]).to(dev)
+    a = torch.from_numpy(A[tr]).to(dev)
+    ov = torch.from_numpy(O[val]).to(dev)
+    av = torch.from_numpy(A[val]).to(dev)
     with torch.no_grad():
         actor.norm.mean.zero_()
         actor.norm.var.fill_(1.0)
         actor.norm.count.fill_(1e-4)
         actor.norm.update(o)
-    opt = torch.optim.Adam([p for n, p in actor.named_parameters() if n != "log_std"], lr=lr)
+    opt = torch.optim.Adam([p for n_, p in actor.named_parameters() if n_ != "log_std"], lr=cfg.sup_lr)
     n = len(o)
-    tot = float("nan")
-    for ep in range(epochs):
-        perm = torch.randperm(n, generator=gen, device=dev)
-        tot = 0.0
-        for i in range(0, n, batch):
-            j = perm[i:i + batch]
-            mu, _, logit = actor.dist_params(o[j])
-            if actor.kind == "magsign":
-                loss = Fnn.mse_loss(mu, a[j].abs()) + Fnn.binary_cross_entropy_with_logits(logit, (a[j] >= 0).float())
+    bs = max(1, min(int(cfg.sup_batch), n))
+    perm, at = torch.randperm(n, generator=gen, device=dev), 0
+    best, best_step, best_state, bad, step, tr_loss = float("inf"), 0, None, 0, 0, float("nan")
+    run, n_run = 0.0, 0
+    for step in range(1, int(cfg.sup_steps) + 1):
+        if at + bs > n:
+            perm, at = torch.randperm(n, generator=gen, device=dev), 0
+        j = perm[at:at + bs]
+        at += bs
+        loss = _sup_loss(actor, o[j], a[j])
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"[{label}] supervised fit: loss {float(loss)} at step {step}")
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        run += float(loss.detach())
+        n_run += 1
+        if step % int(cfg.sup_eval_every) == 0 or step == int(cfg.sup_steps):
+            tr_loss, run, n_run = run / max(n_run, 1), 0.0, 0
+            if len(ov):
+                with torch.no_grad():
+                    vl = float(_sup_loss(actor, ov, av))
             else:
-                loss = Fnn.mse_loss(mu, a[j])
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-            tot += float(loss) * len(j)
-        tot /= n
-    log(f"  [{label}] supervised fit on {n:,} states: loss {tot:.4f}")
-    return tot
+                vl = tr_loss
+            if vl < best - 1e-6:
+                best, best_step, bad = vl, step, 0
+                best_state = {k: v.detach().clone() for k, v in actor.state_dict().items()}
+            else:
+                bad += 1
+            if bad >= int(cfg.sup_patience):
+                break
+    if best_state is not None:
+        actor.load_state_dict(best_state)
+    out = {"steps": int(step), "best_step": int(best_step), "train_loss": float(tr_loss), "val_loss": float(best),
+           "n_train": int(n), "n_val": int(len(ov)), "val_episodes": int(len(np.unique(E[val]))) if val.any() else 0,
+           "lr": float(cfg.sup_lr), "batch": int(bs), "val": sup_metrics(actor, O[val], A[val], dev)}
+    v = out["val"]
+    log(f"  [{label}] supervised fit on {n:,} states ({out['val_episodes']} episodes held out): {step} steps, best "
+        f"validation loss {best:.4f} at step {best_step}" + (f"; held-out sign accuracy {v['sign_acc']:.3f} "
+        f"(baselines {v['always_positive']:.3f}, {v['current_bank_sign']:.3f}), |bank| error {v['bank_err_deg']:.1f} deg"
+        if "sign_acc" in v else ""))
+    try:
+        from jepa import runguard_v5 as RG
+        RG.touch("supervised fit")
+    except Exception:
+        pass
+    return out
 
 
 def dagger_train(L, d: Path, cfg: RLCfg, device, label: str, fnpeg_cfg: Optional[dict] = None, log=print,
@@ -721,9 +958,13 @@ def dagger_train(L, d: Path, cfg: RLCfg, device, label: str, fnpeg_cfg: Optional
         st_path = d / "data" / f"env_{i:02d}.pt"
         if i > 0 and (d / "data" / f"env_{i - 1:02d}.pt").exists():
             env.set_state(torch.load(d / "data" / f"env_{i - 1:02d}.pt", map_location="cpu", weights_only=False))
-        expert = FastExpert(env, cfg, fnpeg_cfg)
+        expert = make_expert(env, cfg, fnpeg_cfg)
         gen = torch.Generator(device=dev).manual_seed(cfg.seed * 7919 + 9 + 1000 * i)
-        O, A, s = _rollouts(env, expert, actor if i > 0 else None, beta, cfg.dagger_rollouts, gen, dev)
+        try:
+            O, A, s = _rollouts(env, expert, actor if i > 0 else None, beta, cfg.dagger_rollouts, gen, dev,
+                                ep_offset=EP_STRIDE * i)
+        finally:
+            _close(expert)
         buf = io.BytesIO()
         torch.save(env.get_state(), buf)
         L.atomic_bytes(st_path, buf.getvalue())
@@ -734,11 +975,13 @@ def dagger_train(L, d: Path, cfg: RLCfg, device, label: str, fnpeg_cfg: Optional
             f"{s['success_5km_fast']:.3f} ({(time.time() - t0) / 60:.1f} min)")
         _dagger_curve(L, d, i + 1, label)
         fail_point(stage, i)
-    actor, loss = _fit_from_iters(d, cfg.dagger_iters, cfg, dev, label, log)
+    actor, fit = _fit_from_iters(d, cfg.dagger_iters, cfg, dev, label, log)
     rows = _dagger_curve(L, d, cfg.dagger_iters, label)
-    save_policy(L, d / "policy.pt", actor, {"label": label, "iterations": cfg.dagger_iters, "fit_loss": loss,
-                                            "cfg": asdict(cfg)})
-    return {"iterations": cfg.dagger_iters, "states": int(sum(r["states"] for r in rows))}
+    L.write_json(d / "fit.json", fit)
+    save_policy(L, d / "policy.pt", actor, {"label": label, "iterations": cfg.dagger_iters,
+                                            "fit_loss": fit.get("val_loss"), "fit": fit, "cfg": asdict(cfg)})
+    return {"iterations": cfg.dagger_iters, "states": int(sum(r["states"] for r in rows)), "fit": fit,
+            "expert_success_fast": rows[0]["success_5km_fast"] if rows else None}
 
 
 def _dagger_curve(L, d: Path, n_iter: int, label: str) -> List[dict]:
@@ -756,17 +999,28 @@ def _dagger_curve(L, d: Path, n_iter: int, label: str) -> List[dict]:
     return rows
 
 
-def _fit_from_iters(d: Path, n_iter: int, cfg: RLCfg, dev, label: str, log) -> Tuple[Actor, float]:
+EP_STRIDE = 10_000_000         # episode ids of DAgger iteration i start at i x EP_STRIDE
+
+
+def _episodes(z, i: int) -> np.ndarray:
+    """A data file's episode ids (files from before 2026-11-18 have none: each state its own id)."""
+    if "ep" in z.files:
+        return np.asarray(z["ep"], dtype=np.int64)
+    return np.arange(len(z["obs"]), dtype=np.int64) + EP_STRIDE * i
+
+
+def _fit_from_iters(d: Path, n_iter: int, cfg: RLCfg, dev, label: str, log) -> Tuple[Actor, dict]:
     torch.manual_seed(cfg.seed + 100 * n_iter)
     actor = Actor(hidden=cfg.hidden, kind="magsign").to(dev)
     if n_iter == 0:
-        return actor, float("nan")
+        return actor, {}
     zs = [np.load(d / "data" / f"iter_{i:02d}.npz") for i in range(n_iter)]
     O = np.concatenate([z["obs"] for z in zs])
     A = np.concatenate([z["act"] for z in zs])
+    E = np.concatenate([_episodes(z, i) for i, z in enumerate(zs)])
     g = torch.Generator(device=dev).manual_seed(cfg.seed * 31 + n_iter)
-    loss = fit_supervised(actor, O, A, cfg.dagger_epochs, cfg.sup_batch, cfg.lr, g, dev, log, f"{label} fit {n_iter}")
-    return actor, loss
+    fit = fit_supervised(actor, O, A, E, cfg, g, dev, log, f"{label} fit {n_iter}")
+    return actor, fit
 
 
 def bc_dataset(L, d: Path, cfg: RLCfg, device, label: str, fnpeg_cfg: Optional[dict] = None, log=print) -> Path:
@@ -781,8 +1035,11 @@ def bc_dataset(L, d: Path, cfg: RLCfg, device, label: str, fnpeg_cfg: Optional[d
             continue
         if j > 0 and (d / "data" / f"bc_env_{j - 1:03d}.pt").exists():
             env.set_state(torch.load(d / "data" / f"bc_env_{j - 1:03d}.pt", map_location="cpu", weights_only=False))
-        expert = FastExpert(env, cfg, fnpeg_cfg)
-        O, A, s = _rollouts(env, expert, None, 1.0, cfg.dagger_rollouts, gen, dev)
+        expert = make_expert(env, cfg, fnpeg_cfg)
+        try:
+            O, A, s = _rollouts(env, expert, None, 1.0, cfg.dagger_rollouts, gen, dev, ep_offset=EP_STRIDE * j)
+        finally:
+            _close(expert)
         buf = io.BytesIO()
         torch.save(env.get_state(), buf)
         L.atomic_bytes(d / "data" / f"bc_env_{j:03d}.pt", buf.getvalue())
@@ -794,26 +1051,165 @@ def bc_dataset(L, d: Path, cfg: RLCfg, device, label: str, fnpeg_cfg: Optional[d
     return d / "data"
 
 
+def bc_clone(L, d: Path, cfg: RLCfg, device, label: str, fnpeg_cfg: Optional[dict] = None, log=print) -> dict:
+    """BC's CPU part: the fnpeg dataset (bc_dataset) and the clone's supervised fit, d/clone.pt (+ clone_fit.json
+    and clone_hardware.json, the platform it was made on). Skips when clone.pt exists."""
+    d = Path(d)
+    clone_p = d / "clone.pt"
+    if clone_p.exists():
+        p = d / "clone_fit.json"
+        return json.loads(p.read_text()) if p.exists() else {}
+    L.guard(d).mkdir(parents=True, exist_ok=True)
+    dev = torch.device(device)
+    t0 = time.time()
+    bc_dataset(L, d, cfg, device, label, fnpeg_cfg, log)
+    files = sorted((d / "data").glob("bc_*.npz"))
+    zs = [np.load(f) for f in files]
+    O = np.concatenate([z["obs"] for z in zs])
+    A = np.concatenate([z["act"] for z in zs])
+    E = np.concatenate([_episodes(z, j) for j, z in enumerate(zs)])
+    torch.manual_seed(cfg.seed)
+    actor = Actor(hidden=cfg.hidden, kind="magsign").to(dev)
+    g = torch.Generator(device=dev).manual_seed(cfg.seed * 13 + 1)
+    fit = fit_supervised(actor, O, A, E, cfg, g, dev, log, f"{label} clone")
+    fit["expert_success_fast"] = float(np.mean([float(z["success_5km_fast"]) for z in zs]))
+    fit["wall_s"] = round(time.time() - t0, 1)
+    L.write_json(d / "clone_fit.json", fit)
+    L.write_json(d / "clone_hardware.json", hardware_info(device))
+    save_policy(L, clone_p, actor, {"label": f"{label} clone", "states": int(len(O)), "fit_loss": fit["val_loss"],
+                                    "fit": fit})
+    return fit
+
+
 def bcppo_train(L, d: Path, cfg: RLCfg, device, label: str, fnpeg_cfg: Optional[dict] = None, log=print,
                 stage: str = "rl_train") -> dict:
-    """BC from fnpeg episodes, then critic warm-up on frozen-actor rollouts, then PPO with a KL penalty."""
+    """BC from fnpeg episodes (bc_clone, normally made on a CPU pass), then critic warm-up on frozen-actor
+    rollouts, then PPO with a KL penalty."""
     dev = torch.device(device)
     clone_p = d / "clone.pt"
     if not clone_p.exists():
-        bc_dataset(L, d, cfg, device, label, fnpeg_cfg, log)
-        files = sorted((d / "data").glob("bc_*.npz"))
-        O = np.concatenate([np.load(f)["obs"] for f in files])
-        A = np.concatenate([np.load(f)["act"] for f in files])
-        torch.manual_seed(cfg.seed)
-        actor = Actor(hidden=cfg.hidden, kind="magsign").to(dev)
-        g = torch.Generator(device=dev).manual_seed(cfg.seed * 13 + 1)
-        loss = fit_supervised(actor, O, A, cfg.bc_epochs, cfg.sup_batch, cfg.lr, g, dev, log, f"{label} clone")
-        save_policy(L, clone_p, actor, {"label": f"{label} clone", "states": int(len(O)), "fit_loss": loss})
+        bc_clone(L, d, cfg, device, label, fnpeg_cfg, log)
     clone = load_policy(clone_p, dev)
     ref = load_policy(clone_p, dev)
     for p_ in ref.parameters():
         p_.requires_grad_(False)
     return ppo_train(L, d, cfg, device, label, actor=clone, ref=ref, log=log, stage=stage)
+
+
+# ============================================================================
+# Competence gates (v5_plan.md section 15, 2026-11-18): an RL arm tunes and trains only once they pass
+# ============================================================================
+RV1_MARGIN = 0.05            # held-out sign accuracy at least 5 points above the best trivial baseline
+RV1_BANK_DEG = 10.0          # and a held-out |bank| error of at most 10 deg
+RV2_FRAC = 0.5               # the policy alone reaches >= 50 % of fnpeg's fast-env success@5km
+
+
+def rv1(fit: dict) -> dict:
+    """RV1 from a supervised fit's held-out numbers."""
+    v = fit.get("val", {})
+    if "sign_acc" not in v:
+        return {"passed": False, "reason": "no held-out episodes to score", "fit": fit}
+    base = max(v["always_positive"], v["current_bank_sign"])
+    ok = v["sign_acc"] >= base + RV1_MARGIN and v["bank_err_deg"] <= RV1_BANK_DEG
+    return {"passed": bool(ok), "sign_acc": v["sign_acc"], "baseline": base, "bank_err_deg": v["bank_err_deg"],
+            "reason": (f"held-out sign accuracy {v['sign_acc']:.3f} vs best trivial baseline {base:.3f} (need +"
+                       f"{RV1_MARGIN:.2f}); |bank| error {v['bank_err_deg']:.1f} deg (need <= {RV1_BANK_DEG:g})"),
+            "n_val": v["n"], "val_episodes": fit.get("val_episodes")}
+
+
+def rv2(policy_success: float, expert_success: float) -> dict:
+    ok = expert_success > 0 and policy_success >= RV2_FRAC * expert_success
+    return {"passed": bool(ok), "policy_success_fast": policy_success, "expert_success_fast": expert_success,
+            "reason": (f"the policy alone {policy_success:.3f} success@5km in the fast env, fnpeg {expert_success:.3f}"
+                       f" (need >= {RV2_FRAC:.0%} of it)")}
+
+
+def imitation_pilot(L, d: Path, arm: str, cfg: RLCfg, device, fnpeg_cfg: Optional[dict] = None, log=print,
+                    n_eval: int = 512) -> dict:
+    """RV1 and RV2 of an imitation arm from a pilot run in d (seed 0, cfg = the pilot's budget): DAgger's pilot
+    iterations, or BC's dataset and clone. Cached in d/pilot.json."""
+    d = Path(d)
+    out_p = d / "pilot.json"
+    if out_p.exists():
+        return json.loads(out_p.read_text())
+    L.guard(d).mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    if arm == "dagger_fnpeg":
+        info = train_rl_dir(L, d, arm, cfg, device, fnpeg_cfg, log, label=f"pilot {arm}")
+        fit = info.get("fit") or json.loads((d / "fit.json").read_text())
+        expert = info.get("expert_success_fast")
+        if expert is None:
+            expert = float(np.load(d / "data" / "iter_00.npz")["success_5km_fast"])
+        pol = load_policy(d / "policy.pt", device)
+        states = int(info.get("states", 0))
+    elif arm == "bcppo_fnpeg":
+        fit = bc_clone(L, d, cfg, device, f"pilot {arm}", fnpeg_cfg, log)
+        expert = fit["expert_success_fast"]
+        pol = load_policy(d / "clone.pt", device)
+        states = int(fit.get("n_train", 0) + fit.get("n_val", 0))
+    else:
+        raise ValueError(f"{arm} is not an imitation arm")
+    fs = fast_success(pol, n_eval, seed=12345, device=device)
+    doc = {"arm": arm, "rv1": rv1(fit), "rv2": rv2(fs["success_5km_fast"], float(expert)), "fast": fs,
+           "states": states, "wall_s": round(time.time() - t0, 1), "cfg": asdict(cfg), "hardware": hardware_info(device)}
+    L.write_json(out_p, doc)
+    log(f"[RL gates] {arm}: RV1 {'PASS' if doc['rv1']['passed'] else 'FAIL'} ({doc['rv1']['reason']}); RV2 "
+        f"{'PASS' if doc['rv2']['passed'] else 'FAIL'} ({doc['rv2']['reason']}); pilot {doc['wall_s'] / 60:.1f} min")
+    return doc
+
+
+def rv3(rows: Sequence[dict], actor: nn.Module) -> dict:
+    """RV3 from a PPO pilot's learning curve: the return rises (late third above early third), success@5km > 0 at
+    some point, no NaN."""
+    ret = [float(r["ep_return"]) for r in rows if r.get("episodes")]
+    finite = all(math.isfinite(x) for x in ret) and all(bool(torch.isfinite(p).all()) for p in actor.parameters())
+    k = max(1, len(ret) // 3)
+    rise = len(ret) >= 3 and float(np.mean(ret[-k:])) > float(np.mean(ret[:k]))
+    succ = max([float(r.get("success_5km_fast", 0.0)) for r in rows] or [0.0])
+    ok = finite and rise and succ > 0
+    return {"passed": bool(ok), "finite": bool(finite), "return_first": float(np.mean(ret[:k])) if ret else None,
+            "return_last": float(np.mean(ret[-k:])) if ret else None, "max_success_5km_fast": succ,
+            "curve_rows": len(ret),
+            "reason": (f"return {np.mean(ret[:k]) if ret else float('nan'):.3f} -> "
+                       f"{np.mean(ret[-k:]) if ret else float('nan'):.3f} ({'rises' if rise else 'does not rise'}), "
+                       f"best success@5km {succ:.3f}, {'no NaN' if finite else 'NaN'}")}
+
+
+def ppo_pilot(L, d: Path, arm: str, cfg: RLCfg, device, clone: Optional[Path] = None, log=print) -> dict:
+    """RV3 of ppo_hist (PPO from scratch) or bcppo_fnpeg (PPO from the pilot's clone): a short PPO run in d
+    (cfg = the pilot's budget); cached in d/pilot.json."""
+    d = Path(d)
+    out_p = d / "pilot.json"
+    if out_p.exists():
+        return json.loads(out_p.read_text())
+    L.guard(d).mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    dev = torch.device(device)
+    try:
+        if clone is not None:
+            ref = load_policy(clone, dev)
+            for p_ in ref.parameters():
+                p_.requires_grad_(False)
+            info = ppo_train(L, d, cfg, device, f"pilot {arm}", actor=load_policy(clone, dev), ref=ref, log=log)
+        else:
+            info = ppo_train(L, d, cfg, device, f"pilot {arm}", log=log)
+        stopped = None
+    except RLStopped as e:
+        info, stopped = {"decisions": e.step}, str(e)
+    import pandas as pd
+    rows = pd.read_csv(d / "learning_curve.csv").to_dict("records") if (d / "learning_curve.csv").exists() else []
+    pol = load_policy(d / "policy.pt", dev) if (d / "policy.pt").exists() else Actor()
+    g = rv3(rows, pol)
+    if stopped:
+        g.update({"passed": False, "reason": f"stopped by its training check: {stopped}"})
+    el = max(time.time() - t0, 1e-6)
+    doc = {"arm": arm, "rv3": g, "decisions": int(info.get("decisions", 0)), "wall_s": round(el, 1),
+           "decisions_per_s": round(int(info.get("decisions", 0)) / el, 1), "cfg": asdict(cfg),
+           "hardware": hardware_info(device)}
+    L.write_json(out_p, doc)
+    log(f"[RL gates] {arm}: RV3 {'PASS' if g['passed'] else 'FAIL'} ({g['reason']}); pilot {el / 60:.1f} min, "
+        f"{doc['decisions_per_s']:,.0f} decisions/s")
+    return doc
 
 
 # ============================================================================

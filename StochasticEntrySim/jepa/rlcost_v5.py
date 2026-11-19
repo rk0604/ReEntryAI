@@ -9,8 +9,8 @@ tuning configuration and training run:
                  min(budget_hours, budget_decisions / rate).
     FNPEG expert one chunk of expert-labelled fast-env episodes (DAgger's iteration, BC's dataset chunk) at the
                  training size (dagger_rollouts envs) and the tuning size (10 % of it). Not wall-clock capped.
-    fits         the supervised fit on one chunk's states at dagger_epochs (DAgger refits on all data so far
-                 before every iteration; BC fits once on its whole dataset at bc_epochs).
+    fits         one supervised fit at sup_steps Adam steps (section 15, 2026-11-18: a fit's cost is its step count,
+                 not the data size; DAgger refits before every iteration, BC fits once).
     flights      DEV48 policy flights in the full simulator (48 per tuning configuration), on every CPU core.
     fast eval    each training run's fast-environment evaluation (fast_eval.json).
 
@@ -59,7 +59,7 @@ def measure(cfg: S5.StudyConfigV5, L: S5.LayoutV5, device: str, workers: int, mi
     fn = dict(cfg.fnpeg)
     base = _cfg(cfg, "ppo_hist")
     chunk = int(chunk or base.dagger_rollouts)
-    tune_chunk = int(tune_chunk or max(2, int(base.dagger_rollouts * cfg.rl_tune_frac)))
+    tune_chunk = int(tune_chunk or min(base.dagger_rollouts, max(S5.TUNE_MIN_ROLLOUTS, int(base.dagger_rollouts * cfg.rl_tune_frac))))
     out = {"hardware": RL.hardware_info(device), "minutes_per_ppo_measurement": minutes, "chunk": chunk,
            "tune_chunk": tune_chunk}
 
@@ -90,16 +90,17 @@ def measure(cfg: S5.StudyConfigV5, L: S5.LayoutV5, device: str, workers: int, mi
         O, A, s = RL._rollouts(env, expert, None, 1.0, k, gen, dev)
         r = {"episodes": int(s["episodes"]), "states": int(len(O)), "s": round(time.time() - t0, 1)}
         log(f"[FNPEG expert] {r['episodes']} episodes on {k} envs: {r['states']:,} labelled states in {r['s']:.0f} s")
-        return r, O, A
+        return r, O, A, s.get("ep")
 
-    out["expert_chunk"], O, A = expert_chunk(chunk)
-    out["expert_tune_chunk"], _, _ = expert_chunk(tune_chunk)
+    out["expert_chunk"], O, A, E = expert_chunk(chunk)
+    out["expert_tune_chunk"], _, _, _ = expert_chunk(tune_chunk)
 
     g = torch.Generator(device=dev).manual_seed(1)
     actor = RL.Actor(hidden=base.hidden, kind="magsign").to(dev)
     t0 = time.time()
-    RL.fit_supervised(actor, O, A, base.dagger_epochs, base.sup_batch, base.lr, g, dev, log, "measure fit")
-    out["fit_chunk"] = {"states": int(len(O)), "epochs": base.dagger_epochs, "s": round(time.time() - t0, 1)}
+    fit = RL.fit_supervised(actor, O, A, E, base, g, dev, log, "measure fit")
+    out["fit_chunk"] = {"states": int(len(O)), "steps": int(fit.get("steps", base.sup_steps)),
+                        "s": round(time.time() - t0, 1)}
 
     pol_path = root / "ppo_hist" / "policy.pt"
     conds = S5.conditions(cfg, "DEV48")
@@ -128,7 +129,7 @@ def project(cfg: S5.StudyConfigV5, m: dict, arms=("dagger_fnpeg", "bcppo_fnpeg",
     fe_h = m["fast_eval"]["s"] / H
     chunk_h = m["expert_chunk"]["s"] / H
     tchunk_h = m["expert_tune_chunk"]["s"] / H
-    fit_h = m["fit_chunk"]["s"] / H                                 # one chunk's states at dagger_epochs
+    fit_h = m["fit_chunk"]["s"] / H                                 # one supervised fit (measured steps)
 
     def ppo_h(rate, dec, hours):
         return min(hours, dec / max(rate, 1e-9) / H)
@@ -137,21 +138,21 @@ def project(cfg: S5.StudyConfigV5, m: dict, arms=("dagger_fnpeg", "bcppo_fnpeg",
     for arm in arms:
         c = _cfg(cfg, arm)
         rate = m["bcppo_fnpeg_ppo" if arm == "bcppo_fnpeg" else "ppo_hist"]["decisions_per_s"]
-        n_iter, epochs_ratio = c.dagger_iters, c.dagger_epochs / max(m["fit_chunk"]["epochs"], 1)
+        n_iter, epochs_ratio = c.dagger_iters, c.sup_steps / max(m["fit_chunk"].get("steps", c.sup_steps), 1)
         if arm == "ppo_hist":
             train = ppo_h(rate, c.budget_decisions, c.budget_hours)
             tune = ppo_h(rate, c.budget_decisions * f, c.budget_hours * f)
         elif arm == "bcppo_fnpeg":
             n_chunks = math.ceil(c.bc_episodes / c.dagger_rollouts)
-            bc_fit = fit_h * n_chunks * c.bc_epochs / max(m["fit_chunk"]["epochs"], 1)
+            bc_fit = fit_h * epochs_ratio                           # one fit of sup_steps
             train = n_chunks * chunk_h + bc_fit + ppo_h(rate, c.budget_decisions, c.budget_hours)
             t_rollouts = max(2, int(c.dagger_rollouts * f))
             t_chunks = math.ceil(max(2, int(c.bc_episodes * f)) / t_rollouts)
-            tune = (t_chunks * tchunk_h + bc_fit * f + ppo_h(rate, c.budget_decisions * f, c.budget_hours * f))
+            tune = (t_chunks * tchunk_h + bc_fit + ppo_h(rate, c.budget_decisions * f, c.budget_hours * f))
         elif arm == "dagger_fnpeg":
             fits = sum(range(1, n_iter)) + n_iter                   # before iterations 1..n-1, then the final fit
             train = n_iter * chunk_h + fits * fit_h * epochs_ratio
-            tune = n_iter * tchunk_h + fits * fit_h * epochs_ratio * f
+            tune = n_iter * tchunk_h + fits * fit_h * epochs_ratio
         else:
             raise ValueError(arm)
         n_tune, n_seed = int(cfg.rl_tune_n.get(arm, 0)), len(cfg.rl_seeds)

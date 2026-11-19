@@ -1392,6 +1392,36 @@ saturated.
   so a failure anywhere in Setup releases the runtime too. Tested by smoke check 17 and by
   `ReEntryAI_watchdog_test.ipynb` (5 minutes on a CPU runtime: a cell hangs, and the watchdog must release the
   runtime from its background thread).
+* **2026-11-18, RL competence gates, the supervised-fit fix and CPU routing (Part B; no flown flight, tuned law or
+  trained model changes; no RL policy had been trained).** (1) **The supervised fit counts steps, not epochs**
+  (`rl_v5.fit_supervised`): `sup_steps` (4,000) Adam steps at its own rate `sup_lr` (10⁻³; BC used PPO's 3·10⁻⁴),
+  minibatches of `sup_batch`; whole episodes (`sup_val_frac` 20 %) are held out, the held-out loss is read every
+  `sup_eval_every` (100) steps, the fit stops after `sup_patience` (10) reads without improvement and keeps its best
+  weights; a non-finite loss raises. `dagger_epochs` and `bc_epochs` stay in `RLCfg` (unused) so old run files still
+  load. DAgger's refit tunes `sup_lr` (log-uniform 3·10⁻⁴–3·10⁻³), `sup_steps` {2,000, 4,000, 8,000} and the width,
+  in `03_tuning/rl_dagger_fnpeg_fit2/`. (2) **More expert flights**: a DAgger tuning iteration labels at least 100
+  episodes (`rl_tune_frac` alone gave 20, about 2,500 states), and the FNPEG labels run on every core
+  (`ParallelExpert`, `label_workers`; one FNPEG flight per env row, so the labels equal the single-process ones,
+  smoke check 18). (3) **Competence gates** (`01_checks/RV*_<arm>.json`, pilots in `01_checks/rl_pilots/`, seed 0,
+  the arm's settings with a smaller count): **RV1** held-out sign accuracy at least 5 points above the better of the
+  two trivial baselines (always positive; the current bank's sign) and a held-out |bank| error of at most 10°;
+  **RV2** the policy alone (no expert) reaches at least 50 % of FNPEG's fast-env success@5km (pilots: DAgger 4
+  iterations × 100 episodes, BC 400 episodes); **RV3** in a PPO pilot (0.5 h or 2·10⁷ decisions) the return rises
+  (last third above first third), success@5km > 0 at some point, no NaN. DAgger needs RV1 and RV2, BC → PPO RV1–RV3
+  (its RV3 pilot starts from its clone), ppo_hist and sac_hist RV3, ppo_matched ppo_hist's. A failed gate is final
+  for the arm (it is reported, not tuned or trained); deleting the gate file reruns its pilot. (4) **An arm whose
+  first 3 tuning configurations all score 0 % success@5km on DEV48 stops** (`03_tuning/<method>/stopped.json`): no
+  choice, no training, reported. (5) **Training checks** at 25 % and 50 % of a PPO run's budget (decisions or
+  hours, whichever is further along): non-finite weights or returns stop it; at 50 %, no flight within 5 km in any
+  learning-curve row and no rise in the return stops it. A stopped run gets `failed.json` (status `stopped`), later
+  sessions skip it, the other seeds go on. Poor accuracy never stops a run. (6) **CPU routing**: DAgger (labelling,
+  fits, DEV48 scoring, tuning and its 5 seeds) and BC's expert dataset and clone (`clone.pt`, `clone_fit.json`,
+  `clone_hardware.json`) run on a CPU pass (cell 6b); BC → PPO's PPO stage, ppo_hist (and sac_hist) on the L4
+  (cell 15); Tier 2's ppo_matched (full-simulator PPO, CPU-bound) on the CPU pass after the L4. Each run's
+  `hardware.json` records where it trained. BC → PPO's tuning configurations start from seed 0's clone (the clone
+  does not depend on the tuned PPO settings). The GPU arms still share the one GPU type (§16). (7) **Cost
+  projection**: the pilots' wall times give `01_checks/rl_cost_projection.json` (hours per tuning configuration and
+  per seed, on the runtime each part runs on). PILOT_RESULTS
 
 ---
 
@@ -1407,10 +1437,11 @@ in their own Holm family so that RQ1–RQ4 are unchanged, and AS1 (§3.4b) one M
 error (the published Orion lift and drag). v5 still does not test winds, navigation errors or sensor
 noise, and its results do not carry over to them.
 
-**RL runs are capped in wall time** (added 2026-11-16, rewritten 2026-11-17, §15). Every RL run tuned and
-trained on the study's one GPU type, an L4 (`00_study/gpu_platform.json`), the GPU type of the E3 models and of
-v4's R0; each run stops at its decision budget or its wall-time cap (3 h; `ppo_matched` 24 h), whichever comes
-first. The RL arms are comparable with each other; the cap depends on the hardware, so each run's decisions
+**RL runs are capped in wall time** (added 2026-11-16, rewritten 2026-11-17 and 2026-11-18, §15). Every GPU RL
+run (BC → PPO's PPO stage, ppo_hist, sac_hist) tuned and trained on the study's one GPU type, an L4
+(`00_study/gpu_platform.json`), the GPU type of the E3 models and of v4's R0; DAgger (no wall-time cap: a fixed number
+of iterations and fit steps), BC's clone and ppo_matched trained on Colab's CPU runtime. Each PPO run stops at its
+decision budget or its wall-time cap (3 h; `ppo_matched` 24 h), whichever comes first. The RL arms are comparable with each other; the cap depends on the hardware, so each run's decisions
 reached are reported (T07), and a faster GPU could have given the RL arms more training within the same cap.
 
 **Single landings depend on rounding** (added 2026-11-17, §15; extended the same day, `v5_code_audit.md` B3).

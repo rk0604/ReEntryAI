@@ -95,7 +95,7 @@ AMENDMENTS = {
 # Approximate Colab compute units per hour by runtime (the status cell's projection only).
 UNITS_PER_HOUR = {"A100": 11.8, "L4": 1.98, "T4": 1.8, "V100": 4.9, "cpu": 0.08}   # L4: the rate Colab showed the
                                                                                 # user (2026-11-17), was 4.8
-NOTEBOOK_REV = 2        # ReEntryAI_JEPA_v5.ipynb's revision; an older copy of the notebook stops at its status cell
+NOTEBOOK_REV = 3        # ReEntryAI_JEPA_v5.ipynb's revision; an older copy of the notebook stops at its status cell
 
 
 # ============================================================================
@@ -195,6 +195,7 @@ class StudyConfigV5:
         rl = dict(n_envs=16, hidden=(32, 32), n_steps=8, epochs=2, minibatch=64, budget_decisions=512,
                   budget_hours=1.0, buffer=4096, batch=64, learning_starts=64, updates_per_step=4.0, dagger_iters=2,
                   dagger_rollouts=4, dagger_epochs=2, bc_episodes=4, bc_epochs=2, sup_batch=256, save_every_s=30.0,
+                  sup_steps=60, sup_eval_every=20, sup_patience=3,
                   curve_points=2, env_pool=64, full_episodes=2, full_per_update=2, full_workers=2,
                   critic_warmup_updates=1)
         return StudyConfigV5(
@@ -1517,7 +1518,9 @@ RL_SPACES = {
                  "clip": ("choice", [0.1, 0.2, 0.3])},
     "bcppo_fnpeg": {"lr": ("loguniform", 1e-5, 1e-4), "kl_coef": ("loguniform", 0.01, 1.0),
                     "critic_warmup_updates": ("choice", [10, 20, 50])},
-    "dagger_fnpeg": {"lr": ("loguniform", 1e-4, 3e-3), "dagger_epochs": ("choice", [20, 30, 50]),
+    # 2026-11-18 (section 15): the refit's space. The first tuning's lr / dagger_epochs set PPO's unused rate and the
+    # epoch count of a fit that no longer counts epochs; DAgger's knobs are now the supervised fit's
+    "dagger_fnpeg": {"sup_lr": ("loguniform", 3e-4, 3e-3), "sup_steps": ("choice", [2000, 4000, 8000]),
                      "hidden": ("choice", [[256, 256], [512, 512]])},
     "sac_hist": {"lr": ("loguniform", 1e-4, 1e-3), "tau": ("choice", [0.005, 0.01]),
                  "batch": ("choice", [512, 1024, 2048])},
@@ -1776,9 +1779,55 @@ class SessionLimit:
             self.after_run()
 
 
+TUNE_MIN_ROLLOUTS = 100      # DAgger tuning: at least this many expert-labelled episodes per iteration (2026-11-18;
+                             # cfg.rl_tune_frac alone gave 20)
+TUNE_ZERO_STOP = 3           # an RL arm's tuning stops when its first 3 configurations all score 0 % (2026-11-18)
+
+
+def tuning_stopped(L: LayoutV5, arm: str) -> Optional[dict]:
+    return _read_json(L.tuning / rl_method(arm) / "stopped.json")
+
+
+def _zero_stop(L: LayoutV5, m: str, arm: str, log=print) -> bool:
+    """True (and 03_tuning/<m>/stopped.json written) when the first TUNE_ZERO_STOP configurations are all scored
+    and all at 0 % success@5km on DEV48."""
+    if (L.tuning / m / "stopped.json").exists():
+        return True
+    zero = [_read_json(L.tuning / m / f"config_{k:02d}.json") for k in range(TUNE_ZERO_STOP)]
+    if not all(z is not None and float(z["score"]["success_5km"]) == 0.0 for z in zero):
+        return False
+    RG.record_failure(L, L.tuning / m / "stopped.json",
+                      {"method": m, "status": "stopped",
+                       "reason": f"its first {TUNE_ZERO_STOP} configurations all scored 0 % success@5km on DEV48 "
+                                 f"(section 15, 2026-11-18)", "git_commit": _GIT.get()},
+                      "RL tuning", arm, log)
+    return True
+
+
+def _bc_clone_into(cfg: StudyConfigV5, L: LayoutV5, d: Path, workers: int, log, build: bool) -> bool:
+    """BC -> PPO's tuning configurations start from seed 0's clone (the clone does not depend on the tuned PPO
+    settings): copy it into d, building it first (on the CPU) when build. False: the clone waits for a CPU pass."""
+    from jepa import rl_v5 as RL
+    if (d / "clone.pt").exists():
+        return True
+    src = L.policy_dir("bcppo_fnpeg", 0)
+    if not (src / "clone.pt").exists():
+        if not build:
+            return False
+        RL.bc_clone(L, src, rl_cfg(cfg, L, "bcppo_fnpeg", {"seed": 0, "label_workers": int(workers)}), "cpu",
+                    "bcppo_fnpeg seed 0", tuned(L, "fnpeg", cfg), log)
+    for f in ("clone.pt", "clone_fit.json", "clone_hardware.json"):
+        if (src / f).exists():
+            L.atomic_bytes(d / f, (src / f).read_bytes())
+    return True
+
+
 def tune_rl(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, workers: int, log=print,
-            limit: Optional[SessionLimit] = None) -> dict:
-    """RL configurations (seed 0, cfg.rl_tune_frac of the budget) scored on DEV48 in the full simulator."""
+            limit: Optional[SessionLimit] = None, allow_clone: bool = True) -> dict:
+    """RL configurations (seed 0, cfg.rl_tune_frac of the budget) scored on DEV48 in the full simulator. DAgger
+    labels at least TUNE_MIN_ROLLOUTS episodes per iteration; BC -> PPO starts from seed 0's clone (built on the
+    CPU when allow_clone, else it waits); an arm whose first TUNE_ZERO_STOP configurations all score 0 % stops
+    (03_tuning/<method>/stopped.json) and is not trained."""
     from jepa import rl_v5 as RL
     if not is_tuned(L, "fnpeg"):
         log("[tuning] RL tuning waits for FNPEG's tuning (its expert and clone source)")
@@ -1794,20 +1843,30 @@ def tune_rl(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, w
         if (L.tuning / m / "chosen.json").exists():
             out[arm] = json.loads((L.tuning / m / "chosen.json").read_text())
             continue
+        if tuning_stopped(L, arm):
+            log(f"[tuning] {arm}: tuning stopped earlier ({tuning_stopped(L, arm)['reason']})")
+            continue
         base = asdict(RL.RLCfg(**{**cfg.rl, **cfg.rl_arms.get(arm, {})}))
         for j, c in enumerate(sample_configs(RL_SPACES[arm], n, cfg.tune_seed + zlib.crc32(arm.encode()) % 1000)):
+            if j >= TUNE_ZERO_STOP and _zero_stop(L, m, arm, log):
+                break
             if (L.tuning / m / f"config_{j:02d}.json").exists():
                 continue
             f = cfg.rl_tune_frac
             red = {"budget_decisions": max(1, int(base["budget_decisions"] * f)), "budget_hours": base["budget_hours"] * f,
                    "dagger_rollouts": max(2, int(base["dagger_rollouts"] * f)),
                    "bc_episodes": max(2, int(base["bc_episodes"] * f)), "curve_points": 0}
-            kw = {**base, **c, **red, "seed": 0}
+            if arm == "dagger_fnpeg":
+                red["dagger_rollouts"] = min(int(base["dagger_rollouts"]), max(red["dagger_rollouts"], TUNE_MIN_ROLLOUTS))
+            kw = {**base, **c, **red, "seed": 0, "label_workers": int(workers)}
             kw["hidden"] = tuple(kw["hidden"])
             d = L.tuning / m / f"config_{j:02d}"
             if limit is not None and not limit.may_start(0.0 if (d / "policy.pt").exists() else red["budget_hours"],
                                                          log, f"tune {arm} config {j}",
                                                          extra_s=n_dev * 90.0 / max(1, int(workers))):
+                return out
+            if arm == "bcppo_fnpeg" and not _bc_clone_into(cfg, L, d, workers, log, allow_clone):
+                log(f"[tuning] {arm}: seed 0's BC clone waits for a CPU pass (cell 6b)")
                 return out
             RL.train_rl_dir(L, d, arm, RL.RLCfg(**kw), device, fn, log, label=f"tune {arm} config {j}")
             js = [policy_job(cd, f"tune_{arm}{RL_TUNE_SUFFIX.get(arm, '')}_c{j:02d}", "tuning",
@@ -1821,7 +1880,10 @@ def tune_rl(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, w
                                                                     "budget": red, "score": _score_dev(rs)})
             if limit is not None:
                 limit.done()
-        out[arm] = _choose_method(cfg, L, m, n, log)
+            if _zero_stop(L, m, arm, log):
+                break
+        if not (n >= TUNE_ZERO_STOP and _zero_stop(L, m, arm, log)):
+            out[arm] = _choose_method(cfg, L, m, n, log)
     return out
 
 
@@ -1954,35 +2016,137 @@ def rl_gate(L: LayoutV5, arm: str) -> Tuple[bool, str]:
     return True, f"{arm}: gates {', '.join(RL_GATES.get(arm, ())) or '(none)'} passed"
 
 
-def rl_imitation_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, workers: int, log=print,
-                       can_cpu: bool = True) -> dict:
-    """The CPU part of the imitation arms (DAgger's labelling, fit and scoring; BC's dataset and clone). Waits for
-    the supervised-fit fix (section 15, 2026-11-18): until then it only says so."""
-    out = {}
-    for arm in arms:
-        if arm in ("dagger_fnpeg", "bcppo_fnpeg"):
-            out[arm] = "waits for the supervised-fit fix (section 15, 2026-11-18)"
-            log(f"[RL imitation] {arm}: {out[arm]}")
-    return out
+RL_CPU_ARMS = ("dagger_fnpeg", "ppo_matched")     # trained on a CPU pass (section 15, 2026-11-18)
+RL_PILOT = {"dagger_fnpeg": {"dagger_iters": 4, "dagger_rollouts": 100},
+            "bcppo_fnpeg": {"bc_episodes": 400, "dagger_rollouts": 100},
+            "ppo": {"budget_decisions": 20_000_000, "budget_hours": 0.5}}
+
+
+def _pilot_cfg(cfg: StudyConfigV5, L: LayoutV5, arm: str, kind: str, workers: int):
+    """The pilot's RLCfg: the arm's settings (tuned ones where chosen), seed 0, the pilot's smaller counts."""
+    rc = rl_cfg(cfg, L, arm, {"seed": 0, "label_workers": int(workers), "curve_points": 0})
+    over = {k: min(v, getattr(rc, k)) for k, v in RL_PILOT[kind].items()}
+    return replace(rc, **over)
+
+
+def _gate_doc(L: LayoutV5, gate: str, arm: str, g: dict, pilot: Path) -> dict:
+    doc = {"gate": gate, "arm": arm, **g, "pilot": os.path.relpath(pilot, L.root).replace(os.sep, "/"),
+           "git_commit": _GIT.get(), "time": time.strftime("%Y-%m-%d %H:%M:%S")}
+    L.write_json(rl_gate_path(L, gate, arm), doc)
+    if not g.get("passed"):
+        RG.SUMMARY.failure("RL gate", f"{gate} {arm}", g.get("reason", "failed"), os.path.relpath(
+            rl_gate_path(L, gate, arm), L.root))
+    return doc
 
 
 def rl_gates_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, workers: int, log=print,
                    can_cpu: bool = True, can_gpu: bool = False) -> dict:
-    """RV1-RV2 (can_cpu: the imitation arms, CPU) and RV3 (can_gpu: the PPO pilot) per RL arm
-    (01_checks/RV*_<arm>.json). Waits for the supervised-fit fix: until then it reports each arm's state."""
-    out = {}
+    """
+    The RL competence gates (01_checks/RV*_<arm>.json, pilots in 01_checks/rl_pilots/):
+    RV1 and RV2 of the imitation arms on a CPU runtime (a pilot DAgger, BC's pilot dataset and clone), RV3 (a PPO
+    pilot) of ppo_hist and BC -> PPO on a GPU runtime (BC -> PPO's only after its RV1 and RV2 passed). Each pilot is
+    cached; a gate that fails is final (delete its file to run the pilot again).
+    """
+    from jepa import rl_v5 as RL
+    out: Dict[str, dict] = {}
+    if not is_tuned(L, "fnpeg"):
+        log("[RL gates] wait for FNPEG's tuning (the experts' settings)")
+        return out
+    fn = tuned(L, "fnpeg", cfg)
+    pil = L.checks / "rl_pilots"
+    lim = SESSION["limit"]
     for arm in arms:
+        if arm in RL_GATE_ARM:
+            continue
+        need = RL_GATES.get(arm, ())
+        try:
+            if ("RV1" in need or "RV2" in need) and can_cpu and not all(
+                    rl_gate_path(L, g, arm).exists() for g in ("RV1", "RV2")):
+                if lim is not None and not lim.may_start(0.5, log, f"RL gate pilot {arm}"):
+                    return out
+                d = pil / arm
+                doc = RL.imitation_pilot(L, d, arm, _pilot_cfg(cfg, L, arm, arm, workers), "cpu", fn, log)
+                _gate_doc(L, "RV1", arm, doc["rv1"], d)
+                _gate_doc(L, "RV2", arm, doc["rv2"], d)
+            if "RV3" in need and can_gpu and not rl_gate_path(L, "RV3", arm).exists():
+                clone = None
+                if arm == "bcppo_fnpeg":
+                    first = [_read_json(rl_gate_path(L, g, arm)) for g in ("RV1", "RV2")]
+                    if not all(x and x.get("passed") for x in first):
+                        log(f"[RL gates] {arm}: RV3 waits for RV1 and RV2 to pass (a CPU pass, cell 6b)")
+                        out[arm] = {"passed": False, "note": rl_gate(L, arm)[1]}
+                        continue
+                    clone = pil / arm / "clone.pt"
+                pc = _pilot_cfg(cfg, L, arm, "ppo", workers)
+                if lim is not None and not lim.may_start(pc.budget_hours, log, f"RL gate pilot {arm} RV3"):
+                    return out
+                d = pil / f"{arm}_ppo"
+                doc = RL.ppo_pilot(L, d, arm, pc, device, clone, log)
+                _gate_doc(L, "RV3", arm, doc["rv3"], d)
+        except Exception as e:                    # a pilot that crashes fails its gate; the other arms go on
+            RG.record_failure(L, L.checks / f"rl_pilot_{arm}_failed.json",
+                              {"arm": arm, "reason": f"{type(e).__name__}: {e}", "git_commit": _GIT.get()},
+                              "RL gate pilot", arm, log)
         ok, note = rl_gate(L, arm)
         out[arm] = {"passed": ok, "note": note}
         log(f"[RL gates] {note}")
+    try:
+        rl_cost_projection(cfg, L, log)
+    except Exception as e:
+        log(f"[RL gates] cost projection not written: {e}")
+    return out
+
+
+def rl_imitation_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, workers: int, log=print,
+                       can_cpu: bool = True) -> dict:
+    """The CPU pass's RL work (section 15, 2026-11-18), for arms whose gates passed: DAgger whole (expert labels on
+    `workers` cores, fits, DEV48 scoring, every seed), BC -> PPO's dataset and clone per seed (its PPO stage runs on
+    the GPU), and Tier 2's ppo_matched (full-simulator PPO, CPU-bound)."""
+    out = {}
+    if not can_cpu:
+        log("[RL imitation] waits for a CPU runtime (GPU_PASS_SKIPS_CPU)")
+        return out
+    from jepa import rl_v5 as RL
+    lim = SESSION["limit"]
+    for arm in arms:
+        if arm == "bcppo_fnpeg":
+            first = [_read_json(rl_gate_path(L, g, arm)) for g in ("RV1", "RV2")]
+            if not all(x and x.get("passed") for x in first) and os.environ.get(RL_GATES_PASS_ENV) != "1":
+                out[arm] = rl_gate(L, arm)[1]
+                log(f"[RL imitation] {out[arm]}")
+                continue
+            fn = tuned(L, "fnpeg", cfg)
+            for sd in cfg.rl_seeds:
+                if (L.policy_dir(arm, sd) / "clone.pt").exists():
+                    continue
+                if lim is not None and not lim.may_start(0.5, log, f"BC clone seed {sd}"):
+                    return out
+                rc = rl_cfg(cfg, L, arm, {"seed": int(sd), "label_workers": int(workers)})
+                RL.bc_clone(L, L.policy_dir(arm, sd), rc, "cpu", f"{arm} seed {sd}", fn, log)
+            out[arm] = "clones made (PPO on the GPU, cell 15)"
+            continue
+        if arm not in RL_CPU_ARMS:
+            continue
+        ok, note = rl_gate(L, arm)
+        if not ok:
+            out[arm] = note
+            log(f"[RL imitation] {note}")
+            continue
+        if arm in RL_SPACES:
+            tune_rl(cfg, L, [arm], "cpu", workers, log, limit=lim)
+        train_rl_stage(cfg, L, [arm], "cpu", log, limit=lim, workers=workers)
+        out[arm] = "trained on this CPU runtime"
     return out
 
 
 def rl_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, workers: int, log=print,
-             can_gpu: bool = True) -> dict:
-    """RL tuning and training (the GPU pass's last stage), only for arms whose competence gates passed."""
+             can_gpu: bool = True, can_cpu: bool = False) -> dict:
+    """RL tuning and training on the GPU (the GPU pass's last stage), only for arms whose competence gates passed;
+    the CPU arms (RL_CPU_ARMS) train in rl_imitation_stage."""
     ready, waiting = [], {}
     for arm in arms:
+        if arm in RL_CPU_ARMS:
+            continue
         ok, note = rl_gate(L, arm)
         if ok:
             ready.append(arm)
@@ -1994,9 +2158,63 @@ def rl_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device: str, 
             log(f"[RL] {ready} wait for a GPU runtime")
         return {"ready": ready, "waiting": waiting}
     lim = SESSION["limit"]
-    tune_rl(cfg, L, ready, device, workers, log, limit=lim)
-    train_rl_stage(cfg, L, ready, device, log, limit=lim)
+    tune_rl(cfg, L, ready, device, workers, log, limit=lim, allow_clone=can_cpu)
+    train_rl_stage(cfg, L, ready, device, log, limit=lim, workers=workers, allow_clone=can_cpu)
     return {"ready": ready, "waiting": waiting}
+
+
+def rl_cost_projection(cfg: StudyConfigV5, L: LayoutV5, log=print) -> Optional[dict]:
+    """
+    01_checks/rl_cost_projection.json from the gate pilots' measured times (B6): hours per tuning configuration and
+    per training seed of each arm, and totals, on the runtime each part runs on (DAgger and BC's clone on a CPU
+    pass, PPO on the GPU). PPO's decisions per second are the RV3 pilot's, on its own hardware (a laptop pilot is
+    not a GPU measurement: the file says which).
+    """
+    from jepa import rl_v5 as RL
+    pil = L.checks / "rl_pilots"
+    out: Dict[str, dict] = {}
+    f = cfg.rl_tune_frac
+    n_seeds = len(cfg.rl_seeds)
+    for arm in ("dagger_fnpeg", "bcppo_fnpeg", "ppo_hist"):
+        rc = rl_cfg(cfg, L, arm)
+        n_cfg = int(cfg.rl_tune_n.get(arm, 1))
+        row: Dict[str, object] = {"configs": n_cfg, "seeds": n_seeds}
+        im = _read_json(pil / arm / "pilot.json")
+        if arm == "dagger_fnpeg" and im:
+            pc = im["cfg"]
+            eps = max(1, int(pc["dagger_iters"]) * int(pc["dagger_rollouts"]))
+            h_ep = im["wall_s"] / 3600.0 / eps
+            tune_eps = int(rc.dagger_iters) * min(int(rc.dagger_rollouts),
+                                                  max(int(rc.dagger_rollouts * f), TUNE_MIN_ROLLOUTS))
+            row.update({"per_config_h": h_ep * tune_eps + 0.05, "per_seed_h": h_ep * rc.dagger_iters *
+                        rc.dagger_rollouts + 0.05, "runtime": "CPU", "measured_on": im["hardware"]})
+        if arm == "bcppo_fnpeg" and im:
+            h_ep = im["wall_s"] / 3600.0 / max(1, int(im["cfg"]["bc_episodes"]))
+            row.update({"clone_per_seed_h": h_ep * rc.bc_episodes, "clone_runtime": "CPU"})
+        pp = _read_json(pil / f"{arm}_ppo" / "pilot.json")
+        if arm in ("bcppo_fnpeg", "ppo_hist") and pp and pp.get("decisions_per_s"):
+            dps = float(pp["decisions_per_s"])
+            run_h = lambda dec, hours: min(dec / dps / 3600.0, hours)
+            row.update({"per_config_h": run_h(rc.budget_decisions * f, rc.budget_hours * f) + 0.05,
+                        "per_seed_h": run_h(rc.budget_decisions, rc.budget_hours), "runtime": "GPU",
+                        "ppo_decisions_per_s": dps, "ppo_measured_on": pp["hardware"]})
+        if "per_config_h" in row:
+            row["total_h"] = n_cfg * row["per_config_h"] + n_seeds * row["per_seed_h"] + row.get(
+                "clone_per_seed_h", 0.0) * n_seeds
+            rate = cfg.units_per_hour.get("L4", 1.98) if row.get("runtime") == "GPU" else RG.UNITS_PER_HOUR_CPU_HIGH
+            row["units"] = row["total_h"] * rate
+        out[arm] = row
+    doc = {"arms": out, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "git_commit": _GIT.get(),
+           "note": "from the gate pilots' wall times; DEV48 scoring adds ~0.05 h per configuration"}
+    L.write_json(L.checks / "rl_cost_projection.json", RG.json_safe(doc))
+    for arm, r in out.items():
+        if "total_h" in r:
+            log(f"[RL cost] {arm}: ~{r['per_config_h']:.2f} h per tuning configuration, ~{r['per_seed_h']:.2f} h per "
+                f"seed on the {r['runtime']}" + (f" (+{r['clone_per_seed_h']:.2f} h per clone on the CPU)"
+                                                 if "clone_per_seed_h" in r else "")
+                + f"; {r['configs']} configurations + {r['seeds']} seeds = ~{r['total_h']:.1f} h, "
+                  f"~{r['units']:.1f} units")
+    return doc
 
 
 # ============================================================================
@@ -2071,25 +2289,50 @@ def train_e3_stage(cfg: StudyConfigV5, L: LayoutV5, data_fn: Callable[[], dict],
     return out
 
 
+def rl_failed(L: LayoutV5, arm: str, seed: int) -> Optional[dict]:
+    """failed.json of an RL run stopped by its training check (rl_v5.training_check), or None."""
+    return _read_json(L.policy_dir(arm, seed) / "failed.json")
+
+
 def train_rl_stage(cfg: StudyConfigV5, L: LayoutV5, arms: Sequence[str], device, log=print,
-                   limit: Optional[SessionLimit] = None) -> List[dict]:
-    """Every RL arm and seed (seed-major within the arm), then its fast-env evaluation (fast-vs-full gap)."""
+                   limit: Optional[SessionLimit] = None, workers: int = 1, allow_clone: bool = True) -> List[dict]:
+    """Every RL arm and seed (seed-major within the arm), then its fast-env evaluation (fast-vs-full gap). A run
+    stopped by its training check gets failed.json and is skipped; the other seeds go on. BC -> PPO's clone is made
+    on the CPU (allow_clone), else the seed waits for a CPU pass."""
     from jepa import rl_v5 as RL
     fn = tuned(L, "fnpeg", cfg)
     out = []
     for arm in arms:
         base = "ppo_hist" if arm == "ppo_matched" else arm
+        if tuning_stopped(L, base):
+            log(f"[E4] {arm}: not trained, its tuning stopped ({tuning_stopped(L, base)['reason']})")
+            continue
         if not is_tuned(L, "fnpeg") or (base in RL_SPACES and not is_tuned(L, rl_method(base))):
             log(f"[E4] {arm} waits for tuning (03_tuning/)")
             continue
         for s in cfg.rl_seeds:
-            rc = rl_cfg(cfg, L, arm)
+            if rl_failed(L, arm, s):
+                log(f"[E4] {arm} seed {s}: stopped earlier ({rl_failed(L, arm, s)['reason']}); delete failed.json "
+                    f"to train it again")
+                continue
+            rc = rl_cfg(cfg, L, arm, {"label_workers": int(workers)})
             fresh = not (L.policy_dir(arm, s) / "fast_eval.json").exists()
+            if arm == "bcppo_fnpeg" and not (L.policy_dir(arm, s) / "clone.pt").exists():
+                if not allow_clone:
+                    log(f"[E4] {arm} seed {s}: its BC clone waits for a CPU pass (cell 6b)")
+                    continue
+                RL.bc_clone(L, L.policy_dir(arm, s), replace(rc, seed=int(s)), "cpu", f"{arm} seed {s}", fn, log)
             if limit is not None and fresh and not limit.may_start(
                     0.0 if (L.policy_dir(arm, s) / "policy.pt").exists() else rc.budget_hours, log,
                     f"{arm} seed {s}", extra_s=600.0):
                 return out
-            info = RL.train_rl_arm(L, arm, s, rc, device, fn, log)
+            try:
+                info = RL.train_rl_arm(L, arm, s, rc, device, fn, log)
+            except (RL.RLStopped, FloatingPointError) as e:
+                RG.record_failure(L, L.policy_dir(arm, s) / "failed.json",
+                                  {"arm": arm, "seed": int(s), "status": "stopped", "reason": str(e),
+                                   "git_commit": _GIT.get()}, "RL run", f"{arm} seed {s}", log)
+                continue
             d = L.policy_dir(arm, s)
             fe = d / "fast_eval.json"
             if (d / "policy.pt").exists() and not fe.exists():
@@ -2262,7 +2505,9 @@ def status(cfg: StudyConfigV5, L: LayoutV5, stage_jobs: Dict[str, List[dict]], r
     for a in RL_TIER1 + (RL_TIER2 if cfg.tier >= 2 else ()):
         for s in cfg.rl_seeds:
             d = L.policy_dir(a, s)
-            st = "done" if (d / "policy.pt").exists() else ("partial" if d.exists() else "todo")
+            st = "done" if (d / "policy.pt").exists() else ("stopped" if (d / "failed.json").exists() else
+                                                            ("partial" if (d / "train_state.pt").exists() or
+                                                             (d / "data").exists() else "todo"))
             train.append({"kind": "E4", "arm": a, "seed": s, "state": st})
     hours = sum(s["hours_left"] or 0.0 for s in stages)
     key = next((k for k in cfg.units_per_hour if k.lower() in runtime.lower()), "cpu")

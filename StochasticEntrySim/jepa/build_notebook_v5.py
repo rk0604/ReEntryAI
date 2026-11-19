@@ -120,7 +120,7 @@ STALL_MIN = 45                  # release the runtime after this many minutes wi
 MAX_SESSION_UNITS = None        # e.g. 40: start no model, run or flight group that would not fit in this many units
 UNITS_PER_HOUR = None           # this runtime's rate (None: L4 1.98, High-RAM CPU 0.26, CPU 0.08)
 STOP_ON_FAILURE = False         # True: release at the first failed stage; False: record it, skip it, go on
-NOTEBOOK_REV = 2                # this notebook's revision (an old copy stops at Setup: open it from GitHub)
+NOTEBOOK_REV = 3                # this notebook's revision (an old copy stops at Setup: open it from GitHub)
 """
 
 SETUP = r"""
@@ -330,8 +330,8 @@ RL_ARMS = list(S5.RL_TIER1) + (list(S5.RL_TIER2) if RUN["tier2_rl"] else [])
 if RUN["E4_train"]:
     log = L.logger("RL_imitation")
     with RG.stage("RL imitation and gates RV1-RV2 (CPU)", log):
-        S5.rl_imitation_stage(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log, CAN_CPU)
         S5.rl_gates_stage(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log, CAN_CPU, False)
+        S5.rl_imitation_stage(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log, CAN_CPU)
 """
 
 A256 = r"""
@@ -376,7 +376,7 @@ if RUN["E4_train"]:
     log = L.logger("E4_train")
     with RG.stage("RL gate RV3, tuning and training (GPU)", log):
         S5.rl_gates_stage(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log, False, CAN_GPU)
-        S5.rl_stage(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log, CAN_GPU)
+        S5.rl_stage(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log, CAN_GPU, CAN_CPU)
     done = sum((L.policy_dir(a, s) / "policy.pt").exists() for a in RL_ARMS for s in CFG.rl_seeds)
     log(f"RL policies on Drive: {done}/{len(RL_ARMS) * len(CFG.rl_seeds)}")
     p = L.policy_dir(RL_ARMS[0], CFG.rl_seeds[0]) / "F_curves.png"
@@ -576,11 +576,16 @@ on a CPU runtime; RL tunes in section 15 (GPU, last), once FNPEG is chosen and t
     ("md", r"""
 ## 6b. RL imitation and gates RV1–RV2 (CPU runtime)
 
-The imitation arms' CPU work: DAgger's FNPEG labelling, supervised fit and scoring, BC's expert dataset and clone,
-then their competence gates on held-out episodes (RV1: sign accuracy at least 5 points above the best trivial
-baseline and |bank| error ≤ 10°; RV2: the policy alone reaches ≥ 50 % of FNPEG's fast-environment success;
-`01_checks/RV*_<arm>.json`). **An RL arm tunes and trains only after its gates pass**; until then it waits with a
-note (section 15, 2026-11-18: DAgger's first tuning underfitted, and is kept under `DEPRECATED.md`, ignored).
+First the imitation arms' competence gates, from a small pilot of each (`01_checks/rl_pilots/`), scored on
+held-out episodes: **RV1** sign accuracy at least 5 points above the best trivial baseline and |bank| error ≤ 10°;
+**RV2** the policy alone reaches ≥ 50 % of FNPEG's fast-environment success (`01_checks/RV*_<arm>.json`). Then, for
+arms whose gates passed, their CPU work, with the FNPEG expert labelling on every core: **DAgger whole** (tuning,
+5 seeds, DEV48 scoring), **BC → PPO's expert dataset and clone** for each seed (its PPO stage runs on the L4 in
+section 15), and in Tier 2 `ppo_matched` (full-simulator PPO, CPU-bound; it waits for ppo_hist's gate and tuning,
+so it trains on the CPU pass after the L4). **An RL arm tunes and trains only after its gates pass**; until then it
+waits with a note. An arm whose first 3 tuning configurations all score 0 % stops (`03_tuning/<method>/stopped.json`)
+and is reported, not trained. The pilots also write `01_checks/rl_cost_projection.json`. (Section 15 of the plan,
+2026-11-18: DAgger's first tuning underfitted, and is kept under `DEPRECATED.md`, ignored.)
 """),
     ("code", RL_IMITATION),
     ("md", r"""
@@ -667,15 +672,17 @@ it is tuned, an RL arm once its seed-0 policy exists. Cached per (arm, device).
     ("md", r"""
 ## 15. E4 RL: gate RV3, tuning and training (GPU, last)
 
-The GPU pass's last stage, so a slow RL run never holds up the other GPU work. First the PPO pilot gate RV3 (the
-return rises, success@5km > 0, no NaNs), then, for each arm whose gates passed, its DEV48 tuning (12 configurations
-at a reduced budget, each scored by its 48 full-simulator flights) and its training:
-`dagger_fnpeg`, `bcppo_fnpeg`, `ppo_hist` (Tier 2: `sac_hist`, `ppo_matched`), 5 seeds each, in the batched fast
-environment (ppo_matched: the full simulator). Checkpoints every 5 minutes with optimizer, normalizer and RNG
+The GPU pass's last stage, so a slow RL run never holds up the other GPU work. First the PPO pilot gate **RV3** (the
+return rises, success@5km > 0, no NaNs; BC → PPO's pilot starts from its CPU-made clone, after its RV1 and RV2), then,
+for each arm whose gates passed, its DEV48 tuning (12 configurations at a reduced budget, each scored by its 48
+full-simulator flights) and its training: `bcppo_fnpeg`'s PPO stage and `ppo_hist` (Tier 2: `sac_hist`), 5 seeds
+each, in the batched fast environment. DAgger and `ppo_matched` train on a CPU runtime instead (section 6b). Each
+PPO run is checked at 25 % and 50 % of its budget; one that has not learned stops with `failed.json` and the other
+seeds go on. Checkpoints every 5 minutes with optimizer, normalizer and RNG
 state; learning curves redrawn at each; `policy.pt` marks a run done; then each policy's fast-environment success
 (the fast side of the fast-vs-full gap).
 
-**Every RL run (tuning and training) trains here, on the study's one GPU type** (the L4,
+**Every GPU RL run (tuning and training) trains here, on the study's one GPU type** (the L4,
 `00_study/gpu_platform.json`), so the RL arms share one platform with each other and with the E3 models. Kaggle is no
 longer used (2026-11-17, `jepa/v5_plan.md` §15). The DAgger and BC experts use FNPEG's **tuned** filter β (from its
 `chosen.json`), so RL is compared with the law that was tuned. A run resumes on any later L4 session; a newer torch or

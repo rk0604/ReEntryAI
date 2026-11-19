@@ -131,7 +131,7 @@ RL_TINY = dict(n_envs=16, hidden=(32, 32), n_steps=8, epochs=2, minibatch=64, bu
                buffer=4096, batch=64, learning_starts=64, updates_per_step=4.0, dagger_iters=2, dagger_rollouts=4,
                dagger_epochs=2, bc_episodes=4, bc_epochs=2, sup_batch=256, save_every_s=1e9, save_every_updates=2,
                curve_points=2, env_pool=64, full_episodes=4, full_per_update=2, full_workers=1,
-               critic_warmup_updates=1, kl_coef=0.1)
+               critic_warmup_updates=1, kl_coef=0.1, sup_steps=40, sup_eval_every=20, sup_patience=3)
 RL_EXTRA = {"sac_hist": {"budget_decisions": 2400, "save_every_updates": 40}, "ppo_matched": {"save_every_updates": 1}}
 RL_FAIL = {"ppo_hist": "rl_train:2", "bcppo_fnpeg": "rl_train:2", "sac_hist": "rl_train:80",
            "dagger_fnpeg": "rl_train:1", "ppo_matched": "rl_train:1"}
@@ -1306,7 +1306,7 @@ def t16_kaggle(work: Path) -> None:
     # notebook stay as a tested by-hand route, checked below
     check("Colab notebook: no Kaggle step; RL tuning and training run in the notebook on the GPU",
           "RL_ON_KAGGLE" not in nb and "K.export_inputs" not in nb and "K.import_rl" not in nb
-          and "S5.rl_stage(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log, CAN_GPU)" in nb)
+          and "S5.rl_stage(CFG, L, RL_ARMS, DEVICE, CPU_WORKERS, log, CAN_GPU, CAN_CPU)" in nb)
     src = work / "v5_smoke"
     if not (src / "03_tuning" / "fnpeg" / "chosen.json").exists():
         check("Kaggle check needs check 10's smoke study (FNPEG tuned)", False, f"({src})")
@@ -1571,9 +1571,9 @@ def t17_unattended(tmp: Path, fx: dict) -> None:
     g2 = S5.rl_gate(L, "dagger_fnpeg")
     rs = S5.rl_stage(cfg, L, ["ppo_hist", "ppo_matched"], "cpu", 1, log, True)
     check("17. RL gates: an arm waits without its gate files, is refused on a failed gate, passes when all pass; "
-          "rl_stage tunes and trains nothing whose gate has not passed (ppo_matched uses ppo_hist's)",
+          "rl_stage tunes and trains nothing whose gate has not passed (ppo_matched trains on a CPU pass)",
           not g0[0] and "waits" in g0[1] and not g1[0] and "failed" in g1[1] and g2[0] and rs["ready"] == []
-          and set(rs["waiting"]) == {"ppo_hist", "ppo_matched"} and not (L.tuning / "rl_ppo_hist").exists(),
+          and set(rs["waiting"]) == {"ppo_hist"} and not (L.tuning / "rl_ppo_hist").exists(),
           f"({g0}, {g1}, {g2}, {rs})")
 
     # (f) the session budget: nothing starts that does not fit; the stage then releases the runtime
@@ -1675,6 +1675,121 @@ def t17_unattended(tmp: Path, fx: dict) -> None:
     RG.STATE.update({"release": None, "limit": None, "stop_on_failure": False})
 
 
+def t18_rl_gates(tmp: Path) -> None:
+    section("18. RL competence gates: parallel expert labels, pilots RV1-RV3, cost projection, the tuning stop, "
+            "failed RL runs")
+    import dataclasses
+    from jepa import rl_v5 as RL
+    from jepa import runguard_v5 as RG
+    from jepa import study_v5 as S5
+    base = tmp / "rl_gates"
+    shutil.rmtree(base, ignore_errors=True)
+    RG.BEAT_DIR = base / "beat"
+    L = S5.LayoutV5(base / "study").make()
+    cfg = S5.StudyConfigV5.smoke()
+    logs = []
+    log = lambda *a: logs.append(" ".join(str(x) for x in a))
+    RG.configure(L, {"test": "18"}, 1.0, lambda r: None)
+    old_env = os.environ.pop(S5.RL_GATES_PASS_ENV, None)
+    try:
+        # (a) ParallelExpert's labels are FastExpert's (fnpeg decides each flight on its own), across resets
+        rc = RL.RLCfg(**RL_TINY)
+        env_a, env_b = RL.make_env(rc, 3, "cpu", n_envs=6), RL.make_env(rc, 3, "cpu", n_envs=6)
+        fe, pe = RL.FastExpert(env_a, rc), RL.ParallelExpert(env_b, rc, None, 2)
+        same, n_reset, n_dec, after = True, 0, 0, 0
+        try:
+            while n_dec < 600 and after < 10:          # an entry is ~200 decisions; go on 10 past the first resets
+                n_dec += 1
+                after += 1 if n_reset else 0
+                a, b = fe.label(), pe.label()
+                same &= bool(torch.equal(a, b))
+                _, _, da, _ = env_a.step(a)
+                _, _, db, _ = env_b.step(a)
+                same &= bool(torch.equal(da, db))
+                idx = torch.nonzero(da).flatten()
+                if len(idx):
+                    fe.reset_rows(idx)
+                    pe.reset_rows(idx)
+                    n_reset += len(idx)
+        finally:
+            pe.close()
+        check("18. ParallelExpert (2 processes) labels == FastExpert labels, through episode resets",
+              same and n_reset > 0, f"({n_reset} rows reset in {n_dec} decisions)")
+
+        # (b) the gates' pilots on the CPU, their files and the cost projection
+        L.write_json(L.tuning / "fnpeg" / "chosen.json", {"method": "fnpeg", "config": S5.tuned(L, "fnpeg", cfg)})
+        t0 = time.time()
+        g = S5.rl_gates_stage(cfg, L, ["dagger_fnpeg", "bcppo_fnpeg", "ppo_hist", "ppo_matched"], "cpu", 2, log,
+                              True, True)
+        keys = (("RV1", "dagger_fnpeg"), ("RV2", "dagger_fnpeg"), ("RV1", "bcppo_fnpeg"), ("RV2", "bcppo_fnpeg"),
+                ("RV3", "ppo_hist"))
+        docs = {k: S5._read_json(S5.rl_gate_path(L, k[0], k[1])) for k in keys}
+        pil = L.checks / "rl_pilots"
+        fit = S5._read_json(pil / "dagger_fnpeg" / "fit.json") or {}
+        cp = S5._read_json(L.checks / "rl_cost_projection.json") or {"arms": {}}
+        bc_ok = all((docs[(k, "bcppo_fnpeg")] or {}).get("passed") for k in ("RV1", "RV2"))
+        ok = (all(d is not None and isinstance(d.get("passed"), bool) and d.get("reason") for d in docs.values())
+              and {"sign_acc", "bank_err_deg", "always_positive", "current_bank_sign"} <= set(fit.get("val", {}))
+              and (pil / "ppo_hist_ppo" / "pilot.json").exists() and (pil / "bcppo_fnpeg" / "clone.pt").exists()
+              and S5.rl_gate_path(L, "RV3", "bcppo_fnpeg").exists() == bool(bc_ok)
+              and "total_h" in cp["arms"].get("dagger_fnpeg", {}) and "total_h" in cp["arms"].get("ppo_hist", {})
+              and set(g) == {"dagger_fnpeg", "bcppo_fnpeg", "ppo_hist"})
+        passed = {f"{k[0]} {k[1]}": (d or {}).get("passed") for k, d in docs.items()}
+        check("18. RL gates: the pilots write RV1/RV2 (DAgger, BC) and RV3 (ppo_hist; BC's only after its RV1-RV2) "
+              "with the held-out sign accuracy, bank error and trivial baselines; rl_cost_projection.json",
+              ok, f"({passed}, {time.time() - t0:.0f}s)")
+        if not ok:
+            print("\n".join(logs[-40:]))
+        n_files = len(list(L.checks.rglob("*")))
+        S5.rl_gates_stage(cfg, L, ["dagger_fnpeg", "ppo_hist"], "cpu", 2, log, True, True)
+        check("18. RL gates are cached: a second call runs no pilot", len(list(L.checks.rglob("*"))) == n_files)
+
+        # (c) an arm whose first 3 tuning configurations all score 0 % stops and is not trained
+        os.environ[S5.RL_GATES_PASS_ENV] = "1"
+        m = S5.rl_method("ppo_hist")
+        for j in range(3):
+            L.write_json(L.tuning / m / f"config_{j:02d}.json", {"method": m, "config_index": j, "config": {},
+                                                                 "score": {"n": 48, "success_5km": 0.0}})
+        cfg4 = dataclasses.replace(cfg, rl_tune_n={**cfg.rl_tune_n, "ppo_hist": 4})
+        out = S5.tune_rl(cfg4, L, ["ppo_hist"], "cpu", 1, log)
+        S5.train_rl_stage(cfg, L, ["ppo_hist", "ppo_matched"], "cpu", log)
+        st = S5.tuning_stopped(L, "ppo_hist")
+        check("18. RL tuning stops after 3 configurations at 0 %: stopped.json, no choice, no training (ppo_matched "
+              "neither), RUN_SUMMARY lists it",
+              st is not None and "ppo_hist" not in out and not (L.tuning / m / "config_03").exists()
+              and not (L.tuning / m / "chosen.json").exists() and not L.policy_dir("ppo_hist", 0).exists()
+              and not L.policy_dir("ppo_matched", 0).exists() and "RL tuning" in RG.SUMMARY.text(), f"({st})")
+
+        # (d) a run stopped by its training check gets failed.json; the next seed still trains
+        L.write_json(L.tuning / S5.rl_method("dagger_fnpeg") / "chosen.json",
+                     {"method": S5.rl_method("dagger_fnpeg"), "config": {}})
+        real = RL.train_rl_arm
+        calls = []
+
+        def fake(L_, arm, seed, rc_, device, fn, log_=print):
+            calls.append(int(seed))
+            if int(seed) == 0:
+                raise RL.RLStopped("no sign of learning by 50 % of the budget (smoke)", 7)
+            return {"arm": arm, "seed": int(seed), "fake": True}
+        RL.train_rl_arm = fake
+        try:
+            cfg2 = dataclasses.replace(cfg, rl_seeds=(0, 1))
+            S5.train_rl_stage(cfg2, L, ["dagger_fnpeg"], "cpu", log)
+            S5.train_rl_stage(cfg2, L, ["dagger_fnpeg"], "cpu", log)
+        finally:
+            RL.train_rl_arm = real
+        f0 = S5.rl_failed(L, "dagger_fnpeg", 0)
+        rows = S5.status(cfg2, L, {}, write=False)["training"]
+        st = {(r["arm"], r["seed"]): r["state"] for r in rows if r.get("kind") == "E4"}
+        check("18. an RL run stopped by its training check: failed.json, the other seed trains, a rerun skips it, "
+              "status 'stopped'", f0 is not None and "learning" in f0["reason"] and calls.count(0) == 1
+              and calls.count(1) >= 1 and st.get(("dagger_fnpeg", 0)) == "stopped", f"({calls}, {st})")
+    finally:
+        os.environ.pop(S5.RL_GATES_PASS_ENV, None)
+        if old_env is not None:
+            os.environ[S5.RL_GATES_PASS_ENV] = old_env
+
+
 def main(work: Path, workers: int, only=None, keep: bool = False) -> None:
     t_all = time.time()
     torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
@@ -1726,6 +1841,8 @@ def main(work: Path, workers: int, only=None, keep: bool = False) -> None:
         t16_kaggle(work)
     if run(17):
         t17_unattended(tmp, fx)
+    if run(18):
+        t18_rl_gates(tmp)
     shutil.rmtree(tmp, ignore_errors=True)
     n_ok = sum(ok for _, ok, _ in RESULTS)
     print(f"\nnotes: {json.dumps(NOTES, default=str)}")
