@@ -122,9 +122,34 @@ under v2's MPPI on A256 (5 seeds × 256 = 1,280 flights per arm) and paired with
 | 4 | `gru_pi` | physics-informed decoder without JEPA | 0–4 | ~38.7 (incl. pilots) | ~1.2 |
 
 **change (order only):** `r0_nojepa` first. It alone answers Q-C (J-equiv is defined for it only). The current
-order is `mlp_direct`, `gru_direct`, `gru_pi`, `r0_nojepa`.
+order is `mlp_direct`, `gru_direct`, `gru_pi`, `r0_nojepa`. All four arms train all 5 seeds (user decision
+2026-11-19: no seeds cut, no arm dropped).
 
 Open loop (§4.7) for every finished model: ~0.01 h, runs after training.
+
+### 2.2b E3 on the robustness suites (added 2026-11-19, user decision; exploratory, estimates only)
+
+The question: does the JEPA model's advantage, if any, survive model error that the classical laws cannot
+handle (AS1) or that changes during flight (DS1)? And do the non-JEPA models handle it too? A256 cannot tell,
+since success@5km saturates there.
+
+| Arm | Suite | Seeds | Flights | L4 h |
+|---|---|---|---|---|
+| R0 (v4's checkpoints, seeds 0–4, v4's adapter and settings) | AS1, DS1 | case mod 5 | 128 + 256 | ~0.6 |
+| `r0_nojepa` | AS1, DS1 | case mod 5 | 384 | ~0.6 |
+| `gru_direct` | AS1, DS1 | case mod 5 | 384 | ~0.3 |
+| `mlp_direct` | AS1, DS1 | case mod 5 | 384 | ~0.4 |
+| `gru_pi` | AS1, DS1 | case mod 5 | 384 | ~0.4 |
+| **total** | | | **1,920** | **~2.3** |
+
+* R0 is added because RQ2's reference is R0, and R0 has no AS1/DS1 flights. With it, each E3 arm on AS1/DS1
+  pairs with R0, exactly as on A256. `v2single` (§2.1) is also on both suites, as the RQ1 arm.
+* Each E3 arm's AS1/DS1 flights run right after that arm's A256 flights.
+* Reported as estimates with intervals, in their own table: paired log miss and success@5km vs R0 per suite,
+  cases as units, the DS1/AS1 bootstrap (§6). No pass/fail criterion and no Holm family, so they cannot change
+  an RQ2 verdict. The §15 entry must be written **before any of these flights exists**, stating that.
+* Statistics are fixed now: R0-minus-arm paired log miss and success@5km, 95% bootstrap intervals over seeds
+  then cases, and the seed-level t-test beside it.
 
 ### 2.3 Cheap work on a CPU runtime
 
@@ -139,53 +164,102 @@ treat missing E4 arms as "not in this notebook", not as pending failures.
 
 ---
 
-## 3. E3 learning-rate fix (decision for the user before building)
+## 3. E3 learning-rate fix (decided 2026-11-19: the divergence fallback)
 
 **What happened.** The pilot trains each multiplier for 3,600 steps with its own short schedule, so its rate
 has decayed by the end. ×3 won for `mlp_direct` and `gru_direct`. In the 36,000-step run, ×3 is still near its
 peak (1.8e-3) at step ~3,400, and `mlp_direct` diverged there on all 5 seeds. `gru_direct` at ×3 passed that
 point and is training normally. `gru_pi` and `r0_nojepa` have not chosen yet and could hit the same problem.
 
-**Proposed rule** (a §15 entry; applies to all four arms, prospectively):
-1. A full run that goes NaN is recorded as now (`failed.json`, kept, never deleted).
-2. That seed is then retrained once at the next-best pilot multiplier (for `mlp_direct`: ×1, pilot val 0.861
-   vs ×3's 0.753) in its own folder (`seed_k/lr_x1/` or similar). The arm's results use that run.
-3. If an arm's chosen multiplier diverges on seed 0, the remaining seeds start directly at the fallback.
-4. Every multiplier used, and why, goes in the report's tuning table.
-5. `gru_direct`'s ×3 runs that finish without NaN stand.
+**The rule** (the user left the choice to the building plan; it goes in `v5_plan.md` §15 before `gru_pi` or
+`r0_nojepa` pilots, and applies to all four arms the same way):
+1. The pilots and the choice stay as preregistered: {×1, ×0.3, ×3}, seed 0, 10% pilot, lowest validation
+   open-loop state loss at horizon 96. Pilots that already ran (`mlp_direct`, `gru_direct`) are not rerun.
+2. A full run whose training loss goes non-finite is recorded as now (`failed.json`, kept, never deleted or
+   moved). It is a result: "×m diverged at step s".
+3. That seed is retrained from scratch at the **next-best pilot multiplier** (lowest validation loss among the
+   multipliers not yet diverged for this arm). For `mlp_direct` that is ×1 (pilot val 0.861; ×3 had 0.753,
+   ×0.3 1.685). The retrain lives in its own folder (for example `seed_k/lr_x1/`) so the failed run's files
+   stay untouched. The arm's flights use the retrained model.
+4. Once an arm's chosen multiplier has diverged on any seed, its remaining seeds start directly at the
+   fallback. Every seed of an arm then uses one multiplier. The exception is runs at the original choice that
+   already finished without divergence: those stand, and the report says which seeds used which multiplier.
+5. If the fallback also diverges, the next one is tried. If all three diverge, the arm is reported as "did not
+   train" and the notebook stops and releases the runtime (§4b).
+6. The report's tuning table lists, per arm and seed, the multiplier used, any divergence (step) and the pilot
+   losses.
 
-The alternative is to rerun the pilots with the full run's schedule (pilot = first 3,600 steps of the real
-36,000-step schedule). That is better science but re-pilots every arm. **The user picks one.**
+**Why this rule and not re-piloting on the full schedule.**
+- It keeps the preregistered selection procedure intact, and the `gru_direct` work that is valid.
+- It reacts only to an objective event (a non-finite loss), not to any flight or test result, so it cannot be
+  tuned toward a conclusion.
+- It is the standard practice for a learning rate that is unstable at full length.
+- It costs only the retrains the divergences force.
 
-Also check, with no behaviour change: the early stop (Part A) stops a NaN run within minutes, so a diverged seed
-costs ~5 minutes, not hours.
+Re-piloting would change a preregistered procedure after its results were seen for two arms, and would re-pilot
+every arm. It is the weaker choice for a reviewer.
+
+The early stop (Part A) already stops a non-finite run within minutes, so a diverged seed costs ~5 minutes of
+L4, not hours.
 
 ---
 
-## 4. Budget
+## 4. Budget (user decision 2026-11-19: buy units, run everything)
 
 Units on hand ~126 (129.77 at the screenshot, minus the current session). L4 = 1.98 units/h.
 
 | Block | L4 h | Units | Running total (units) |
 |---|---|---|---|
 | §2.1 E2 + robustness flights | ~7.2 | ~14 | 14 |
-| `gru_direct` (finish) + flights | ~4.4 | ~9 | 23 |
-| `r0_nojepa` 5 seeds + flights | ~39.8 | ~79 | 102 |
-| `mlp_direct` 5 seeds + flights | ~16.5 | ~33 | 135 |
-| `gru_pi` 5 seeds + flights | ~39.9 | ~79 | 214 |
+| `r0_nojepa` 5 seeds + A256 flights | ~39.8 | ~79 | 93 |
+| `gru_direct` (finish) + A256 flights | ~4.4 | ~9 | 102 |
+| `mlp_direct` 5 seeds (×1 fallback) + A256 flights | ~16.5 | ~33 | 135 |
+| `gru_pi` 5 seeds + A256 flights | ~39.9 | ~79 | 214 |
+| §2.2b E3 + R0 on AS1/DS1 | ~2.3 | ~5 | 219 |
+| reserve: one more fallback retrain set, open loop, compute per decision, Setup per session (~5 sessions) | ~10 | ~20 | ~240 |
 
-So the current balance covers §2.1, `gru_direct` and `r0_nojepa`, and part of `mlp_direct`. **Decision for the
-user:**
-- (a) buy ~90 more units for the full E3;
-- (b) `mlp_direct` at 3 seeds (~21 units) and drop `gru_pi`;
-- (c) `gru_pi` and `mlp_direct` at fewer seeds.
-
-Fewer seeds is a **change** to §4.3 and §8.2's "4 of 5 seeds" rule. It must be a §15 entry with the seed rule
-restated (for example "3 of 3") before the training starts.
+The full notebook needs **~240 units**, so **~115 more** than on hand. About 110–120 L4-hours means **at least
+5 Colab sessions** (24 h limit each), so 5 or more days of Run all. The status cell prints the projection for
+what is left at the start of every session.
 
 **Spending guards** (reuse Part A's): watchdog `STALL_MIN = 45`; `MAX_SESSION_UNITS` set by the user per
 session; failure records and skip; release after the GPU stages and in the last cell. Each Colab session ends
-by its 24 h limit at the latest; Run all resumes.
+by its 24 h limit at the latest; Run all resumes. §4b adds the stop rules.
+
+## 4b. Stop-and-disconnect rules (user request 2026-11-19: "stop the run and disconnect if a run is failing")
+
+The notebook releases the runtime itself, after writing a failure record, `RUN_SUMMARY.txt` and the Drive
+flush, whenever a run is failing in a way that more compute will not fix. It never stops on a bad *result*
+(a miss, a low success rate). AS1's 6% FNPEG is a real result, not a failure.
+
+| Trigger | Action |
+|---|---|
+| No progress for 45 min (watchdog, exists) | release |
+| An E3 run's loss goes non-finite | early stop (exists), then the §3 fallback retrain |
+| An E3 arm has diverged at every pilot multiplier | record "did not train", **release** |
+| An E3 run's validation loss is non-finite, or at 25% of its steps is worse than 3× its own pilot's final validation loss at that multiplier | record, **release** (it is not learning; a human looks before more units go in) |
+| An MPPI arm: ≥ 5 of its first 20 flights end in an exception or a non-finite state/plan (technical failures, not misses) | stop that arm, record, **release** |
+| ≥ 3 failure records of any kind in one session | **release** |
+| A stage raises an exception (failure hook, exists) | **release** |
+| The session reaches `MAX_SESSION_UNITS` | **release** |
+
+**Resuming:**
+- A release from a stop rule leaves `00_study/STOPPED.json` with the trigger and the evidence.
+- The next Run all prints it at Setup and **refuses to continue** until the user sets
+  `ACK_STOP = "<the trigger id>"` in Settings, so a stopped problem is never re-run blindly.
+- Watchdog, budget and 24 h-limit releases are not stop rules and resume normally.
+
+`RUN_SUMMARY.txt` lists every trigger hit, so the user can see from Drive alone why a session ended.
+
+**Calibrate the not-learning trigger before using it.** The logged validation loss depends on the curriculum
+horizon: it jumps when T goes from 48 to 96. So the builder must check the 25% / 3× threshold against the
+logged histories in `00_study/logs/E3_train.log` (`gru_direct` seed 0 and every pilot). It must not fire on
+any healthy run there. If it would, loosen it and record the value chosen and why.
+
+**Current run (2026-11-19).** The old notebook's E3 log on Drive last advanced at 17:19 UTC (`gru_direct`
+seed 0, step 18,500). If that session is still open, either Drive sync is lagging or it is stalled. Its
+watchdog releases it 45 minutes after the last progress. It must be stopped before the new notebook runs (§5,
+"one writer").
 
 ---
 
@@ -201,9 +275,9 @@ by its 24 h limit at the latest; Run all resumes.
   cell, and text saying it disconnects itself and that `AUTO_DISCONNECT = False` turns it off.
 * **Cells, in order:** Settings → Setup (clone/pull `space-jepa5`, mount Drive, repair, platform check) →
   Status (what is done, what is left, projected hours and units per block) → §2.1 flights in the order given →
-  E3 `r0_nojepa` → `gru_direct` → `mlp_direct` → `gru_pi` (each: pilot if needed, seeds, then its A256 flights
-  right after its seeds) → open loop → compute per decision → release (GPU pass ends) → analysis (CPU) → report
-  → release.
+  R0 on AS1/DS1 (§2.2b) → E3 `r0_nojepa` → `gru_direct` → `mlp_direct` → `gru_pi`. Each arm runs its pilot
+  if needed, then its seeds, then its A256 flights, then its AS1/DS1 flights. Then open loop → compute per
+  decision → release (GPU pass ends) → analysis (CPU) → report → release.
 * **One writer at a time.** The old `ReEntryAI_JEPA_v5.ipynb` writes the same folder. Bump `NOTEBOOK_REV` so an
   old copy stops at Setup with "superseded by ReEntryAI_JEPA_v5_needed.ipynb". The running old session must be
   stopped before the new notebook first runs. `gru_direct` resumes from `train_state.pt`, so stopping loses
@@ -225,8 +299,13 @@ by its 24 h limit at the latest; Run all resumes.
 * Do not run the full study. The user runs it on Colab.
 * Smoke test (`python jepa/smoke_v5.py`, CPU) must pass, plus new checks:
   * the stage order of §2;
-  * the E3 fallback rule (a forced NaN at the chosen multiplier retrains at the next one and keeps
-    `failed.json`);
+  * the E3 fallback rule:
+    * a forced NaN at the chosen multiplier retrains at the next one and keeps `failed.json`;
+    * the remaining seeds start at the fallback;
+    * all-diverged releases;
+  * each §4b trigger, forced in smoke, writes `STOPPED.json` and releases;
+  * the next run refuses without `ACK_STOP`;
+  * the E3 AS1/DS1 flights pair with R0's by flight condition;
   * no E4 / RL stage runs;
   * the notebook has the CLAUDE.md release code;
   * an old `NOTEBOOK_REV` stops at Setup.
@@ -235,12 +314,44 @@ by its 24 h limit at the latest; Run all resumes.
 
 ---
 
-## 7. Decisions needed from the user before building
+## 7. The user's decisions (2026-11-19)
 
-1. E3 learning-rate fix: the fallback rule (§3, recommended) or re-piloting with the full schedule.
-2. Budget: buy units for full E3, or reduce `mlp_direct` / `gru_pi` seeds (§4).
-3. Optional, exploratory (estimates only, no criterion): fly the finished E3 models on AS1 and DS1 too (~0.5
-   L4-h). It shows whether a non-JEPA model also handles the model error FNPEG cannot. This is new relative to
-   `v5_plan.md` and would need its own §15 entry before any of it flies.
-4. Stop the current Colab run of `ReEntryAI_JEPA_v5.ipynb` (now or after `gru_direct` seed 0) before the new
-   notebook is pushed.
+1. E3 learning rate: left to the plan, documented. **The divergence fallback (§3).**
+2. Budget: the user buys units. **No seeds cut, no arm dropped** (§2.2, §4).
+3. **Fly the E3 models on AS1 and DS1** (§2.2b), with R0 for pairing, as exploratory estimates.
+4. **Stop and disconnect when a run is failing** (§4b). The old notebook's run must be stopped before the new
+   notebook first runs.
+5. **This notebook is the priority.** RL (notebook 2) waits for it.
+
+The `v5_plan.md` §15 entries to write before the first affected run are:
+- the run order (§2.1, §2.2);
+- the learning-rate fallback (§3);
+- E3 + R0 on AS1/DS1 as estimates (§2.2b);
+- the stop rules (§4b, notebook only);
+- RL moving to notebook 2 (§2.4).
+
+## 8. What this notebook can and cannot do for the SpaceJEPA claim
+
+The purpose is to give SpaceJEPA's claim its strongest *fair* test, not to arrange a win. A reviewer will check
+whether the setup was steered after results were seen, so the plan keeps every criterion, seed rule and
+statistic as preregistered. Everything new is an order change, a failure rule that reacts only to non-finite
+losses, or an exploratory estimate written down before its data exists.
+
+**Where the claim stands today (A256, complete data):**
+- v2 beats PredGuid clearly.
+- v2 ties FNPEG on success@5km, and FNPEG's misses are about 3× smaller. G1 does not pass, and this notebook
+  cannot change that.
+
+**Where it can still be strengthened, honestly:**
+- **AS1 (A1, A3, A4):** FNPEG falls to 6% and PredGuid to 15% when the true aerodynamics differ from their
+  model. A learned model trained across a range of lift may hold up. This is the strongest possible result for
+  the claim, and the cheapest to get (~0.3 L4-h, first in the order).
+- **DS1 (D1–D4):** FNPEG holds at 98.4%, so a win there is unlikely. A tie still shows robustness.
+- **G5 (v2 vs `mppi_filtered`):** whether learning beats explicit estimation under the same planner.
+  `mppi_nominal` (36.7%) and `mppi_truth` (96.3%) bracket it. This is the cleanest "the learned model is
+  needed" result.
+- **RQ2 (J-each for `r0_nojepa`):** whether the JEPA objective itself matters. Plus §2.2b: whether the JEPA
+  model is more robust than the non-JEPA ones off the training distribution.
+
+**Every outcome is reported**, including a null or a loss, with the same tables. The §0 table fixes the wording
+in advance.
