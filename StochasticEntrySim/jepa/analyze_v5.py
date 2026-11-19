@@ -135,9 +135,17 @@ def _read(layout) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def load_flights_v5(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4=None) -> pd.DataFrame:
-    """v3's, v4's and v5's flights in one table (v3 and v4 read-only)."""
+def load_flights_v5(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4=None, extra_v5: Sequence = ()) -> pd.DataFrame:
+    """v3's, v4's and v5's flights in one table (v3 and v4 read-only). extra_v5 (notebook 2, jepa/study_rl_v5.py):
+    more v5 folders read only from their flights.csv, as v5 flights; column v5_folder says which folder a v5 row
+    came from (L's own rows: L.root)."""
     parts = []
+    for Lx in extra_v5:
+        dx = _read(Lx)
+        if len(dx):
+            dx["source"] = "v5"
+            dx["v5_folder"] = str(Lx.root)
+            parts.append(dx)
     d3 = _read(L3)
     if len(d3):
         d3["source"] = "v3"
@@ -149,6 +157,8 @@ def load_flights_v5(cfg: S5.StudyConfigV5, L: S5.LayoutV5, L3: S.Layout, L4=None
     d5 = S5.collect_flights(L, write=True)
     if len(d5):
         d5["source"] = "v5"
+        if extra_v5:
+            d5["v5_folder"] = str(L.root)
         parts.append(d5)
     if not parts:
         return pd.DataFrame(columns=["arm", "load", "suite", "seed", "case", "atmosphere", "miss_km", "outcome"])

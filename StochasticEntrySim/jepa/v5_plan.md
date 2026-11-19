@@ -1438,6 +1438,30 @@ saturated.
   passed, ~2.8 h per tuning configuration and ~5.6 h per seed on the CPU (~62 h, ~16 units); BC's clone ~4.5 h
   per seed on the CPU; ppo_hist ~0.35 h per configuration and 3 h per seed (its wall cap) on the L4 (~19 h,
   ~38 units).
+* **2026-11-19, RQ3 moves to notebook 2 with new arms (user decision; written before any notebook-2 tuning,
+  training or flight).** The brief and the build record are `jepa/plan_rl_v5.md`; the notebook is
+  `ReEntryAI_RL_v5.ipynb` (`jepa/build_notebook_v5_rl.py`, logic in `jepa/rl2_v5.py` and `jepa/study_rl_v5.py`),
+  writing to `MyDrive/ReEntryAI_rl_v5` and reading this study's folder read-only. (1) **Arms.** `dagger_fnpeg` and
+  `bcppo_fnpeg` are dropped after the Part B laptop pilots with the fix of commit 5471ceb (DAgger RV1 fail: 0.919
+  vs 0.909, 9.7°; RV2 fail: 0.014 vs FNPEG 0.805; BC → PPO RV1 pass: 0.957 vs 0.818, 5.8°; RV2 fail: 0.031 vs
+  0.805) and are reported as failed gates. They are replaced by `resid_fnpeg` (residual RL on the tuned FNPEG:
+  σ = s_F clip(|σ_F| + b a, 0, 90°), FNPEG keeps the sign and the reversals, zero-initialized last layer so the arm
+  is FNPEG at init; Johannink et al. 2019, Silver et al. 2018) and `liu_track` (Liu-style reference tracking after
+  Liu et al., Adv. Space Res. 77 (2026): bank magnitude only, reversals by FNPEG's tuned heading deadband, Liu's
+  reward with a 4.5 g limit and a 5 km terminal bonus; every adaptation listed in plan_rl_v5.md §1.3). `ppo_hist`
+  stays as preregistered. (2) **RQ3 Holm family** {R-resid_fnpeg, R-liu_track, R-ppo_hist} (was {R-dagger_fnpeg,
+  R-bcppo_fnpeg, R-ppo_hist}); the size stays 3 and an arm that fails its gate enters with p = 1. R-each as §8.3
+  (`v2single − arm` on A256, ≥ 4 of 5 seeds). R-imit is replaced by the estimates `arm − fnpeg` (A256, DS1, AS1,
+  ORB-1 block 1). (3) **Gates.** RI (`resid_fnpeg` at init equals FNPEG bit for bit in the fast env and on DEV48 in
+  the full simulator; a failure is a stop) and RP (an untuned pilot of 2·10⁷ decisions or 1 h on the CPU, judged on
+  512 fixed fast-env episodes against FNPEG alone on the same episodes: `resid_fnpeg` ≥ FNPEG − 2 pp with a rising
+  return, `liu_track` ≥ 50 % of FNPEG, `ppo_hist` the old RV3 **and** ≥ 50 % of FNPEG: RV3 is raised because a pilot
+  passed it at 0.2 %). (4) **Budget rule.** A run's budget is its decision count (`ppo_hist`, `liu_track` 2·10⁸;
+  `resid_fnpeg` 4·10⁶, bound by FNPEG's CPU labels); the wall clock is a safety cap of max(3 h, 1.5 × the time
+  projected at the routed runtime's measured rate), so `ppo_hist`'s preregistered 3 L4-hours are unchanged. Each arm
+  trains on the runtime with fewer units per million decisions (pilot rate on the CPU, a 5-minute timing run on the
+  L4; `01_checks/route_<arm>.json`). (5) **Stop rules** (plan_rl_v5.md §6): technical failures write
+  `00_study/STOPPED.json` and release the runtime; the next session needs `ACK_STOP`. A failed RP is a result.
 
 ---
 
