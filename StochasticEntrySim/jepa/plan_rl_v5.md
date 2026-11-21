@@ -355,3 +355,20 @@ rows (§4.1). In-process and 2-worker labels are identical over 25 decisions of 
 * Notebook 1's own flights of an arm named `resid_fnpeg`, `liu_track` or `ppo_hist` (if any) are dropped from the
   join: RQ3's arms are notebook 2's.
 * No PDF report: the analysis writes CSV tables and a Markdown summary; notebook 1's report can read them later.
+* The notebook's `CPU_WORKERS` can also come from the environment variable `JEPA_RL2_WORKERS` (the smoke run sets
+  it, so a laptop isn't oversubscribed); on Colab it stays unset and full mode uses every core.
+
+**Bug found by the smoke run (fixed before the commit).** Tuning flights named their controller
+`tune_<arm>_cNN`, and `rl_job` wrote that name into `model["rl2"]["arm"]`, so `make_law` fell back to the plain
+policy law and `resid_fnpeg`'s 185-input actor met a 181-input observation. `rl_job` now takes `kind=` (the arm),
+the controller name is unchanged, and `make_law` raises on an arm it doesn't know instead of guessing. The
+flight-error stop rule caught it as designed (`STOPPED.json`, reason `flight_errors`).
+
+**Smoke results (2026-11-21, laptop CPU, numbers meaningless).** `python jepa/smoke_rl_v5.py --units`: 12/12 PASS.
+Notebook smoke (c13): Run all completes every stage (gates: FNPEG fixed 1.000, RI PASS with 4 DEV48 conditions and
+0 differing; RP fails on the tiny budgets as expected, the smoke-only `JEPA_RL2_GATES_PASS` lets the arms go on;
+timing runs; tuning, training and 13 flights per arm; analysis of 89 flights) in ~100 min, the second Run all only
+skips and reports (0.7 min) and both release the runtime. c12: `05_analysis/tables/RQ3_criteria.csv` has the three
+rows with Holm over 3. Flights of `resid_fnpeg` are the slow part (~7 min per flight on the laptop, FNPEG runs
+inside every decision); suites of one arm fly one after another, so the small DS1/AS1/ORB-1 smoke suites leave
+workers idle (on Colab the suites are large enough that this costs little).

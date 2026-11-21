@@ -260,6 +260,9 @@ def c8(fn, root):
     assert all(int(x["block"]) == 0 for x in o)
     d = SR.flight_jobs(cfg, L, "resid_fnpeg", "DS1", fn)
     assert all(int(x["seed"]) == int(x["case"]) % 5 for x in d)
+    t = SR.rl_job(S5.conditions(v5, "DEV48")[0], "tune_resid_fnpeg_c00", "tuning", "p.pt", 0, {}, fn,
+                  kind="resid_fnpeg")
+    assert t["controller"] == "tune_resid_fnpeg_c00" and t["model"]["rl2"]["arm"] == "resid_fnpeg"
     assert SR.flight_jobs(cfg, L, "liu_track", "A256", fn) == []          # failed its gate
     assert SR.flight_jobs(cfg, L, "dagger_fnpeg", "A256", fn) == []       # dropped
     assert SR.flight_jobs(cfg, L, "ppo_hist", "A256", fn) == []           # not gated yet
@@ -375,7 +378,8 @@ def run_notebook(root: Path, jroot: Path, tag: str) -> Path:
     out = root / "nb_runs"
     out.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "JEPA_RL2_MODE": "smoke", "JEPA_RL2_ROOT": str(rl_root), "JEPA_V5_ROOT": str(jroot),
-           SR.GATES_PASS_ENV: "1", "PYTHONIOENCODING": "utf-8"}
+           SR.GATES_PASS_ENV: "1", "PYTHONIOENCODING": "utf-8",
+           "JEPA_RL2_WORKERS": str(max(2, min(6, (os.cpu_count() or 2) // 2)))}
     env.pop("JEPA_V3_ROOT", None)
     env.pop("JEPA_V4_ROOT", None)
     t0 = time.time()

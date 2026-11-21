@@ -530,9 +530,11 @@ def seed_of(cfg: RLStudyConfig, cond: dict) -> int:
     return int(s[int(cond.get("train_seed", cond["case"])) % len(s)])
 
 
-def rl_job(cond: dict, arm: str, stage: str, path, seed: int, kw: dict, fn: dict) -> dict:
+def rl_job(cond: dict, arm: str, stage: str, path, seed: int, kw: dict, fn: dict, kind: Optional[str] = None) -> dict:
+    """A flight of controller `arm` (its name in the results, e.g. tune_resid_fnpeg_c00) flown as notebook-2 arm
+    `kind` (default: arm), which selects the law (rl2_v5.make_law)."""
     j = S5.policy_job(cond, arm, stage, str(path), seed)
-    j["model"]["rl2"] = {"arm": arm, "fnpeg_cfg": dict(fn), **{k: v for k, v in kw.items()}}
+    j["model"]["rl2"] = {"arm": kind or arm, "fnpeg_cfg": dict(fn), **{k: v for k, v in kw.items()}}
     return j
 
 
@@ -701,7 +703,7 @@ def tune(cfg: RLStudyConfig, L: S5.LayoutV5, arm: str, fn: dict, device, workers
             score = {"n": 0, "success_5km": 0.0, "mean_log_miss": 99.0, "mean_peak_g": 99.0,
                      "median_miss_km": float("nan"), "stopped": note}
         else:
-            js = [rl_job(cd, f"tune_{arm}_c{j:02d}", "tuning", d / "policy.pt", 0, kw, fn) for cd in dev]
+            js = [rl_job(cd, f"tune_{arm}_c{j:02d}", "tuning", d / "policy.pt", 0, kw, fn, kind=arm) for cd in dev]
             run_flights(cfg, L, js, workers, log, f"tuning {arm} config {j}")
             rs = S5._results(L, js)
             if len(rs) < len(js):

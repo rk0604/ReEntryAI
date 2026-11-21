@@ -164,7 +164,7 @@ SR.check_stopped(L, ACK_STOP, LOG)        # a stopped study refuses to continue 
 REPAIR = S5.repair(L, LOG)
 FN = SR.fnpeg_input(L, J, LOG)            # FNPEG's tuned configuration (notebook 1), copied with its SHA-256
 FROZEN = SR.freeze(CFG, L, inputs={"jepa_v5": JEPA_ROOT, "v3": V3_ROOT, "v4": V4_ROOT})
-CPU_WORKERS = CPU_WORKERS or (CPUS if MODE == "full" else min(2, CPUS))
+CPU_WORKERS = CPU_WORKERS or int(os.environ.get("JEPA_RL2_WORKERS", "0")) or (CPUS if MODE == "full" else min(2, CPUS))
 KIND = SR.runtime_kind(DEVICE, RUNTIME)  # "cpu" | "L4"
 if DEVICE == "cuda":
     S5.check_gpu_platform(L, RUNTIME, GPU_TYPE, {"torch": torch.__version__, "cuda": torch.version.cuda}, LOG)

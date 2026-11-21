@@ -887,6 +887,8 @@ def make_law(model: dict, device="cpu"):
         return LiuLaw(model["path"], r2["fnpeg_cfg"], device)
     if arm == "fnpeg":
         return F5.make_law("fnpeg", r2["fnpeg_cfg"], device)
+    if arm not in (None, "ppo_hist"):
+        raise ValueError(f"unknown notebook-2 arm {arm!r} in a flight job (model['rl2']['arm'])")
     return F5.make_law("policy", {"path": model["path"], "legacy": False}, device)
 
 
