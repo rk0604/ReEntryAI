@@ -25,7 +25,7 @@ sys.path.insert(0, HERE)
 from build_notebooks_v3 import AUTO_DISCONNECT_CODE, DONE, DONE_MD  # noqa: E402
 
 NAME = "ReEntryAI_JEPA_v5_needed.ipynb"
-BRANCH = "space-jepa5"
+BRANCH = "space-jepa5-needed"   # until merged into space-jepa5 (then change back)
 BADGE = ("[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)]"
          f"(https://colab.research.google.com/github/rk0604/ReEntryAI/blob/{BRANCH}/StochasticEntrySim/{NAME})")
 E3_ORDER = ("r0_nojepa", "gru_direct", "mlp_direct", "gru_pi")      # study_v5.NEEDED_E3_ORDER (checked in smoke 18)
@@ -104,13 +104,13 @@ NOTEBOOK_REV = 3                # this notebook's revision (an old copy stops at
 """
 
 SETUP = r"""
-BRANCH = "space-jepa5"
+BRANCH = "space-jepa5-needed"   # until merged into space-jepa5 (then change back)
 if IN_COLAB:
     REPO = "/content/ReEntryAI_v5"
     if not os.path.exists(REPO):
         !git clone -q -b {BRANCH} https://github.com/rk0604/ReEntryAI.git {REPO}
     else:
-        !git -C {REPO} pull -q origin {BRANCH}
+        !git -C {REPO} fetch -q origin {BRANCH} && git -C {REPO} checkout -q -B {BRANCH} FETCH_HEAD
     %pip install -q pymsis reportlab
     os.chdir(f"{REPO}/StochasticEntrySim")
     from google.colab import drive
@@ -370,7 +370,7 @@ trigger id to continue.
     ("md", r"""
 ## 1. Setup
 
-Clones (or pulls) `space-jepa5`, installs `pymsis` and `reportlab`, mounts Drive, opens the v3 and v4 folders
+Clones (or updates) `space-jepa5-needed`, installs `pymsis` and `reportlab`, mounts Drive, opens the v3 and v4 folders
 read-only. Registers the auto-disconnect hook first (CLAUDE.md), so a failure anywhere in Setup releases the runtime
 too; checks the notebook's revision (an old copy stops here); **stops if an earlier session ended on a stop rule**
 and `ACK_STOP` does not name it; starts the watchdog, the session budget and the stop rules; repairs the v5 folder
