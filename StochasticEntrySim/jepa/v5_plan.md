@@ -1462,6 +1462,20 @@ saturated.
   trains on the runtime with fewer units per million decisions (pilot rate on the CPU, a 5-minute timing run on the
   L4; `01_checks/route_<arm>.json`). (5) **Stop rules** (plan_rl_v5.md §6): technical failures write
   `00_study/STOPPED.json` and release the runtime; the next session needs `ACK_STOP`. A failed RP is a result.
+* **2026-11-21, notebook 2: extended pilot RPX for the arms that failed RP (user decision; written after the RP
+  results and before any extended run).** RP results (Colab High-RAM CPU, 512 fixed episodes, FNPEG 0.797):
+  `resid_fnpeg` 0.795 pass; `liu_track` 0.100 fail (bar 0.398; 2·10⁷ decisions, return 1.67 → 2.41, flat over the
+  last 20 updates); `ppo_hist` 0.000 fail (return −136 → +0.98, still rising, no training flight within 5 km).
+  The pilots used 10 % of these arms' 2·10⁸-decision budget, so each failed arm runs once more at its **full
+  budget**: seed 0, the pilot's untuned settings, a fresh run, the budget rule of entry 2026-11-19 (4) and the
+  same training check as a full training run, on the runtime the routing picks (a 5-minute L4 timing run first).
+  The final policy is judged by the arm's own RP rule on the same 512 episodes against the same FNPEG 0.797; ten
+  snapshots are scored on the same episodes for the learning curve. **Pass:** the arm tunes, trains seeds 0–4 and
+  flies every suite, and `v2single − arm` is reported as **exploratory** (unadjusted p, labelled). **RQ3's
+  confirmatory family is unchanged**: {R-resid_fnpeg, R-liu_track, R-ppo_hist}, and an arm that failed RP enters it
+  with p = 1 whatever RPX shows (a gate relaxed after seeing its result must not change the confirmatory test).
+  **Fail:** the arm is reported as not reaching competence at its full budget, with both gates' numbers.
+  Details: plan_rl_v5.md §3.1.
 
 ---
 

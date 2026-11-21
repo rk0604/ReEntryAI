@@ -2,7 +2,7 @@
 jepa/smoke_rl_v5.py: notebook 2's smoke checks (jepa/plan_rl_v5.md section 7). CPU, numbers meaningless.
 
     python jepa/smoke_rl_v5.py            (from StochasticEntrySim/; ~1 h: FNPEG's labels are slow at tiny batches)
-    python jepa/smoke_rl_v5.py --units    (checks 1-11 without executing the notebook)
+    python jepa/smoke_rl_v5.py --units    (checks 1-12 and 14 without executing the notebook)
 
 Works in a temporary folder (JEPA_RL2_SMOKE_DIR, default <tmp>/jepa_rl2_smoke): a fixture of notebook 1's folder
 (FNPEG's tuned chosen.json and a synthetic flights.csv of fnpeg and v2single on the smoke suites, read only) and
@@ -352,6 +352,65 @@ def c11():
         pass
 
 
+@check(14, "extended pilot RPX: due only after a finite failed RP, runs at the arm's full budget with its snapshots "
+           "scored, decides the gate, keeps RQ3's confirmatory p = 1, adds an exploratory row; settings amendment")
+def c14(fn, root):
+    os.environ.pop(SR.GATES_PASS_ENV, None)
+    L = S5.LayoutV5(root / "c14").make()
+    cfg = SR.RLStudyConfig.smoke()
+    L.write_json(SR._pilots(L) / "fnpeg_fixed.json", {"success_5km_fast": 0.5})
+    L.write_json(L.checks / "RP_resid_fnpeg.json", {"arm": "resid_fnpeg", "passed": True})
+    L.write_json(L.checks / "RP_liu_track.json", {"arm": "liu_track", "passed": False, "finite": False})
+    L.write_json(L.checks / "RP_ppo_hist.json", {"arm": "ppo_hist", "passed": False, "finite": True,
+                                                  "success_5km_fixed": 0.0, "reason": "pilot 0.000"})
+    assert not SR.rpx_due(cfg, L, "resid_fnpeg") and not SR.rpx_due(cfg, L, "liu_track")   # passed / non-finite
+    assert SR.rpx_pending(cfg, L, "ppo_hist") and SR.gate_passed(cfg, L, "ppo_hist") is None
+    assert SR.gate_passed(cfg, L, "liu_track") is False and not SR.flight_jobs(cfg, L, "ppo_hist", "A256", fn)
+    assert "timing ppo_hist" in SR.next_pass(cfg, L, fn)
+    for rt, dps in (("cpu", 1000.0), ("L4", 1500.0)):         # the CPU is cheaper per million: RPX routes there
+        L.write_json(SR._rate_path(L, "ppo_hist", rt), {"decisions_per_s": dps, "units_per_hour": cfg.units_per_hour[rt]})
+    assert SR.route(L, "ppo_hist")["runtime"] == "cpu"
+    assert "CPU pass" in SR.next_pass(cfg, L, fn) and "extended pilot ppo_hist" in SR.next_pass(cfg, L, fn)
+    doc = SR.gate_rpx(cfg, L, "ppo_hist", fn, "cpu", 1, "cpu", log=lambda *a: None)
+    full, _ = SR.arm_settings(cfg, L, "ppo_hist", tuned=False)
+    assert doc["gate"] == "RPX" and doc["run"]["budget_decisions"] == full.budget_decisions, doc["run"]
+    assert doc["run"]["decisions"] >= full.budget_decisions and doc["reached"] == "the full budget", doc
+    assert len(doc["fixed_curve"]) == cfg.rpx_snapshots, doc["fixed_curve"]
+    assert doc["fnpeg_success_5km_fixed"] == 0.5 and (L.checks / "RPX_ppo_hist.json").exists()
+    assert not SR.rpx_pending(cfg, L, "ppo_hist")
+    assert SR.gate_passed(cfg, L, "ppo_hist") is bool(doc["passed"])
+    assert SR.gate_rpx(cfg, L, "ppo_hist", fn, "cpu", 1, "cpu") == json.loads((L.checks / "RPX_ppo_hist.json").read_text())
+    # a passing RPX: the arm goes on (tuning, flights) and is exploratory; RQ3's confirmatory row stays at p = 1
+    L.write_json(L.checks / "RPX_ppo_hist.json", {**doc, "passed": True})
+    assert SR.gate_passed(cfg, L, "ppo_hist") is True and SR.exploratory(cfg, L, "ppo_hist")
+    t = pd.DataFrame([{"id": "R-ppo_hist", "metric": "success5", "atmosphere": "all", "diff": 20.0, "ci_lo": 5.0,
+                       "ci_hi": 30.0, "p_boot": 0.01, "n_seeds": 5, "seeds_holding": 5, "complete": True,
+                       "n_pairs": 1280, "n_expected": 1280}])
+    c = SR.criteria_rq3(cfg, L, t)
+    r = c[c.id == "R-ppo_hist"].iloc[0]
+    assert r.p == 1.0 and r.p_holm == 1.0 and r.met is None and "RPX passed" in r.status, r.to_dict()
+    x = SR.exploratory_rq3(cfg, L, t)
+    assert list(x.id) == ["X-ppo_hist"] and x.iloc[0].p_unadjusted == 0.01 and x.iloc[0].status == "exploratory"
+    st = SR.status(cfg, L, fn)
+    assert {a["arm"]: a["RPX"] for a in st["arms"]} == {"resid_fnpeg": "-", "liu_track": "-",
+                                                         "ppo_hist": "pass (exploratory)"}, st["arms"]
+    # settings amendment: a folder frozen before rpx_arms existed takes it and records it; a changed value refuses
+    L2 = S5.LayoutV5(root / "c14_freeze").make()
+    SR.freeze(cfg, L2)
+    fz = json.loads((L2.study / "study_config.json").read_text())
+    for k in SR.AMENDED_KEYS:
+        fz["config"].pop(k)
+    L2.write_json(L2.study / "study_config.json", fz)
+    SR.freeze(cfg, L2)
+    fz = json.loads((L2.study / "study_config.json").read_text())
+    assert fz["config"]["rpx_arms"] == list(cfg.rpx_arms) and fz["amendments"][0]["keys"].keys() == SR.AMENDED_KEYS.keys()
+    try:
+        SR.freeze(replace(cfg, rpx_arms=("ppo_hist",)), L2)
+        raise AssertionError("a changed rpx_arms was accepted")
+    except ValueError:
+        pass
+
+
 @check(12, "the analysis builds the RQ3 table with Holm over 3 (a missing arm counts as p = 1)")
 def c12(root, run_dir=None):
     L = S5.LayoutV5(root / "c12").make()
@@ -406,6 +465,9 @@ def c13(root, jroot, box):
         assert (L.checks / f"RP_{arm}.json").exists(), arm
         assert (L.checks / f"route_{arm}.json").exists(), arm
         assert (L.tuning / SR.tmethod(arm) / "chosen.json").exists() or SR.tuning_stopped(L, arm), arm
+        rp = json.loads((L.checks / f"RP_{arm}.json").read_text())
+        if arm in SR.RLStudyConfig.smoke().rpx_arms and not rp["passed"]:
+            assert (L.checks / f"RPX_{arm}.json").exists(), f"{arm}: RP failed but no extended pilot"
     st = json.loads((L.study / "status.json").read_text())
     print(pd.DataFrame(st["arms"]).to_string(), flush=True)
     t0 = time.time()
@@ -435,6 +497,7 @@ def main() -> int:
     c1(fn)
     c4(fn, root)
     c2(fn)
+    c14(fn, root)
     box = {}
     if not units:
         c13(root, jroot, box)

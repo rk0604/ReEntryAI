@@ -157,6 +157,30 @@ reference (`01_checks/rl2_pilots/fnpeg_fixed.json`, computed once).
 * A failed RI is a **technical failure** (the code does not do what it claims): stop rule (§6).
 * Gate files: `01_checks/RI_resid_fnpeg.json`, `01_checks/RP_<arm>.json`; deleting one reruns its pilot.
 
+### 3.1 Extended pilot RPX (added 2026-11-21, after the RP results, before any extended run)
+
+RP on Colab's High-RAM CPU (FNPEG 0.797 on the 512 episodes): `resid_fnpeg` 0.795 **pass**; `liu_track` 0.100
+**fail** (bar 0.398; return 1.67 → 2.41, flat over its last 20 updates); `ppo_hist` 0.000 **fail** (return
+−136 → +0.98, still rising; no training flight within 5 km). Both failed pilots used 2·10⁷ decisions, 10 % of
+their full budget, so the obvious objection is "not trained long enough". RPX answers it once:
+
+| | |
+|---|---|
+| Arms | those in `RLStudyConfig.rpx_arms` (`liu_track`, `ppo_hist`) whose RP failed with finite weights |
+| Run | seed 0, the pilot's untuned settings, a fresh run (`01_checks/rl2_pilots/<arm>_full/`), the arm's **full budget** (2·10⁸ decisions) with §4.1's wall-clock rule and the same training check as a full training run |
+| Runtime | the routed one (§3's cost rule; a 5-minute L4 timing run first, as for a passing arm) |
+| Verdict | the arm's own RP rule on the final policy: same 512 episodes, same FNPEG reference, same bar (`ppo_hist` also the old RV3) |
+| Learning curve | 10 snapshots, each scored on the same 512 episodes (`01_checks/RPX_<arm>.json`, `fixed_curve`) |
+| Pass | the arm tunes, trains seeds 0–4 and flies every suite like a passing arm; `v2single − arm` is **exploratory** (`05_analysis/tables/RQ3_exploratory.csv`: unadjusted p, labelled) |
+| Fail | a result: "no competence at the full budget", reported with both gates' numbers |
+
+**RQ3's confirmatory family does not change:** an arm that failed RP enters Holm with p = 1 whatever RPX shows.
+Relaxing a gate after seeing its result must not change the confirmatory test; RPX can only add an exploratory row.
+
+Cost: at the CPU pilots' rates (`ppo_hist` ~12,500, `liu_track` ~9,900 decisions/s) about 4.4 h and 5.6 h on the
+High-RAM CPU (~2.6 units together); on the L4 about 1–1.5 h each (~5 units). The routing picks the cheaper. An arm
+that passes then costs its tuning and five seeds (~13–15 units).
+
 **Cost per million decisions.** Each pilot records decisions per second on its CPU runtime. On the first L4 pass, each
 arm that passed its gate runs a 5-minute timing run on the L4 (`01_checks/rl2_rates/<arm>_L4.json`). Units per
 million decisions = 10⁶ / (decisions/s) / 3,600 × the runtime's units per hour (L4 1.98; High-RAM CPU 0.26). The
@@ -372,3 +396,14 @@ skips and reports (0.7 min) and both release the runtime. c12: `05_analysis/tabl
 rows with Holm over 3. Flights of `resid_fnpeg` are the slow part (~7 min per flight on the laptop, FNPEG runs
 inside every decision); suites of one arm fly one after another, so the small DS1/AS1/ORB-1 smoke suites leave
 workers idle (on Colab the suites are large enough that this costs little).
+
+**Extended pilot RPX (built 2026-11-21, §3.1).** `study_rl_v5.gate_rpx` (with `_pilot_run`, shared with `gate_rp`),
+`rpx_due`, `rpx_pending`, `exploratory`, `exploratory_rq3`; `gate_passed` now returns RPX's verdict for an arm whose
+RP failed (None while it waits); `timing_run` also runs for an arm waiting for its RPX; `criteria_rq3` keeps an arm
+that failed RP at p = 1 even when RPX passed (its comparison goes to `RQ3_exploratory.csv`); status has an RPX
+column; `next_pass` lists the extended pilots. New settings `rpx_arms` and `rpx_snapshots` are `AMENDED_KEYS`: a
+folder frozen before them (the user's, after the RP pass) takes them and records an `amendments` entry in
+`00_study/study_config.json`; a different frozen value still refuses. Notebook revision 2 (cell 4b, 23 cells), so
+an open revision-1 copy stops at Setup. Smoke check 14 covers the rule (due only after a finite failed RP; the
+full budget and its snapshots scored; the verdict decides the gate; confirmatory p = 1; the exploratory row; the
+amendment), and check 13 now requires an RPX file for each smoke arm that failed RP.

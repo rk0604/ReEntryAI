@@ -23,7 +23,7 @@ from build_notebooks_v3 import AUTO_DISCONNECT_CODE, DONE, DONE_MD  # noqa: E402
 
 NAME = "ReEntryAI_RL_v5.ipynb"
 BRANCH = "space-jepa5"
-REV = 1                                   # must equal study_rl_v5.NOTEBOOK_REV_RL (smoke check 11)
+REV = 2                                   # must equal study_rl_v5.NOTEBOOK_REV_RL (smoke check 11)
 BADGE = ("[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)]"
          f"(https://colab.research.google.com/github/rk0604/ReEntryAI/blob/{BRANCH}/StochasticEntrySim/{NAME})")
 
@@ -57,9 +57,9 @@ checkpoint (at most 5 minutes lost). The notebook **disconnects itself** when th
 
 **Passes (switch the runtime type yourself).** (1) **CPU**: FNPEG on the 512 fixed episodes, gate RI, the three
 pilots (gate RP, ~1 h each) and their CPU rates; no L4 time is spent before the gates. (2) **L4**
-(`GPU_TYPE = "L4"`): a 5-minute timing run per arm that passed, then tuning and training of the arms routed to the
-L4 (the cheaper runtime per million decisions, frozen in `01_checks/route_<arm>.json`); it releases itself when its
-GPU work is done. (3) **CPU**: tuning and training of CPU-routed arms (`resid_fnpeg` is expected here: FNPEG's labels
+(`GPU_TYPE = "L4"`): a 5-minute timing run per arm that passed (or waits for its extended pilot RPX), then the
+extended pilots, tuning and training of the arms routed to the L4 (the cheaper runtime per million decisions, frozen in `01_checks/route_<arm>.json`); it releases itself when its
+GPU work is done. (3) **CPU**: extended pilots, tuning and training of CPU-routed arms (`resid_fnpeg` is expected here: FNPEG's labels
 are CPU work), the full-simulator flights (A256, DS1, AS1, ORB-1 block 1) and the analysis. Status cell and
 `00_study/RUN_SUMMARY.txt` say what the next pass must do. Notebook 1 (`ReEntryAI_JEPA_v5`) has priority on the L4
 and must have tuned FNPEG first.
@@ -201,7 +201,7 @@ if ON_CPU or MODE == "smoke":
             SR.gate_ri(CFG, L, FN, CPU_WORKERS, log)
         for arm in CFG.arms:
             SR.gate_rp(CFG, L, arm, FN, "cpu", CPU_WORKERS, "cpu", log)
-elif any(SR.gate_passed(CFG, L, a) is None for a in CFG.arms):
+elif any(SR._rp_doc(L, a) is None for a in CFG.arms):
     print("the gates run on a CPU runtime first; this L4 session does only the arms whose gates are done")
 G = [json.loads(p.read_text()) for p in sorted(L.checks.glob("RP_*.json"))]
 if G:
@@ -220,6 +220,26 @@ for arm in CFG.arms:
     R.append({"arm": arm, "route": (r or {}).get("runtime", "waits for both rates"),
               **{f"{k}_units_per_million": v for k, v in ((r or {}).get("units_per_million") or {}).items()}})
 display(pd.DataFrame(R))
+"""
+
+RPX = r"""
+log = L.logger("gates")
+for arm in CFG.arms:
+    if not SR.rpx_pending(CFG, L, arm):
+        continue
+    if here(arm):
+        with SR.stage(L, CFG, f"extended pilot {arm}", log):
+            SR.gate_rpx(CFG, L, arm, FN, device_for(arm), CPU_WORKERS, KIND, log)
+    else:
+        r = SR.route(L, arm)
+        print(f"extended pilot {arm}: " + (f"runs on the {r['runtime']} runtime (its route)" if r else
+                                           "waits for its L4 timing run (routing needs both rates)"))
+X = [json.loads(p.read_text()) for p in sorted(L.checks.glob("RPX_*.json"))]
+if X:
+    display(pd.DataFrame([{"arm": x["arm"], "passed": x["passed"], "reached": x.get("reached"),
+                           "success_5km_fixed": x.get("success_5km_fixed"), "bar": x.get("bar"),
+                           "curve": ", ".join(f"{c['decisions']:,}: {c['success_5km_fixed']:.3f}"
+                                              for c in x.get("fixed_curve", []))} for x in X]))
 """
 
 TRAIN = r"""
@@ -305,6 +325,18 @@ On the L4: a 5-minute timing run for each arm that passed its gate. Units per mi
 rates exist.
 """),
     ("code", ROUTING),
+    ("md", r"""
+## 4b. Extended pilot RPX (full budget, on each arm's routed runtime)
+
+Added 2026-11-21 after the RP results (`jepa/plan_rl_v5.md` §3.1, `v5_plan.md` §15). An arm that failed RP
+(`liu_track`, `ppo_hist`) runs once more untuned, seed 0, at its **full budget** (2·10⁸ decisions; the same
+wall-clock rule and training check as a full training run), on the runtime its routing picks (so it first needs
+its L4 timing run). The final policy is judged by the arm's RP rule on the same 512 episodes against the same FNPEG
+reference; 10 snapshots are scored on them too (the learning curve, `01_checks/RPX_<arm>.json`). **Pass:** the arm
+tunes, trains and flies, and its comparison with v2 is **exploratory** (RQ3's confirmatory test keeps it at p = 1).
+**Fail:** a result, "no competence at the full budget".
+"""),
+    ("code", RPX),
     ("md", r"""
 ## 5. Tuning and training (on each arm's routed runtime)
 

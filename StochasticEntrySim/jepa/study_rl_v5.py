@@ -44,7 +44,7 @@ from jepa import runguard_v5 as RG
 from jepa import study_v5 as S5
 from jepa.models_v5 import fail_point
 
-NOTEBOOK_REV_RL = 1           # ReEntryAI_RL_v5.ipynb's revision; an older copy stops at Setup
+NOTEBOOK_REV_RL = 2           # ReEntryAI_RL_v5.ipynb's revision; an older copy stops at Setup
 ARMS = R2.ARMS
 SUITES = ("A256", "DS1", "AS1", "ORB1")
 
@@ -79,6 +79,10 @@ STOP_TRIGGERS = {
 }
 GATES_PASS_ENV = "JEPA_RL2_GATES_PASS"   # smoke only ("1"): a failed RP still lets its arm tune, train and fly
 RUNTIME_KEYS = ("guidance_batch",)
+# Settings added after a folder may have been frozen: a frozen study_config.json without the key takes the new value
+# and records the amendment (00_study/study_config.json "amendments"); a different frozen value still refuses.
+AMENDED_KEYS = {"rpx_arms": "2026-11-21: extended pilot RPX (plan_rl_v5.md section 3.1, v5_plan.md section 15)",
+                "rpx_snapshots": "2026-11-21: extended pilot RPX (plan_rl_v5.md section 3.1)"}
 
 
 # ============================================================================
@@ -108,6 +112,8 @@ class RLStudyConfig:
     ri_n: int = 64
     ri_steps: int = 400
     timing_min: float = 5.0
+    rpx_arms: Tuple[str, ...] = ("liu_track", "ppo_hist")   # extended pilot at the full budget after a failed RP (3.1)
+    rpx_snapshots: int = 10                              # RPX policies scored on the fixed episodes along the run
     # tuning (section 4.2)
     tune_n: int = 12
     tune_frac: float = 0.1
@@ -135,7 +141,7 @@ class RLStudyConfig:
             mode="smoke", rl_seeds=(0,), rl=rl,
             rl_arms={"resid_fnpeg": {"n_envs": 8, "n_steps": 4, "budget_decisions": 96, "critic_warmup_updates": 1},
                      "liu_track": {}, "ppo_hist": {}},
-            pilot_decisions=128, pilot_hours=0.2, fixed_n=8, ri_n=4, ri_steps=30, timing_min=0.1, tune_n=2,
+            pilot_decisions=128, pilot_hours=0.2, rpx_snapshots=2, fixed_n=8, ri_n=4, ri_steps=30, timing_min=0.1, tune_n=2,
             tune_frac=0.5, wall_min_h=0.5, fast_eval_episodes=8, n_boot=200, guidance_batch=4)
 
     def v5(self) -> S5.StudyConfigV5:
@@ -192,8 +198,15 @@ def freeze(cfg: RLStudyConfig, L: S5.LayoutV5, inputs: Optional[dict] = None) ->
     want = json.loads(json.dumps(asdict(cfg), default=list))
     if path.exists():
         have = json.loads(path.read_text())
+        new = {k: v for k, v in want.items() if k in AMENDED_KEYS and k not in have["config"]}
         diff = {k: (have["config"].get(k), v) for k, v in want.items()
-                if k not in RUNTIME_KEYS and have["config"].get(k) != v}
+                if k not in RUNTIME_KEYS and k not in new and have["config"].get(k) != v}
+        if not diff and new:
+            have["config"].update(new)
+            have.setdefault("amendments", []).append({"keys": new, "why": {k: AMENDED_KEYS[k] for k in new},
+                                                      "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                                      "git_commit": S5._GIT.get()})
+            L.write_json(path, have)
         if diff:
             raise ValueError(f"settings differ from the frozen {path}: {diff}. This folder was started with git commit "
                              f"{str(have.get('git_commit', '?'))[:10]}; continue it with that commit or start a new "
@@ -425,27 +438,14 @@ def _curve_rows(d: Path) -> List[dict]:
     return list(RL.Curve(st["curve"]).rows), st
 
 
-def gate_rp(cfg: RLStudyConfig, L: S5.LayoutV5, arm: str, fn: dict, device, workers: int, runtime: str,
-            log=print) -> Optional[dict]:
-    """Gate RP: the arm's untuned pilot (seed 0, 2e7 decisions or 1 h) against FNPEG on the fixed episodes. A failed
-    RP is a result (the arm gets no tuning, training or flights); non-finite weights or returns are rl_nonfinite.
-    Also the pilot's decisions per second on this runtime (01_checks/rl2_rates/<arm>_<runtime>.json)."""
-    p = L.checks / f"RP_{arm}.json"
-    if p.exists():
-        return json.loads(p.read_text())
-    if arm == "resid_fnpeg":
-        ri = L.checks / "RI_resid_fnpeg.json"
-        if not ri.exists() or not json.loads(ri.read_text())["passed"]:
-            log("[gates] resid_fnpeg's pilot waits for gate RI")
-            return None
-    ref = fnpeg_fixed(cfg, L, fn, workers, log)
-    rc, kw = arm_settings(cfg, None, arm, {"seed": 0, "label_workers": int(workers),
-                                           "budget_decisions": int(cfg.pilot_decisions),
-                                           "budget_hours": float(cfg.pilot_hours), "curve_points": 0}, tuned=False)
-    d = _pilots(L) / arm
+def _pilot_run(cfg: RLStudyConfig, L: S5.LayoutV5, arm: str, fn: dict, device, workers: int, d: Path, extra: dict,
+               label: str, log=print):
+    """One untuned seed-0 run of an arm into d (resumable): (curve rows, train state, final actor, decisions, seconds,
+    the training check's reason or None, RLCfg, arm settings)."""
+    rc, kw = arm_settings(cfg, None, arm, {"seed": 0, "label_workers": int(workers), **extra}, tuned=False)
     why = None
     try:
-        info = R2.train_dir(L, d, arm, rc, device, fn, kw, log, label=f"pilot {arm}")
+        info = R2.train_dir(L, d, arm, rc, device, fn, kw, log, label=label)
     except RL.RLStopped as e:
         why, info = str(e), {}
     rows, st = _curve_rows(d)
@@ -456,7 +456,33 @@ def gate_rp(cfg: RLStudyConfig, L: S5.LayoutV5, arm: str, fn: dict, device, work
         actor = R2.make_actor(arm, rc, kw).to(device)
         actor.load_state_dict(st["actor"])
         actor.eval()
-    finite = all(bool(torch.isfinite(q).all()) for q in actor.parameters())
+    return rows, st, actor, dec, secs, why, rc, kw
+
+
+def _finite(actor) -> bool:
+    return all(bool(torch.isfinite(q).all()) for q in actor.parameters())
+
+
+def gate_rp(cfg: RLStudyConfig, L: S5.LayoutV5, arm: str, fn: dict, device, workers: int, runtime: str,
+            log=print) -> Optional[dict]:
+    """Gate RP: the arm's untuned pilot (seed 0, 2e7 decisions or 1 h) against FNPEG on the fixed episodes. A failed
+    RP is a result (the arm gets no tuning, training or flights, unless its extended pilot RPX passes); non-finite
+    weights or returns are rl_nonfinite. Also the pilot's decisions per second on this runtime
+    (01_checks/rl2_rates/<arm>_<runtime>.json)."""
+    p = L.checks / f"RP_{arm}.json"
+    if p.exists():
+        return json.loads(p.read_text())
+    if arm == "resid_fnpeg":
+        ri = L.checks / "RI_resid_fnpeg.json"
+        if not ri.exists() or not json.loads(ri.read_text())["passed"]:
+            log("[gates] resid_fnpeg's pilot waits for gate RI")
+            return None
+    ref = fnpeg_fixed(cfg, L, fn, workers, log)
+    rows, st, actor, dec, secs, why, rc, kw = _pilot_run(
+        cfg, L, arm, fn, device, workers, _pilots(L) / arm,
+        {"budget_decisions": int(cfg.pilot_decisions), "budget_hours": float(cfg.pilot_hours), "curve_points": 0},
+        f"pilot {arm}", log)
+    finite = _finite(actor)
     rate = {"arm": arm, "runtime": runtime, "decisions_per_s": dec / max(secs, 1e-9), "decisions": dec,
             "train_s": secs, "units_per_hour": float(cfg.units_per_hour[runtime]), "source": "pilot",
             "n_envs": int(rc.n_envs), "label_workers": int(workers), "device": str(device),
@@ -482,15 +508,113 @@ def gate_rp(cfg: RLStudyConfig, L: S5.LayoutV5, arm: str, fn: dict, device, work
     return doc
 
 
-def gate_passed(cfg: RLStudyConfig, L: S5.LayoutV5, arm: str) -> Optional[bool]:
-    """RP's verdict (None: not run yet). Smoke mode with JEPA_RL2_GATES_PASS=1 lets a failed arm go on."""
+def _rp_doc(L, arm) -> Optional[dict]:
     p = L.checks / f"RP_{arm}.json"
-    if not p.exists():
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def _rpx_doc(L, arm) -> Optional[dict]:
+    p = L.checks / f"RPX_{arm}.json"
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def _smoke_pass(cfg: RLStudyConfig) -> bool:
+    return cfg.mode == "smoke" and os.environ.get(GATES_PASS_ENV) == "1"
+
+
+def rpx_due(cfg: RLStudyConfig, L: S5.LayoutV5, arm: str) -> bool:
+    """Does the arm get the extended pilot (plan section 3.1)? Its RP failed with finite weights and it is in
+    cfg.rpx_arms."""
+    g = _rp_doc(L, arm)
+    return bool(arm in cfg.rpx_arms and g is not None and not g["passed"] and g.get("finite", True))
+
+
+def rpx_pending(cfg: RLStudyConfig, L: S5.LayoutV5, arm: str) -> bool:
+    return rpx_due(cfg, L, arm) and _rpx_doc(L, arm) is None
+
+
+def exploratory(cfg: RLStudyConfig, L: S5.LayoutV5, arm: str) -> bool:
+    """An arm that failed RP and passed RPX: it trains and flies, and its comparisons are exploratory only."""
+    x = _rpx_doc(L, arm)
+    return bool(rpx_due(cfg, L, arm) and x is not None and x["passed"])
+
+
+def gate_rpx(cfg: RLStudyConfig, L: S5.LayoutV5, arm: str, fn: dict, device, workers: int, runtime: str,
+             log=print) -> Optional[dict]:
+    """Extended pilot RPX (plan section 3.1): an arm that failed RP runs once more untuned, seed 0, at its full budget
+    (the budget rule's wall-clock cap, the same training check as a full run), on its routed runtime; the final
+    policy is judged by the arm's RP rule on the same fixed episodes against the same FNPEG reference, and
+    cfg.rpx_snapshots snapshots are scored there too (the learning curve). Pass: the arm goes on as exploratory."""
+    p = L.checks / f"RPX_{arm}.json"
+    if p.exists():
+        return json.loads(p.read_text())
+    if not rpx_due(cfg, L, arm):
         return None
-    ok = bool(json.loads(p.read_text())["passed"])
-    if not ok and cfg.mode == "smoke" and os.environ.get(GATES_PASS_ENV) == "1":
+    ref = fnpeg_fixed(cfg, L, fn, workers, log)
+    full, _ = arm_settings(cfg, L, arm, tuned=False)
+    dec_budget = int(full.budget_decisions)
+    hours = wall_cap_h(cfg, L, arm, dec_budget)
+    d = _pilots(L) / f"{arm}_full"
+    lim = S5.SESSION["limit"]
+    if lim is not None and not (d / "policy.pt").exists() and not lim.may_start(
+            hours, log, f"extended pilot {arm}", extra_s=600.0):
+        return None
+    log(f"[gates] RPX {arm}: the full budget, {dec_budget:,} decisions (wall-clock cap {hours:.2f} h) on {runtime}")
+    rows, st, actor, dec, secs, why, rc, kw = _pilot_run(
+        cfg, L, arm, fn, device, workers, d,
+        {"budget_decisions": dec_budget, "budget_hours": hours, "curve_points": int(cfg.rpx_snapshots)},
+        f"extended pilot {arm}", log)
+    if lim is not None:
+        lim.done()
+    if not _finite(actor) or (why and "non-finite" in why):
+        doc = {"gate": "RPX", "arm": arm, "passed": False, "finite": False, "reason": why or "non-finite weights",
+               "time": time.strftime("%Y-%m-%d %H:%M:%S"), "git_commit": S5._GIT.get()}
+        L.write_json(p, doc)
+        stop(L, "rl_nonfinite", {"arm": arm, "stage": "extended pilot", "reason": doc["reason"]}, log)
+    curve = []
+    snaps = sorted((d / "snapshots").glob("policy_*of*.pt"), key=lambda q: int(q.stem.split("_")[1].split("of")[0]))
+    for sp in snaps:
+        meta = R2.policy_meta(sp)
+        e = R2.eval_fixed(arm, R2.load_actor(sp, device), rc, fn, kw, cfg.fixed_n, cfg.fixed_seed, device)
+        curve.append({"point": sp.stem, "decisions": int(meta.get("decisions", 0)), "trigger": meta.get("trigger"),
+                      "success_5km_fixed": float(e["success_5km_fast"]),
+                      "miss_km_fixed_median": float(e["miss_km_fast_median"])})
+    ev = R2.eval_fixed(arm, actor, rc, fn, kw, cfg.fixed_n, cfg.fixed_seed, device)
+    v = R2.rp_verdict(arm, rows, actor, ev["success_5km_fast"], float(ref["success_5km_fast"]))
+    v["reason"] = "full-budget run" + v["reason"][len("pilot"):] if v["reason"].startswith("pilot") else v["reason"]
+    if why:
+        v["passed"] = False
+        v["reason"] += f"; the run's training check stopped it: {why}"
+    reached = "the full budget" if dec >= dec_budget else f"{dec:,} of {dec_budget:,} decisions"
+    doc = {"gate": "RPX", "arm": arm, **v, "reached": reached,
+           "run": {"decisions": dec, "budget_decisions": dec_budget, "wall_cap_h": hours, "train_s": round(secs, 1),
+                   "runtime": runtime, "cfg": asdict(rc), "arm_kw": kw, "stopped": why},
+           "fixed_eval": {k: ev[k] for k in ("n", "seed", "success_5km_fast", "miss_km_fast_median")},
+           "fixed_curve": curve, "rp": {k: (_rp_doc(L, arm) or {}).get(k) for k in ("success_5km_fixed", "reason")},
+           "time": time.strftime("%Y-%m-%d %H:%M:%S"), "git_commit": S5._GIT.get()}
+    L.write_json(p, doc)
+    log(f"[gates] RPX {arm}: {'PASS (the arm goes on as exploratory)' if v['passed'] else 'FAIL (a result)'} "
+        f"after {reached}: {v['reason']}; fixed-episode curve: "
+        + ", ".join(f"{c['decisions']:,}: {c['success_5km_fixed']:.3f}" for c in curve))
+    return doc
+
+
+def gate_passed(cfg: RLStudyConfig, L: S5.LayoutV5, arm: str) -> Optional[bool]:
+    """Does the arm tune, train and fly? RP's verdict; for an arm that failed RP and gets the extended pilot, RPX's
+    (None: not decided yet). Smoke mode with JEPA_RL2_GATES_PASS=1 lets a failed arm go on (after its RPX, if due)."""
+    g = _rp_doc(L, arm)
+    if g is None:
+        return None
+    if g["passed"]:
         return True
-    return ok
+    if rpx_due(cfg, L, arm):
+        x = _rpx_doc(L, arm)
+        if x is None:
+            return None
+        ok = bool(x["passed"])
+    else:
+        ok = False
+    return True if (not ok and _smoke_pass(cfg)) else ok
 
 
 def timing_run(cfg: RLStudyConfig, L: S5.LayoutV5, arm: str, fn: dict, device, workers: int, runtime: str = "L4",
@@ -499,7 +623,7 @@ def timing_run(cfg: RLStudyConfig, L: S5.LayoutV5, arm: str, fn: dict, device, w
     p = _rate_path(L, arm, runtime)
     if p.exists():
         return json.loads(p.read_text())
-    if not gate_passed(cfg, L, arm):
+    if not (gate_passed(cfg, L, arm) or rpx_pending(cfg, L, arm)):
         return None
     rc, kw = arm_settings(cfg, None, arm, {"seed": 0, "label_workers": int(workers), "budget_decisions": 10 ** 12,
                                            "budget_hours": cfg.timing_min / 60.0, "curve_points": 0,
@@ -783,11 +907,14 @@ def runtime_kind(device: str, gpu_name: str = "") -> str:
 def status(cfg: RLStudyConfig, L: S5.LayoutV5, fn: Optional[dict]) -> dict:
     rows = []
     for arm in cfg.arms:
-        g = gate_passed(cfg, L, arm)
+        g = _rp_doc(L, arm)
+        x = _rpx_doc(L, arm)
         r = route(L, arm)
         n_cfg = sum(1 for k in range(cfg.tune_n) if (L.tuning / tmethod(arm) / f"config_{k:02d}.json").exists())
         trained = sum(1 for s in cfg.rl_seeds if (L.policy_dir(arm, s) / "policy.pt").exists())
-        row = {"arm": arm, "RP": {None: "not run", True: "pass", False: "FAIL (result)"}[g],
+        row = {"arm": arm, "RP": "not run" if g is None else ("pass" if g["passed"] else "FAIL (result)"),
+               "RPX": ("pending" if x is None else ("pass (exploratory)" if x["passed"] else "FAIL (result)"))
+               if rpx_due(cfg, L, arm) else "-",
                "rates": ",".join(sorted(rates(L, arm))), "route": (r or {}).get("runtime", "waits"),
                "tuning": "stopped" if tuning_stopped(L, arm) else ("chosen" if chosen(L, arm) else f"{n_cfg}/{cfg.tune_n}"),
                "seeds_trained": f"{trained}/{len(cfg.rl_seeds)}"}
@@ -807,10 +934,17 @@ def next_pass(cfg: RLStudyConfig, L: S5.LayoutV5, fn: Optional[dict]) -> str:
     """What the next Run all has to do, and on which runtime."""
     cpu, l4 = [], []
     for arm in cfg.arms:
-        g = gate_passed(cfg, L, arm)
-        if g is None:
+        if _rp_doc(L, arm) is None:
             cpu.append(f"gate RP {arm}")
             continue
+        if rpx_pending(cfg, L, arm):
+            if "L4" not in rates(L, arm):
+                l4.append(f"timing {arm}")
+            else:
+                r = route(L, arm)
+                (l4 if r and r["runtime"] == "L4" else cpu).append(f"extended pilot {arm} (full budget)")
+            continue
+        g = gate_passed(cfg, L, arm)
         if not g:
             continue
         rt = rates(L, arm)
@@ -850,11 +984,6 @@ def load_flights(cfg: RLStudyConfig, L: S5.LayoutV5, J: Optional[S5.LayoutV5], L
     return df
 
 
-def _rp_doc(L, arm) -> Optional[dict]:
-    p = L.checks / f"RP_{arm}.json"
-    return json.loads(p.read_text()) if p.exists() else None
-
-
 def criteria_rq3(cfg: RLStudyConfig, L: S5.LayoutV5, t: "pd.DataFrame") -> "pd.DataFrame":
     """R-each for the three arms, Holm over m = 3 (an arm without a comparison enters with p = 1)."""
     import pandas as pd
@@ -866,12 +995,15 @@ def criteria_rq3(cfg: RLStudyConfig, L: S5.LayoutV5, t: "pd.DataFrame") -> "pd.D
             q = t[(t.id == f"R-{arm}") & (t.metric == "success5") & (t.atmosphere == "all")]
             r = q.iloc[0].to_dict() if len(q) else None
         g = _rp_doc(L, arm)
+        failed_rp = g is not None and not g["passed"] and not _smoke_pass(cfg)
         row = {"id": f"R-{arm}", "question": f"Does v2 beat {arm}? (v2single - {arm}, success@5km, A256)",
                "gate_RP": None if g is None else bool(g["passed"]), "diff_pp": np.nan, "ci_lo": np.nan,
                "ci_hi": np.nan, "p": 1.0, "seeds_holding": None, "n_pairs": 0, "n_expected": 0, "met": None}
-        if r is None:
-            row["status"] = ("did not reach the gate" if g is not None and not g["passed"] else
-                             "tuning stopped" if tuning_stopped(L, arm) else "not run")
+        if failed_rp:                         # confirmatory: p = 1 whatever the extended pilot shows (section 3.1)
+            row["status"] = ("did not reach the gate (RPX passed: exploratory comparison in RQ3_exploratory.csv)"
+                             if exploratory(cfg, L, arm) else "did not reach the gate")
+        elif r is None:
+            row["status"] = "tuning stopped" if tuning_stopped(L, arm) else "not run"
         else:
             n = int(r["n_seeds"])
             need = 4 if n >= 5 else n
@@ -889,6 +1021,28 @@ def criteria_rq3(cfg: RLStudyConfig, L: S5.LayoutV5, t: "pd.DataFrame") -> "pd.D
         if o["met"] is not None:
             o["met"] = bool(o["met"] and pa < 0.05)
             o["status"] = "met" if o["met"] else "not met"
+    return pd.DataFrame(out)
+
+
+def exploratory_rq3(cfg: RLStudyConfig, L: S5.LayoutV5, t: "pd.DataFrame") -> "pd.DataFrame":
+    """v2single - arm for the arms that failed RP and passed RPX: exploratory, unadjusted p, not in Holm's family."""
+    import pandas as pd
+    out = []
+    for arm in ARMS:
+        if not exploratory(cfg, L, arm):
+            continue
+        q = t[(t.id == f"R-{arm}") & (t.metric == "success5") & (t.atmosphere == "all")] if len(t) else t
+        row = {"id": f"X-{arm}", "question": f"v2single - {arm}, success@5km, A256 (exploratory: {arm} failed RP "
+                                             "and passed the extended pilot RPX; not in RQ3's Holm family)",
+               "diff_pp": np.nan, "ci_lo": np.nan, "ci_hi": np.nan, "p_unadjusted": np.nan, "seeds_holding": None,
+               "n_pairs": 0, "n_expected": 0, "status": "pending"}
+        if len(q):
+            r = q.iloc[0].to_dict()
+            row.update({"diff_pp": r["diff"], "ci_lo": r["ci_lo"], "ci_hi": r["ci_hi"], "p_unadjusted": float(r["p_boot"]),
+                        "seeds_holding": f"{int(r['seeds_holding'])}/{int(r['n_seeds'])}", "n_pairs": int(r["n_pairs"]),
+                        "n_expected": int(r["n_expected"]),
+                        "status": "exploratory" if bool(r["complete"]) else "pending"})
+        out.append(row)
     return pd.DataFrame(out)
 
 
@@ -917,6 +1071,8 @@ def analyze(cfg: RLStudyConfig, L: S5.LayoutV5, J: Optional[S5.LayoutV5], L3=Non
     L.write_csv(t, L.tables / "RQ3_paired_A256.csv")
     L.write_csv(crit, L.tables / "RQ3_criteria.csv")
     out["paired"], out["criteria"] = t, crit
+    out["exploratory"] = exploratory_rq3(cfg, L, t)
+    L.write_csv(out["exploratory"], L.tables / "RQ3_exploratory.csv")
     # ---- DS1 / AS1 ----
     for su, base in (("DS1", None), ("AS1", ("nominal",))):
         comps = [(f"{su[0]}-{a}", "v2single", a) for a in ARMS] + [(f"{su[0]}-{a}-fnpeg", a, "fnpeg") for a in ARMS]
@@ -979,6 +1135,14 @@ def analyze(cfg: RLStudyConfig, L: S5.LayoutV5, J: Optional[S5.LayoutV5], L3=Non
             gates.append({"gate": "RP", "arm": arm, "passed": g["passed"], "reason": g.get("reason"),
                           "success_5km_fixed": g.get("success_5km_fixed"),
                           "fnpeg_success_5km_fixed": g.get("fnpeg_success_5km_fixed"), "bar": g.get("bar")})
+        x = _rpx_doc(L, arm)
+        if x is not None:
+            gates.append({"gate": "RPX (full budget)", "arm": arm, "passed": x["passed"],
+                          "reason": f"{x.get('reason')}; reached {x.get('reached')}; fixed-episode curve "
+                                    + ", ".join(f"{c['decisions']:,}: {c['success_5km_fixed']:.3f}"
+                                                for c in x.get("fixed_curve", [])),
+                          "success_5km_fixed": x.get("success_5km_fixed"),
+                          "fnpeg_success_5km_fixed": x.get("fnpeg_success_5km_fixed"), "bar": x.get("bar")})
     for arm, v in DROPPED.items():
         gates.append({"gate": "RV1/RV2 (notebook 1's design, dropped)", "arm": arm, "passed": False,
                       "reason": f"RV1 {v['RV1']}; RV2 {v['RV2']} ({v['pilot']})"})
@@ -1030,6 +1194,9 @@ def summary_md(cfg: RLStudyConfig, out: dict) -> str:
     return (f"# RQ3: RL baselines (notebook 2, jepa/plan_rl_v5.md)\n\n{out['n_flights']} flights read. "
             "Holm over m = 3 (an arm without a comparison enters with p = 1). `liu_track` is Liu-style: its "
             "deviations from Liu et al. (2026) are listed in plan_rl_v5.md section 1.3.\n\n"
-            "## Criteria\n\n" + tab(c) + "\n## Gates (failed gates are results)\n\n" + tab(out["gates"])
+            "## Criteria\n\n" + tab(c)
+            + "\n## Exploratory (arms that failed RP and passed the extended pilot RPX; unadjusted, not in the "
+              "Holm family)\n\n" + tab(out.get("exploratory"))
+            + "\n## Gates (failed gates are results)\n\n" + tab(out["gates"])
             + "\n## ORB-1 block 1\n\n" + tab(out["ORB1"]) + "\n## Sim-to-sim gap\n\n" + tab(out["gap"])
             + "\n## Cost\n\n" + tab(out["cost"]))
