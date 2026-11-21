@@ -274,7 +274,7 @@ def t1_gpu_pass() -> None:
           "pass's runtime before the analysis and the report, which run only on a CPU runtime",
           gpu_pass == [("mppi", 4)] and w1["cpu"] - before["cpu"] == 5 and cpu_pass == [("cpu", 9)]
           and w2["gpu"] - w1["gpu"] == 4 and both == [("cpu", 9), ("mppi", 4)]
-          and nb.count("S5.run_jobs(") == nb.count("can_cpu=CAN_CPU") == 10 and "GPU_PASS_SKIPS_CPU = True" in nb
+          and nb.count("S5.run_jobs(") == nb.count("can_cpu=CAN_CPU") == 11 and "GPU_PASS_SKIPS_CPU = True" in nb
           and order, f"(gpu pass {gpu_pass}, cpu pass {cpu_pass}, default {both}, release cell {end})")
 
 
@@ -1700,7 +1700,7 @@ def _summary_stages(text: str) -> List[str]:
         if on:
             if not ln.startswith("  ") or ln.strip() == "(none yet)":
                 break
-            out.append(ln.strip().rsplit(": ", 1)[0] if ": " in ln else ln.strip())
+            out.append(ln.strip().split(": ", 1)[0] if ": " in ln else ln.strip())   # a note may hold ": "
     return out
 
 
