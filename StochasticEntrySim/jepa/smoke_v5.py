@@ -1947,6 +1947,33 @@ def t18_needed(tmp: Path, fx: dict, work: Path) -> None:
           and got2["not_needed"] == "pending" and got2["learned_needed"] == "pending"
           and set(o[o.part == "criterion"].id) == set(A5.NEEDED_EVIDENCE), f"({ex}; {got}; {got2})")
 
+    # (k2) projection: hours per seed from a finished seed, else the arm's pilots scaled to the full steps, else the plan
+    Lp = S5.LayoutV5(base / "proj").make()
+    full = M5.E3TrainCfg(**cfg.e3_train).steps
+    arm = "gru_pi"
+    src0 = S5.e3_seed_hours(Lp, cfg, arm)
+    for m, ts in zip(cfg.lr_mults, (100.0, 140.0)):
+        Lp.write_json(Lp.models / arm / "lr_pilot" / f"x{m:g}" / "model.json", {"train_s": ts, "steps": 10})
+    src1 = S5.e3_seed_hours(Lp, cfg, arm)
+    Lp.write_json(S5.e3_model_dir(Lp, arm, cfg.seeds[0]) / "model.json", {"train_s": 7200.0})
+    src2 = S5.e3_seed_hours(Lp, cfg, arm)
+    pj_log = []
+    rows = S5.log_e3_projection(cfg, Lp, pj_log.append, rate=2.0)
+    pj = rd(Lp.study / "e3_projection.json")
+    want1 = 120.0 * full / 10 / 3600
+    check("18. projection: an arm's hours per seed come from a finished seed, else its pilots scaled to the full steps, "
+          "else the plan's estimate (named in 'source'); log_e3_projection logs them and writes "
+          "00_study/e3_projection.json",
+          src0[1] == "plan estimate" and src1[1].startswith("measured: 2 pilot") and abs(src1[0] - want1) < 1e-9
+          and src2 == (2.0, "measured: finished seed") and {r["arm"] for r in rows} == set(S5.needed_e3_arms(cfg))
+          and pj.get("arms") and abs(pj["units_left"] - round(pj["hours_left"] * 2.0, 0)) <= 1
+          and pj_log and "e3_projection.json" in pj_log[0],
+          f"({src0}, {src1}, {src2}; {pj_log[:1]})")
+    nbsrc = (SIM_DIR / "jepa" / "study_v5.py").read_text(encoding="utf-8")
+    check("18. train_e3_stage writes the projection right after an arm's learning-rate choice (guarded: it never "
+          "stops training)", "M5.choose_lr(cfg, data, L, arm, device, log)\n        try:" in nbsrc
+          and "log_e3_projection(cfg, L, log)" in nbsrc)
+
     # (l) ReEntryAI_JEPA_v5.ipynb (revision 2) stops at Setup: superseded
     runs = base / "nb"
     runs.mkdir(parents=True, exist_ok=True)

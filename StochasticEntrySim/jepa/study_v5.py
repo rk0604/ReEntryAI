@@ -2230,6 +2230,47 @@ def _e3_hours(L: LayoutV5, cfg: StudyConfigV5, arm: str) -> float:
     return 0.0
 
 
+def e3_seed_hours(L: LayoutV5, cfg: StudyConfigV5, arm: str) -> tuple:
+    """GPU hours of one full seed of an arm, and where the number comes from: a finished seed's own time; else its
+    learning-rate pilots' times scaled to the full steps (a pilot runs the same curriculum on lr_pilot_frac of the
+    steps; on Drive, mlp_direct's and gru_direct's pilots scaled this way match their seeds within ~5%); else the
+    plan's estimate (NEEDED_TRAIN_H). For the status projection only; the session budget keeps _e3_hours."""
+    h = _e3_hours(L, cfg, arm)
+    if h:
+        return h, "measured: finished seed"
+    full = M5.E3TrainCfg(**cfg.e3_train).steps
+    xs = []
+    for m in cfg.lr_mults:
+        info = _read_json(L.models / arm / "lr_pilot" / f"x{m:g}" / "model.json")
+        if info and info.get("train_s") and info.get("steps"):
+            xs.append(float(info["train_s"]) * full / float(info["steps"]) / 3600.0)
+    if xs:
+        return float(np.median(xs)), f"measured: {len(xs)} pilot(s)"
+    return NEEDED_TRAIN_H.get(arm, 7.0) * (full / 36_000), "plan estimate"
+
+
+def log_e3_projection(cfg: StudyConfigV5, L: LayoutV5, log=print, rate: float = None) -> List[dict]:
+    """E3 training hours left per arm (seed_hours x seeds left, plus pilots not yet run), logged and written to
+    00_study/e3_projection.json, so a measured number is on Drive as soon as an arm's pilots finish, not only at
+    the next session's status cell."""
+    rate = UNITS_PER_HOUR["L4"] if rate is None else rate
+    rows = []
+    for a in needed_e3_arms(cfg):
+        plan = e3_arm_plan(L, cfg, a)
+        h, src = e3_seed_hours(L, cfg, a)
+        left = sum(v == "train" for v in plan["seeds"].values()) if not plan["did_not_train"] else 0
+        pil = 0.0 if plan["ranking"] is not None else h * cfg.lr_pilot_frac * len(cfg.lr_mults)
+        rows.append({"arm": a, "seed_hours": round(h, 2), "source": src, "seeds_left": left,
+                     "hours_left": round(left * h + pil, 2)})
+    tot = sum(r["hours_left"] for r in rows)
+    L.write_json(L.study / "e3_projection.json", {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "arms": rows,
+                                                  "hours_left": round(tot, 1), "units_left": round(tot * rate, 0)})
+    log(f"[E3] training left: ~{tot:.1f} GPU-hours (~{tot * rate:.0f} units at {rate}/h); "
+        + "; ".join(f"{r['arm']} {r['hours_left']:.1f} h ({r['seed_hours']:.2f} h/seed, {r['source']})" for r in rows)
+        + " (00_study/e3_projection.json)")
+    return rows
+
+
 def _did_not_train(cfg, L: LayoutV5, arm: str, plan: dict, log) -> None:
     """Every multiplier of an arm diverged: 02_models/<arm>/did_not_train.json; with the stop rules on, the notebook
     stops and releases the runtime (plan 4b)."""
@@ -2280,6 +2321,10 @@ def train_e3_stage(cfg: StudyConfigV5, L: LayoutV5, data_fn: Callable[[], dict],
             return out
         data = data_fn()
         M5.choose_lr(cfg, data, L, arm, device, log)
+        try:                                     # measured pilot times on Drive now, not at the next session
+            log_e3_projection(cfg, L, log)
+        except Exception as e:                   # a projection must never stop training
+            log(f"[E3] projection not written: {e!r}")
         for s in cfg.seeds:
             tried = set()
             while True:
@@ -2552,17 +2597,18 @@ NEEDED_TRAIN_H = {"r0_nojepa": 7.1, "gru_direct": 0.8, "mlp_direct": 3.0, "gru_p
 
 def needed_projection(cfg: StudyConfigV5, L: LayoutV5, doc: dict, rate: float) -> List[dict]:
     """Hours and units left per block of the "Is JEPA needed?" notebook: flights (status, measured rates or
-    NEEDED_RATES), and each E3 arm's training (pilots if not chosen, seeds left; a finished seed's own time)."""
+    NEEDED_RATES), and each E3 arm's training (pilots if not chosen, seeds left; hours per seed from a finished
+    seed, else the arm's pilots, else the plan's estimate: e3_seed_hours, named in the "source" column)."""
     rows = [{"block": s_["stage"], "done": s_["done"], "total": s_["total"], "hours_left": s_["hours_left"] or 0.0}
             for s_ in doc["stages"]]
     for a in needed_e3_arms(cfg):
         plan = e3_arm_plan(L, cfg, a)
-        h = _e3_hours(L, cfg, a) or NEEDED_TRAIN_H.get(a, 7.0) * (M5.E3TrainCfg(**cfg.e3_train).steps / 36_000)
+        h, src = e3_seed_hours(L, cfg, a)
         left = sum(v == "train" for v in plan["seeds"].values()) if not plan["did_not_train"] else 0
         pil = 0.0 if plan["ranking"] is not None else h * cfg.lr_pilot_frac * len(cfg.lr_mults)
         i = next((k for k, r in enumerate(rows) if r["block"] == f"{a} A256"), len(rows))
         rows.insert(i, {"block": f"{a} training", "done": len(cfg.seeds) - left, "total": len(cfg.seeds),
-                        "hours_left": round(left * h + pil, 2)})
+                        "hours_left": round(left * h + pil, 2), "hours_per_seed": round(h, 2), "source": src})
     tot = 0.0
     for r in rows:
         r["units_left"] = round(r["hours_left"] * rate, 1)

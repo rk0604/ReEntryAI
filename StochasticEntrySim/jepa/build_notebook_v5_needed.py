@@ -381,8 +381,11 @@ and checks the frozen `00_study/study_config.json` and the GPU type (L4). A minu
 ## 2. Status: what is left, per block
 
 Done / total per block, and projected L4-hours and units per block (flights at each arm type's measured rate, else
-the plan's; training at a finished seed's own time, else the plan's; pilots if they have not chosen), and each E3
-model's state (done, partial, diverged, fallback todo). Writes `00_study/status.json` and `status_history.csv`.
+the plan's; training at a finished seed's own time, else the arm's learning-rate pilots scaled to the full steps,
+else the plan's estimate, named in the `source` column; pilots if they have not chosen), and each E3 model's state
+(done, partial, diverged, fallback todo). Writes `00_study/status.json` and `status_history.csv`. **Mid-session:**
+as soon as an arm's pilots finish, the E3 cell prints the measured training hours left and writes them to
+`00_study/e3_projection.json` (readable on Drive while the notebook runs).
 """),
     ("code", STATUS),
     ("md", r"""
